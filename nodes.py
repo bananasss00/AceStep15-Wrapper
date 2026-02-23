@@ -9,6 +9,8 @@ import json
 import shutil
 import glob
 import comfy.utils
+import comfy.model_management as mm
+import gc
 
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +25,44 @@ from acestep.inference import generate_music, GenerationParams, GenerationConfig
 ACESTEP_MODELS_DIR = os.path.join(folder_paths.models_dir, "acestep")
 if not os.path.exists(ACESTEP_MODELS_DIR):
     os.makedirs(ACESTEP_MODELS_DIR)
+
+GLOBAL_ACESTEP_HANDLERS = []
+
+def cleanup_all_acestep():
+    global GLOBAL_ACESTEP_HANDLERS
+    if not GLOBAL_ACESTEP_HANDLERS:
+        return
+    
+    print("\n[ACE-Step] Системная очистка памяти ComfyUI. Выгрузка ACE-Step из VRAM...\n")
+    for dit_handler, llm_handler in GLOBAL_ACESTEP_HANDLERS:
+        try:
+            if llm_handler:
+                llm_handler.unload()
+        except: pass
+        try:
+            if dit_handler:
+                dit_handler.model = None
+                dit_handler.vae = None
+                dit_handler.text_encoder = None
+                dit_handler._base_decoder = None
+        except: pass
+    
+    GLOBAL_ACESTEP_HANDLERS.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    print("[ACE-Step] Память успешно освобождена.")
+
+# Обезьяний патч (Monkey Patch): подключаемся к функции выгрузки моделей ComfyUI
+if not hasattr(mm, "_original_unload_all_models_acestep"):
+    mm._original_unload_all_models_acestep = mm.unload_all_models
+
+    def hooked_unload_all_models(*args, **kwargs):
+        cleanup_all_acestep()
+        return mm._original_unload_all_models_acestep(*args, **kwargs)
+    
+    mm.unload_all_models = hooked_unload_all_models
 
 # ============================================================================
 # 1. Загрузчик основной модели
@@ -49,6 +89,8 @@ class AceStepModelLoader:
 
     def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, offload_to_cpu):
         print(f"[ACE-Step] Инициализация. Целевая папка моделей: {ACESTEP_MODELS_DIR}")
+        
+        cleanup_all_acestep()
         
         dit_handler = AceStepHandler()
         llm_handler = LLMHandler()
@@ -89,6 +131,9 @@ class AceStepModelLoader:
             if not lm_success:
                 print(f"[ACE-Step] Warning LLM: {lm_status}")
 
+        # Регистрируем хендлеры в глобальном массиве для последующей очистки
+        GLOBAL_ACESTEP_HANDLERS.append((dit_handler, llm_handler if llm_handler.llm_initialized else None))
+
         return ({"dit_handler": dit_handler, "llm_handler": llm_handler if llm_handler.llm_initialized else None, "active_adapters": {}},)
 
 # ============================================================================
@@ -103,7 +148,7 @@ class AceStepLoraLoader:
                 "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Полный путь к папке LoRA"}),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
                 "enable_lora": ("BOOLEAN", {"default": True}),
-                "ignore_bias_error": ("BOOLEAN", {"default": True, "tooltip": "Фильтрует bias из весов в памяти (без сохранения на диск)"}),
+                "ignore_bias_error": ("BOOLEAN", {"default": True, "tooltip": "Фильтрует bias из весов в памяти"}),
             },
             "optional": {
                  "adapter_name_override": ("STRING", {"default": "", "multiline": False}),
@@ -278,8 +323,6 @@ class AceStepPromptEnhancer:
         final_ts = time_signature_override.strip() if time_signature_override.strip() else (result.timesignature or "")
         final_lang = language_override if language_override != "none" else (result.language or "unknown")
 
-        print(f"[ACE-Step Enhancer] Успешно! BPM: {final_bpm}, Тональность: {final_key}")
-        
         return (final_caption, final_lyrics, final_bpm, final_key, final_ts, final_lang)
 
 # ============================================================================
@@ -331,8 +374,20 @@ class AceStepMusicGenerator:
             return
 
         loaded_adapters = list(dit_handler._active_loras.keys())
+
+        if not requested_adapters:
+            if unload_unused:
+                print("[ACE-Step] Все LoRA отключены. Полная выгрузка PEFT (unload_lora)...")
+                dit_handler.unload_lora()
+            else:
+                print("[ACE-Step] Все LoRA отключены. Устанавливаем вес 0.0...")
+                for name in loaded_adapters:
+                    dit_handler.set_lora_scale(name, 0.0)
+                dit_handler.set_use_lora(False)
+            return
+
+        # Если есть запрашиваемые адаптеры
         has_active = False
-        
         for name in loaded_adapters:
             if name in requested_adapters:
                 weight = requested_adapters[name]
@@ -340,10 +395,15 @@ class AceStepMusicGenerator:
                 has_active = True
             else:
                 if unload_unused:
-                    dit_handler.remove_lora(name)
+                    print(f"[ACE-Step] Выгрузка неиспользуемой LoRA: {name}")
+                    try:
+                        dit_handler.remove_lora(name)
+                    except Exception as e:
+                        print(f"[ACE-Step] Предупреждение PEFT при удалении: {e}. Выполняю полный сброс.")
+                        dit_handler.unload_lora()
+                        return # Прерываем цикл, так как все удалено.
                 else:
-                    current_weight = dit_handler._active_loras.get(name, 0.0)
-                    if current_weight != 0.0:
+                    if dit_handler._active_loras.get(name, 0.0) != 0.0:
                         dit_handler.set_lora_scale(name, 0.0)
 
         if dit_handler.lora_loaded:
