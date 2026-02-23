@@ -154,8 +154,7 @@ class AceStepLoraLoader:
 # ============================================================================
 class AceStepLMConfig:
     """
-    Узел для настройки параметров языковой модели (температура, CFG и т.д.),
-    а также силы аудио-кодов.
+    Узел для настройки параметров языковой модели и Chain-of-Thought (CoT)
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -167,6 +166,10 @@ class AceStepLMConfig:
                 "lm_top_k": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "audio_cover_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Сила аудио-кодов / Cover strength"}),
                 "lm_negative_prompt": ("STRING", {"default": "NO USER INPUT", "multiline": True}),
+                "use_cot_metas": ("BOOLEAN", {"default": True, "tooltip": "Генерировать недостающие метаданные (BPM, тональность) через LLM"}),
+                "use_cot_caption": ("BOOLEAN", {"default": True, "tooltip": "Разрешить LLM переписывать caption во время генерации (если не запрещено в самом генераторе)"}),
+                "use_cot_language": ("BOOLEAN", {"default": True, "tooltip": "Определять язык через LLM"}),
+                "allow_lm_batch": ("BOOLEAN", {"default": True, "tooltip": "Разрешить параллельную генерацию в LLM"}),
             }
         }
 
@@ -175,14 +178,19 @@ class AceStepLMConfig:
     FUNCTION = "create_config"
     CATEGORY = "ACE-Step"
 
-    def create_config(self, lm_temperature, lm_cfg_scale, lm_top_p, lm_top_k, audio_cover_strength, lm_negative_prompt):
+    def create_config(self, lm_temperature, lm_cfg_scale, lm_top_p, lm_top_k, audio_cover_strength, 
+                      lm_negative_prompt, use_cot_metas, use_cot_caption, use_cot_language, allow_lm_batch):
         return ({
             "lm_temperature": lm_temperature,
             "lm_cfg_scale": lm_cfg_scale,
             "lm_top_p": lm_top_p,
             "lm_top_k": lm_top_k,
             "audio_cover_strength": audio_cover_strength,
-            "lm_negative_prompt": lm_negative_prompt
+            "lm_negative_prompt": lm_negative_prompt,
+            "use_cot_metas": use_cot_metas,
+            "use_cot_caption": use_cot_caption,
+            "use_cot_language": use_cot_language,
+            "allow_lm_batch": allow_lm_batch
         },)
 
 # ============================================================================
@@ -190,8 +198,8 @@ class AceStepLMConfig:
 # ============================================================================
 class AceStepPromptEnhancer:
     """
-    Прогоняет базовые caption и lyrics через LLM, 
-    возвращая детальное описание, структуру песни и извлеченные метаданные.
+    Прогоняет базовые caption и lyrics через LLM (format_sample).
+    Позволяет принудительно использовать оригинальный текст или задать метаданные вручную.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -200,9 +208,15 @@ class AceStepPromptEnhancer:
                 "model": ("ACESTEP_MODEL",),
                 "caption": ("STRING", {"multiline": True, "default": "pop song"}),
                 "lyrics": ("STRING", {"multiline": True, "default": ""}),
+                "keep_orig_caption": ("BOOLEAN", {"default": False, "tooltip": "Отдать на выход оригинальный Caption, игнорируя результат LLM"}),
+                "keep_orig_lyrics": ("BOOLEAN", {"default": False, "tooltip": "Отдать на выход оригинальные Lyrics, игнорируя результат LLM"}),
             },
             "optional": {
                 "lm_config": ("ACESTEP_LM_CONFIG",),
+                "bpm_override": ("INT", {"default": 0, "min": 0, "max": 300, "tooltip": "0 = использовать сгенерированный LLM"}),
+                "keyscale_override": ("STRING", {"default": "", "tooltip": "Пусто = использовать сгенерированный LLM"}),
+                "time_signature_override": ("STRING", {"default": "", "tooltip": "Пусто = использовать сгенерированный LLM"}),
+                "language_override": (["none", "unknown", "en", "zh", "ja", "ru", "es", "fr", "de"], {"default": "none"}),
             }
         }
 
@@ -211,11 +225,23 @@ class AceStepPromptEnhancer:
     FUNCTION = "enhance"
     CATEGORY = "ACE-Step"
 
-    def enhance(self, model, caption, lyrics, lm_config=None):
+    def enhance(self, model, caption, lyrics, keep_orig_caption, keep_orig_lyrics,
+                lm_config=None, bpm_override=0, keyscale_override="", 
+                time_signature_override="", language_override="none"):
+        
         llm_handler = model.get("llm_handler")
+        
+        # Если LLM нет, просто возвращаем оригиналы или оверрайды
         if not llm_handler or not getattr(llm_handler, "llm_initialized", False):
-            print("[ACE-Step Enhancer] Warning: LLM не инициализирована. Возвращаем оригинальный текст.")
-            return (caption, lyrics, 0, "", "", "unknown")
+            print("[ACE-Step Enhancer] Warning: LLM не инициализирована. Возвращаем базовые данные.")
+            return (
+                caption, 
+                lyrics, 
+                bpm_override, 
+                keyscale_override.strip(), 
+                time_signature_override.strip(), 
+                language_override if language_override != "none" else "unknown"
+            )
 
         temp = 0.85
         top_k = None
@@ -242,16 +268,19 @@ class AceStepPromptEnhancer:
 
         if not result.success:
             print(f"[ACE-Step Enhancer] Ошибка при улучшении промпта: {result.error or result.status_message}")
-            return (caption, lyrics, 0, "", "", "unknown")
+            return (caption, lyrics, bpm_override, keyscale_override, time_signature_override, language_override)
 
-        return (
-            result.caption or caption,
-            result.lyrics or lyrics,
-            result.bpm or 0,
-            result.keyscale or "",
-            result.timesignature or "",
-            result.language or "unknown"
-        )
+        # Выбираем, что отдать на выход: сгенерированное LLM или переопределенное юзером
+        final_caption = caption if keep_orig_caption else (result.caption or caption)
+        final_lyrics = lyrics if keep_orig_lyrics else (result.lyrics or lyrics)
+        final_bpm = bpm_override if bpm_override > 0 else (result.bpm or 0)
+        final_key = keyscale_override.strip() if keyscale_override.strip() else (result.keyscale or "")
+        final_ts = time_signature_override.strip() if time_signature_override.strip() else (result.timesignature or "")
+        final_lang = language_override if language_override != "none" else (result.language or "unknown")
+
+        print(f"[ACE-Step Enhancer] Успешно! BPM: {final_bpm}, Тональность: {final_key}")
+        
+        return (final_caption, final_lyrics, final_bpm, final_key, final_ts, final_lang)
 
 # ============================================================================
 # 5. Генератор Музыки
@@ -268,7 +297,7 @@ class AceStepMusicGenerator:
                 "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0}),
                 "inference_steps": ("INT", {"default": 8}),
                 "guidance_scale": ("FLOAT", {"default": 7.0}),
-                "thinking": ("BOOLEAN", {"default": True}),
+                "thinking": ("BOOLEAN", {"default": True, "tooltip": "Генерация аудио-кодов через LLM"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
             },
@@ -321,8 +350,9 @@ class AceStepMusicGenerator:
             dit_handler.set_use_lora(has_active)
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
-                 guidance_scale, thinking, seed, unload_unused_loras, reference_audio=None, source_audio=None, 
-                 vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
+                 guidance_scale, thinking, seed, unload_unused_loras, 
+                 reference_audio=None, source_audio=None, vocal_language="unknown", 
+                 bpm=0, key_scale="", time_signature="", lm_config=None):
         
         dit_handler = model["dit_handler"]
         llm_handler = model["llm_handler"]
@@ -336,12 +366,17 @@ class AceStepMusicGenerator:
         ref_path = self._save_comfy_audio_to_temp(reference_audio)
         src_path = self._save_comfy_audio_to_temp(source_audio)
 
+        # Вытаскиваем параметры LLM (включая параметры CoT)
         lm_temp = 0.85
         lm_cfg = 2.0
         lm_tk = 0
         lm_tp = 0.9
         cover_str = 1.0
         lm_neg_prompt = "NO USER INPUT"
+        use_cot_metas = True
+        use_cot_caption = True
+        use_cot_language = True
+        allow_lm_batch = True
 
         if lm_config:
             lm_temp = lm_config.get("lm_temperature", 0.85)
@@ -350,6 +385,10 @@ class AceStepMusicGenerator:
             lm_tp = lm_config.get("lm_top_p", 0.9)
             cover_str = lm_config.get("audio_cover_strength", 1.0)
             lm_neg_prompt = lm_config.get("lm_negative_prompt", "NO USER INPUT")
+            use_cot_metas = lm_config.get("use_cot_metas", True)
+            use_cot_caption = lm_config.get("use_cot_caption", True)
+            use_cot_language = lm_config.get("use_cot_language", True)
+            allow_lm_batch = lm_config.get("allow_lm_batch", True)
 
         params = GenerationParams(
             task_type=task_type, caption=caption, lyrics=lyrics,
@@ -358,13 +397,20 @@ class AceStepMusicGenerator:
             inference_steps=inference_steps, guidance_scale=guidance_scale, seed=seed,
             thinking=thinking, reference_audio=ref_path,
             src_audio=src_path if task_type != "text2music" else None,
-            use_cot_metas=True, use_cot_caption=True, use_cot_language=True,
+            use_cot_metas=use_cot_metas, 
+            use_cot_caption=use_cot_caption, 
+            use_cot_language=use_cot_language,
             audio_cover_strength=cover_str,
             lm_temperature=lm_temp, lm_cfg_scale=lm_cfg, lm_top_k=lm_tk, 
             lm_top_p=lm_tp, lm_negative_prompt=lm_neg_prompt
         )
 
-        config = GenerationConfig(batch_size=1, use_random_seed=(seed == -1), audio_format="wav")
+        config = GenerationConfig(
+            batch_size=1, 
+            use_random_seed=(seed == -1), 
+            audio_format="wav",
+            allow_lm_batch=allow_lm_batch
+        )
 
         # ==========================================
         # ПРОГРЕСС БАР COMFYUI
@@ -374,26 +420,21 @@ class AceStepMusicGenerator:
 
         def progress_callback(value, desc=None, *args, **kwargs):
             nonlocal last_percent
-            
-            # ACE-Step может передавать либо float (0.0 - 1.0), либо строку (инфо)
             if isinstance(value, str):
                 # print(f"[ACE-Step] {value}")
                 return
                 
             if isinstance(value, (int, float)):
-                # Конвертируем 0.0-1.0 в 0-100
                 current_percent = min(100, max(0, int(value * 100)))
-                
-                # ComfyUI pbar.update() принимает ДЕЛЬТУ (разницу) шагов, а не абсолютное значение
                 if current_percent > last_percent:
                     pbar.update(current_percent - last_percent)
                     last_percent = current_percent
                     
-            # if desc:
-            #     print(f"[ACE-Step Progress] {desc} ({last_percent}%)")
+            if desc:
+                pass # print(f"[ACE-Step Progress] {desc} ({last_percent}%)")
 
+        print("[ACE-Step] Начинаем генерацию...")
         try:
-            # Передаем наш коллбэк в ядро ACE-Step
             result = generate_music(
                 dit_handler=dit_handler, 
                 llm_handler=llm_handler, 
@@ -406,7 +447,6 @@ class AceStepMusicGenerator:
             if not result.success:
                 raise RuntimeError(f"Generation Failed: {result.error}")
 
-            # Добиваем прогресс-бар до 100%, если он не дошел
             if last_percent < 100:
                 pbar.update(100 - last_percent)
 
