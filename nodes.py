@@ -340,6 +340,7 @@ class AceStepMusicGenerator:
                 "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0}),
                 "inference_steps": ("INT", {"default": 8}),
                 "guidance_scale": ("FLOAT", {"default": 7.0}),
+                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1, "tooltip": "Смещение таймстепов (Timestep shift factor)"}),
                 "thinking": ("BOOLEAN", {"default": True, "tooltip": "Генерация аудио-кодов через LLM"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
@@ -410,7 +411,7 @@ class AceStepMusicGenerator:
             dit_handler.set_use_lora(has_active)
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
-                 guidance_scale, thinking, seed, unload_unused_loras, 
+                 guidance_scale, shift, thinking, seed, unload_unused_loras, 
                  reference_audio=None, source_audio=None, vocal_language="unknown", 
                  bpm=0, key_scale="", time_signature="", lm_config=None):
         
@@ -454,7 +455,8 @@ class AceStepMusicGenerator:
             task_type=task_type, caption=caption, lyrics=lyrics,
             bpm=bpm if bpm > 0 else None, keyscale=key_scale, timesignature=time_signature,
             duration=duration, vocal_language=vocal_language,
-            inference_steps=inference_steps, guidance_scale=guidance_scale, seed=seed,
+            inference_steps=inference_steps, guidance_scale=guidance_scale,
+            shift=shift, seed=seed,
             thinking=thinking, reference_audio=ref_path,
             src_audio=src_path if task_type != "text2music" else None,
             use_cot_metas=use_cot_metas, 
