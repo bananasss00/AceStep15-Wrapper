@@ -1,0 +1,31 @@
+# ACE-Step Training Dependencies
+
+# Core PyTorch
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Transformers and Diffusers
+transformers>=4.40.0
+diffusers>=0.28.0
+
+# LoRA (PEFT)
+peft>=0.10.0
+
+# Training
+lightning>=2.0.0
+accelerate>=0.30.0
+
+# Model downloading
+huggingface-hub>=0.20.0
+
+# Logging
+loguru>=0.7.0
+
+# Audio processing
+soundfile>=0.12.0
+
+# Model serialization
+safetensors>=0.4.0
+
+# Optional: vLLM backend for LLM (uncomment if needed)
+# vllm>=0.4.0
