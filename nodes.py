@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import glob
+import comfy.utils
 
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -149,7 +150,7 @@ class AceStepLoraLoader:
         return (model,)
 
 # ============================================================================
-# 3. Настройка параметров LLM (Новая нода)
+# 3. Настройка параметров LLM
 # ============================================================================
 class AceStepLMConfig:
     """
@@ -185,7 +186,7 @@ class AceStepLMConfig:
         },)
 
 # ============================================================================
-# 4. Улучшение промптов через LLM (Новая нода)
+# 4. Улучшение промптов через LLM
 # ============================================================================
 class AceStepPromptEnhancer:
     """
@@ -243,9 +244,6 @@ class AceStepPromptEnhancer:
             print(f"[ACE-Step Enhancer] Ошибка при улучшении промпта: {result.error or result.status_message}")
             return (caption, lyrics, 0, "", "", "unknown")
 
-        print(f"[ACE-Step Enhancer] Успешно! Сгенерированный BPM: {result.bpm}, Тональность: {result.keyscale}")
-        
-        # ComfyUI требует строгие типы, поэтому None BPM конвертируем в 0
         return (
             result.caption or caption,
             result.lyrics or lyrics,
@@ -281,7 +279,7 @@ class AceStepMusicGenerator:
                 "bpm": ("INT", {"default": 0}),
                 "key_scale": ("STRING", {"default": ""}),
                 "time_signature": ("STRING", {"default": ""}),
-                "lm_config": ("ACESTEP_LM_CONFIG",), # Подключение кастомных параметров LLM
+                "lm_config": ("ACESTEP_LM_CONFIG",),
             }
         }
 
@@ -338,7 +336,6 @@ class AceStepMusicGenerator:
         ref_path = self._save_comfy_audio_to_temp(reference_audio)
         src_path = self._save_comfy_audio_to_temp(source_audio)
 
-        # Вытаскиваем параметры LLM, если они подключены, иначе дефолтные
         lm_temp = 0.85
         lm_cfg = 2.0
         lm_tk = 0
@@ -369,10 +366,49 @@ class AceStepMusicGenerator:
 
         config = GenerationConfig(batch_size=1, use_random_seed=(seed == -1), audio_format="wav")
 
+        # ==========================================
+        # ПРОГРЕСС БАР COMFYUI
+        # ==========================================
+        pbar = comfy.utils.ProgressBar(100)
+        last_percent = 0
+
+        def progress_callback(value, desc=None, *args, **kwargs):
+            nonlocal last_percent
+            
+            # ACE-Step может передавать либо float (0.0 - 1.0), либо строку (инфо)
+            if isinstance(value, str):
+                # print(f"[ACE-Step] {value}")
+                return
+                
+            if isinstance(value, (int, float)):
+                # Конвертируем 0.0-1.0 в 0-100
+                current_percent = min(100, max(0, int(value * 100)))
+                
+                # ComfyUI pbar.update() принимает ДЕЛЬТУ (разницу) шагов, а не абсолютное значение
+                if current_percent > last_percent:
+                    pbar.update(current_percent - last_percent)
+                    last_percent = current_percent
+                    
+            # if desc:
+            #     print(f"[ACE-Step Progress] {desc} ({last_percent}%)")
+
         try:
-            result = generate_music(dit_handler, llm_handler, params, config, save_dir=None)
+            # Передаем наш коллбэк в ядро ACE-Step
+            result = generate_music(
+                dit_handler=dit_handler, 
+                llm_handler=llm_handler, 
+                params=params, 
+                config=config, 
+                save_dir=None,
+                progress=progress_callback
+            )
+            
             if not result.success:
                 raise RuntimeError(f"Generation Failed: {result.error}")
+
+            # Добиваем прогресс-бар до 100%, если он не дошел
+            if last_percent < 100:
+                pbar.update(100 - last_percent)
 
             output_audio_tensor = result.audios[0]["tensor"]
             output_sample_rate = result.audios[0]["sample_rate"]
