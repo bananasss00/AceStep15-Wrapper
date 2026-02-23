@@ -123,6 +123,10 @@ class TrainingConfigV2(TrainingConfig):
     optimizer_type: str = "adamw"
     """Optimizer: 'adamw', 'adamw8bit', 'adafactor', 'prodigy'."""
 
+    # --- Optimizer Specifics ---
+    optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    """Extra keyword arguments passed to the optimizer constructor."""
+
     scheduler_type: str = "cosine"
     """LR scheduler: 'cosine', 'cosine_restarts', 'linear', 'constant', 'constant_with_warmup'."""
 
@@ -176,6 +180,9 @@ class TrainingConfigV2(TrainingConfig):
     resume_from: Optional[str] = None
     """Path to checkpoint directory to resume training from."""
 
+    save_start_epoch: int = 0
+    save_loss_threshold: float = 0.0
+
     # --- Extended TensorBoard logging ---------------------------------------
     log_dir: Optional[str] = None
     """TensorBoard log directory.  Defaults to {output_dir}/runs."""
@@ -188,7 +195,21 @@ class TrainingConfigV2(TrainingConfig):
 
     # --- Sample generation --------------------------------------------------
     sample_every_n_epochs: int = 0
-    """Generate an audio sample every N epochs (0 = disabled)."""
+    
+    generate_preview: bool = False
+    """If True, generate a preview sample whenever a checkpoint is saved."""
+    
+    offload_dit_for_preview: bool = False
+    """If True, moves the DiT model to CPU during VAE decoding to save VRAM."""
+    
+    preview_sample_index: int = 0
+    """Index of the sample in the sorted dataset to use as the prompt source."""
+
+    preview_caption: Optional[str] = None
+    preview_lyrics: Optional[str] = None
+    preview_bpm: Optional[str] = None
+    preview_keyscale: Optional[str] = None
+    preview_timesig: Optional[str] = None
 
     # --- Estimation params --------------------------------------------------
     estimate_batches: Optional[int] = None
@@ -247,6 +268,7 @@ class TrainingConfigV2(TrainingConfig):
                 "persistent_workers": self.persistent_workers,
                 "pin_memory_device": self.pin_memory_device,
                 "optimizer_type": self.optimizer_type,
+                "optimizer_kwargs": self.optimizer_kwargs,
                 "scheduler_type": self.scheduler_type,
                 "gradient_checkpointing": self.gradient_checkpointing,
                 "offload_encoder": self.offload_encoder,
@@ -262,10 +284,20 @@ class TrainingConfigV2(TrainingConfig):
                 "device": self.device,
                 "precision": self.precision,
                 "resume_from": self.resume_from,
+                "save_start_epoch": self.save_start_epoch,
+                "save_loss_threshold": self.save_loss_threshold,
                 "log_dir": self.log_dir,
                 "log_every": self.log_every,
                 "log_heavy_every": self.log_heavy_every,
                 "sample_every_n_epochs": self.sample_every_n_epochs,
+                "generate_preview": self.generate_preview,
+                "offload_dit_for_preview": self.offload_dit_for_preview,
+                "preview_sample_index": self.preview_sample_index,
+                "preview_caption": self.preview_caption,
+                "preview_lyrics": self.preview_lyrics,
+                "preview_bpm": self.preview_bpm,
+                "preview_keyscale": self.preview_keyscale,
+                "preview_timesig": self.preview_timesig,
                 "estimate_batches": self.estimate_batches,
                 "top_k": self.top_k,
                 "granularity": self.granularity,

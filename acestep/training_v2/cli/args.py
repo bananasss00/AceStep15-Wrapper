@@ -214,7 +214,13 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     g_train.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     g_train.add_argument("--shift", type=float, default=3.0, help="Noise schedule shift (turbo=3.0, base/sft=1.0)")
     g_train.add_argument("--num-inference-steps", type=int, default=8, help="Inference steps for timestep schedule (turbo=8, base/sft=50)")
-    g_train.add_argument("--optimizer-type", type=str, default="adamw", choices=["adamw", "adamw8bit", "adafactor", "prodigy"], help="Optimizer (default: adamw)")
+    g_train.add_argument(
+        "--optimizer-type", 
+        type=str, 
+        default="adamw", 
+        choices=["adamw", "adamw8bit", "adafactor", "prodigy", "prodigy_plus", "ademamix"], 
+        help="Optimizer (default: adamw)"
+    )
     g_train.add_argument("--scheduler-type", type=str, default="cosine", choices=["cosine", "cosine_restarts", "linear", "constant", "constant_with_warmup"], help="LR scheduler (default: cosine)")
     g_train.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Recompute activations to save VRAM (~40-60%% less, ~10-30%% slower). On by default; use --no-gradient-checkpointing to disable")
     g_train.add_argument("--offload-encoder", action=argparse.BooleanOptionalAction, default=False, help="Move encoder/VAE to CPU after setup (saves ~2-4GB VRAM)")

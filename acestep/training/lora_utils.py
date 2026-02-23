@@ -463,3 +463,33 @@ def get_lora_info(model) -> Dict[str, Any]:
         info["lora_ratio"] = lora_params / total_params
     
     return info
+
+def _unwrap_decoder(model) -> nn.Module:
+    """
+    Вспомогательная функция для извлечения декодера.
+    Снимает обертки Lightning Fabric / DDP, но ОСТАВЛЯЕТ PEFT/LoRA,
+    чтобы сохранялись только веса адаптера.
+    """
+    # 1. Если передана полная модель AceStep, берем декодер
+    if hasattr(model, 'decoder'):
+        decoder = model.decoder
+    else:
+        decoder = model
+
+    # 2. Снимаем обертки Lightning Fabric / DDP
+    while hasattr(decoder, "_forward_module"):
+        decoder = decoder._forward_module
+    
+    if hasattr(decoder, "module"):
+        decoder = decoder.module
+
+    # 3. ВАЖНО: НЕ СНИМАЕМ обертки PEFT (LoRA)!
+    # Если мы их снимем, save_pretrained сохранит всю модель (3GB) вместо адаптера.
+    # Следующие строки закомментированы специально:
+    
+    # if hasattr(decoder, "base_model"):
+    #     decoder = decoder.base_model
+    # if hasattr(decoder, "model"):
+    #     decoder = decoder.model
+
+    return decoder
