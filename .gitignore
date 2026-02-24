@@ -49,7 +49,7 @@ Thumbs.db
 node_modules/
 
 # Debug files
-debug_*.py
+# debug_*.py
 debug_*.wav
 debug_*.txt
 debug_*.json
