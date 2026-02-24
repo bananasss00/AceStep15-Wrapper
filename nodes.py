@@ -54,7 +54,6 @@ def cleanup_all_acestep():
     gc.collect()
     print("[ACE-Step] Память успешно освобождена.")
 
-# Обезьяний патч (Monkey Patch): подключаемся к функции выгрузки моделей ComfyUI
 if not hasattr(mm, "_original_unload_all_models_acestep"):
     mm._original_unload_all_models_acestep = mm.unload_all_models
 
@@ -184,10 +183,8 @@ class AceStepLoraLoader:
         if "❌" in load_msg and "already loaded" not in load_msg:
             print(f"[ACE-Step] Ошибка загрузки LoRA {adapter_name}: {load_msg}")
         else:
-            print(f"[ACE-Step] LoRA {adapter_name}: OK (weight={strength})")
             new_active = model["active_adapters"].copy()
-            new_active[adapter_name] = strength
-            
+            new_active[adapter_name] = float(strength)
             new_model = model.copy()
             new_model["active_adapters"] = new_active
             return (new_model,)
@@ -198,9 +195,6 @@ class AceStepLoraLoader:
 # 3. Настройка параметров LLM
 # ============================================================================
 class AceStepLMConfig:
-    """
-    Узел для настройки параметров языковой модели и Chain-of-Thought (CoT)
-    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -371,44 +365,95 @@ class AceStepMusicGenerator:
         return temp_path
 
     def _sync_loras(self, dit_handler, requested_adapters, unload_unused):
+        """
+        Ручное управление слоями PEFT для обхода ограничений ACE-Step и старых версий PEFT.
+        Использует add_weighted_adapter для безопасного смешивания нескольких LoRA.
+        """
         if not dit_handler.lora_loaded:
             return
 
         loaded_adapters = list(dit_handler._active_loras.keys())
-
+        decoder = getattr(dit_handler.model, "decoder", None)
+        combo_name = "comfy_mixed_lora"
+        
+        # Если нет запрашиваемых адаптеров (байпасс всех нод)
         if not requested_adapters:
             if unload_unused:
-                print("[ACE-Step] Все LoRA отключены. Полная выгрузка PEFT (unload_lora)...")
+                print("[ACE-Step] Запрошенных LoRA нет. Полная выгрузка PEFT...")
                 dit_handler.unload_lora()
             else:
-                print("[ACE-Step] Все LoRA отключены. Устанавливаем вес 0.0...")
-                for name in loaded_adapters:
-                    dit_handler.set_lora_scale(name, 0.0)
-                dit_handler.set_use_lora(False)
+                print("[ACE-Step] Запрошенных LoRA нет. Отключаем слои...")
+                if decoder and hasattr(decoder, "disable_adapter_layers"):
+                    decoder.disable_adapter_layers()
+                dit_handler.use_lora = False
             return
 
-        # Если есть запрашиваемые адаптеры
-        has_active = False
+        active_names = []
+        active_weights = []
+        
         for name in loaded_adapters:
+            # Игнорируем наш временный адаптер для смешивания при переборе
+            if name == combo_name:
+                continue
+
             if name in requested_adapters:
-                weight = requested_adapters[name]
-                dit_handler.set_lora_scale(name, weight)
-                has_active = True
+                weight = float(requested_adapters[name])
+                # Записываем вес для внутреннего стейта ACE-Step
+                dit_handler._active_loras[name] = weight
+                
+                if weight > 0.0:
+                    active_names.append(name)
+                    active_weights.append(weight)
             else:
                 if unload_unused:
                     print(f"[ACE-Step] Выгрузка неиспользуемой LoRA: {name}")
                     try:
                         dit_handler.remove_lora(name)
-                    except Exception as e:
-                        print(f"[ACE-Step] Предупреждение PEFT при удалении: {e}. Выполняю полный сброс.")
+                    except Exception:
+                        print(f"[ACE-Step] Сброс всех LoRA из-за ошибки выгрузки.")
                         dit_handler.unload_lora()
-                        return # Прерываем цикл, так как все удалено.
+                        return
                 else:
-                    if dit_handler._active_loras.get(name, 0.0) != 0.0:
-                        dit_handler.set_lora_scale(name, 0.0)
+                    dit_handler._active_loras[name] = 0.0
 
-        if dit_handler.lora_loaded:
-            dit_handler.set_use_lora(has_active)
+        # Активация адаптеров (Обход ошибки TypeError: unhashable type: 'list')
+        if decoder is not None:
+            if active_names:
+                if hasattr(decoder, "enable_adapter_layers"):
+                    decoder.enable_adapter_layers()
+                
+                # Если адаптеров несколько, смешиваем их в один виртуальный
+                if len(active_names) > 1 and hasattr(decoder, "add_weighted_adapter"):
+                    try:
+                        if combo_name in decoder.peft_config:
+                            decoder.delete_adapter(combo_name)
+                        
+                        # Линейное объединение весов
+                        decoder.add_weighted_adapter(
+                            adapters=active_names, 
+                            weights=active_weights, 
+                            adapter_name=combo_name, 
+                            combination_type="linear"
+                        )
+                        decoder.set_adapter(combo_name)
+                        print(f"[ACE-Step] Смешаны мульти-LoRA: {active_names} с весами {active_weights}")
+                    except Exception as e:
+                        print(f"[ACE-Step] Не удалось смешать адаптеры: {e}. Включаем только первый: {active_names[0]}")
+                        decoder.set_adapter(active_names[0])
+                else:
+                    # Если адаптер один, просто активируем его
+                    try:
+                        decoder.set_adapter(active_names)
+                    except TypeError:
+                        # Fallback для старых PEFT
+                        decoder.set_adapter(active_names[0])
+                        
+                dit_handler.use_lora = True
+                dit_handler.lora_scale = active_weights[0] if active_weights else 1.0
+            else:
+                if hasattr(decoder, "disable_adapter_layers"):
+                    decoder.disable_adapter_layers()
+                dit_handler.use_lora = False
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
                  guidance_scale, shift, thinking, seed, unload_unused_loras, 
