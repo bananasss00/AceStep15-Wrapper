@@ -1,0 +1,581 @@
+{
+  "id": "7cd8283e-6731-4264-a4a0-b2393e94d73d",
+  "revision": 0,
+  "last_node_id": 14,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 8,
+      "type": "ACEStepPreviewConfig",
+      "pos": [
+        1904,
+        256
+      ],
+      "size": [
+        400,
+        286
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ACESTEP_PREVIEW",
+          "type": "ACESTEP_PREVIEW",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "fcb984ee2c33a1a4e2fc728ec62e994d7f1727be",
+        "Node name for S&R": "ACEStepPreviewConfig"
+      },
+      "widgets_values": [
+        true,
+        false,
+        0,
+        "",
+        "",
+        "",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 11,
+      "type": "ACEStepEstimator",
+      "pos": [
+        2432,
+        352
+      ],
+      "size": [
+        275.970703125,
+        126
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "dataset_config",
+          "type": "ACESTEP_DATASET",
+          "link": 9
+        },
+        {
+          "name": "model_config",
+          "type": "ACESTEP_MODEL",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "target_modules",
+          "type": "STRING",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "cb54a006b4cf901199ff66bb10f865b5a54dd183",
+        "Node name for S&R": "ACEStepEstimator"
+      },
+      "widgets_values": [
+        5,
+        20,
+        "module"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "ShowText|pysssss",
+      "pos": [
+        3072,
+        720
+      ],
+      "size": [
+        448,
+        192
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "shape": 6,
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-custom-scripts",
+        "ver": "609f3afaa74b2f88ef9ce8d939626065e3247469",
+        "Node name for S&R": "ShowText|pysssss"
+      },
+      "widgets_values": [
+        "V:\\ACE-Step-1.5\\lora_output\\dzhuzeppe-base_v12.9-base\\checkpoints\\epoch_400_f95"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "ACEStepLoRAResize",
+      "pos": [
+        2432,
+        720
+      ],
+      "size": [
+        624,
+        202
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "output_path",
+          "type": "STRING",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "cb54a006b4cf901199ff66bb10f865b5a54dd183",
+        "Node name for S&R": "ACEStepLoRAResize"
+      },
+      "widgets_values": [
+        "V:\\ACE-Step-1.5\\lora_output\\dzhuzeppe-base_v12.9-base\\checkpoints\\epoch_400",
+        "V:\\ACE-Step-1.5\\lora_output\\dzhuzeppe-base_v12.9-base\\checkpoints\\epoch_400_f95",
+        32,
+        "sv_fro",
+        0.95,
+        "float32",
+        "cuda"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "ShowText|pysssss",
+      "pos": [
+        3088,
+        -464
+      ],
+      "size": [
+        624,
+        192
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "shape": 6,
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-custom-scripts",
+        "ver": "609f3afaa74b2f88ef9ce8d939626065e3247469",
+        "Node name for S&R": "ShowText|pysssss"
+      },
+      "widgets_values": [
+        "V:\\ACE-Step-1.5\\datasets\\lora_out"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "ShowText|pysssss",
+      "pos": [
+        2736,
+        352
+      ],
+      "size": [
+        448,
+        256
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 11
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "shape": 6,
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-custom-scripts",
+        "ver": "609f3afaa74b2f88ef9ce8d939626065e3247469",
+        "Node name for S&R": "ShowText|pysssss"
+      },
+      "widgets_values": [
+        "layers.0.self_attn.q_proj layers.0.self_attn.k_proj layers.0.self_attn.v_proj layers.0.self_attn.o_proj layers.0.cross_attn.q_proj layers.0.cross_attn.k_proj layers.0.cross_attn.v_proj layers.0.cross_attn.o_proj layers.1.self_attn.q_proj layers.1.self_attn.k_proj layers.1.self_attn.v_proj layers.1.self_attn.o_proj layers.1.cross_attn.q_proj layers.1.cross_attn.k_proj layers.1.cross_attn.v_proj layers.1.cross_attn.o_proj layers.2.self_attn.q_proj layers.2.self_attn.k_proj layers.2.self_attn.v_proj layers.2.self_attn.o_proj"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "ACEStepTrainer",
+      "pos": [
+        2432,
+        -464
+      ],
+      "size": [
+        624,
+        704
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "dataset_config",
+          "type": "ACESTEP_DATASET",
+          "link": 3
+        },
+        {
+          "name": "model_config",
+          "type": "ACESTEP_MODEL",
+          "link": 4
+        },
+        {
+          "name": "optimizer_config",
+          "type": "ACESTEP_OPTIMIZER",
+          "link": 8
+        },
+        {
+          "name": "preview_config",
+          "shape": 7,
+          "type": "ACESTEP_PREVIEW",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_dir",
+          "type": "STRING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "fcb984ee2c33a1a4e2fc728ec62e994d7f1727be",
+        "Node name for S&R": "ACEStepTrainer"
+      },
+      "widgets_values": [
+        42,
+        "fixed",
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "id": 5,
+      "type": "ACEStepDatasetConfig",
+      "pos": [
+        1904,
+        -480
+      ],
+      "size": [
+        448,
+        322
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ACESTEP_DATASET",
+          "type": "ACESTEP_DATASET",
+          "links": [
+            3,
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "fcb984ee2c33a1a4e2fc728ec62e994d7f1727be",
+        "Node name for S&R": "ACEStepDatasetConfig"
+      },
+      "widgets_values": [
+        "V:\\ACE-Step-1.5\\datasets\\egiptyanin.json",
+        "V:\\ACE-Step-1.5\\datasets\\preprocessed_tensors2",
+        "V:\\ACE-Step-1.5\\datasets\\lora_out",
+        "V:\\ACE-Step-1.5\\checkpoints",
+        "",
+        10,
+        1,
+        1,
+        240,
+        10,
+        0,
+        0
+      ]
+    },
+    {
+      "id": 6,
+      "type": "ACEStepModelConfig",
+      "pos": [
+        1904,
+        -96
+      ],
+      "size": [
+        332.444921875,
+        304
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ACESTEP_MODEL",
+          "type": "ACESTEP_MODEL",
+          "links": [
+            4,
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "fcb984ee2c33a1a4e2fc728ec62e994d7f1727be",
+        "Node name for S&R": "ACEStepModelConfig"
+      },
+      "widgets_values": [
+        "turbo",
+        64,
+        128,
+        0.1,
+        "q_proj k_proj v_proj o_proj",
+        "both",
+        "none",
+        8,
+        3,
+        0.15
+      ]
+    },
+    {
+      "id": 10,
+      "type": "ACEStepProdigyPlusConfig",
+      "pos": [
+        1936,
+        608
+      ],
+      "size": [
+        285.878515625,
+        682
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ACESTEP_OPTIMIZER",
+          "type": "ACESTEP_OPTIMIZER",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "bananasss00/AceStep15-Wrapper",
+        "ver": "cb54a006b4cf901199ff66bb10f865b5a54dd183",
+        "Node name for S&R": "ACEStepProdigyPlusConfig"
+      },
+      "widgets_values": [
+        "cosine",
+        1,
+        0.01,
+        100,
+        1,
+        1,
+        0.000001,
+        -1,
+        0,
+        0,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ]
+    }
+  ],
+  "links": [
+    [
+      3,
+      5,
+      0,
+      4,
+      0,
+      "ACESTEP_DATASET"
+    ],
+    [
+      4,
+      6,
+      0,
+      4,
+      1,
+      "ACESTEP_MODEL"
+    ],
+    [
+      6,
+      8,
+      0,
+      4,
+      3,
+      "ACESTEP_PREVIEW"
+    ],
+    [
+      7,
+      4,
+      0,
+      9,
+      0,
+      "STRING"
+    ],
+    [
+      8,
+      10,
+      0,
+      4,
+      2,
+      "ACESTEP_OPTIMIZER"
+    ],
+    [
+      9,
+      5,
+      0,
+      11,
+      0,
+      "ACESTEP_DATASET"
+    ],
+    [
+      10,
+      6,
+      0,
+      11,
+      1,
+      "ACESTEP_MODEL"
+    ],
+    [
+      11,
+      11,
+      0,
+      12,
+      0,
+      "STRING"
+    ],
+    [
+      12,
+      13,
+      0,
+      14,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Train",
+      "bounding": [
+        2416,
+        -544,
+        1300,
+        787.6
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Layers Estimator",
+      "bounding": [
+        2416,
+        272,
+        772,
+        339.6
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "Lora Resizer",
+      "bounding": [
+        2416,
+        640,
+        1108,
+        285.6
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.7513148009015781,
+      "offset": [
+        -1809.3239999999998,
+        642.557
+      ]
+    },
+    "frontendVersion": "1.39.14"
+  },
+  "version": 0.4
+}
