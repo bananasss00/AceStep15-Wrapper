@@ -442,11 +442,18 @@ class AceStepMusicGenerator:
                         decoder.set_adapter(active_names[0])
                 else:
                     # Если адаптер один, просто активируем его
+                    adapter_name = active_names[0]
                     try:
                         decoder.set_adapter(active_names)
                     except TypeError:
                         # Fallback для старых PEFT
-                        decoder.set_adapter(active_names[0])
+                        decoder.set_adapter(adapter_name)
+                    
+                    try:
+                        dit_handler.set_lora_scale(adapter_name, active_weights[0])
+                        # print(f"[ACE-Step] Применен вес {active_weights[0]} для LoRA '{adapter_name}'")
+                    except Exception as e:
+                        print(f"[ACE-Step] Ошибка применения веса LoRA: {e}")
                         
                 dit_handler.use_lora = True
                 dit_handler.lora_scale = active_weights[0] if active_weights else 1.0
