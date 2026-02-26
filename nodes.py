@@ -17,6 +17,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
+from safetensors.torch import load_file, save_file
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
 from acestep.inference import generate_music, GenerationParams, GenerationConfig, format_sample
@@ -190,6 +191,154 @@ class AceStepLoraLoader:
             return (new_model,)
 
         return (model,)
+    
+# ============================================================================
+# Запекание (Merge) LoRA в модель
+# ============================================================================
+class AceStepLoraBaker:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("ACESTEP_MODEL",),
+                "output_dir": ("STRING", {"default": folder_paths.get_output_directory(), "multiline": False}),
+                "file_name": ("STRING", {"default": "acestep_merged_model.safetensors", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_MODEL", "STRING")
+    RETURN_NAMES = ("model", "saved_path")
+    FUNCTION = "bake_loras"
+    CATEGORY = "ACE-Step"
+
+    def load_lora_sd(self, path):
+        """Вспомогательная функция для загрузки весов LoRA"""
+        if os.path.isdir(path):
+            st_path = os.path.join(path, "adapter_model.safetensors")
+            bin_path = os.path.join(path, "adapter_model.bin")
+            if os.path.exists(st_path): 
+                return load_file(st_path)
+            elif os.path.exists(bin_path): 
+                return torch.load(bin_path, map_location="cpu", weights_only=True)
+        else:
+            if path.endswith('.safetensors'): 
+                return load_file(path)
+            else: 
+                return torch.load(path, map_location="cpu", weights_only=True)
+        return None
+
+    def bake_loras(self, model, output_dir, file_name):
+        dit_handler = model["dit_handler"]
+        active_adapters = model.get("active_adapters", {})
+        
+        if not active_adapters:
+            print("[ACE-Step Baker] ⚠️ Нет активных LoRA для запекания. Подключите AceStepLoraLoader.")
+            return (model, "")
+            
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, file_name)
+        
+        print("\n[ACE-Step Baker] 🍳 Загрузка полной базовой модели с диска...")
+        
+        # === ИСПРАВЛЕНИЕ: Получаем имя модели из last_init_params ===
+        config_path = None
+        if hasattr(dit_handler, "last_init_params") and dit_handler.last_init_params:
+            config_path = dit_handler.last_init_params.get("config_path")
+        
+        # Если вдруг не нашли, пробуем хардкод (обычно не требуется)
+        if not config_path:
+            config_path = "acestep-v15-turbo" # Fallback
+            print(f"[ACE-Step Baker] ⚠️ Не удалось определить имя модели, используем {config_path}")
+
+        base_model_dir = os.path.join(dit_handler._get_project_root(), "checkpoints", config_path)
+        base_model_path = os.path.join(base_model_dir, "model.safetensors")
+        
+        if not os.path.exists(base_model_path):
+            raise FileNotFoundError(f"Не найден базовый файл модели: {base_model_path}")
+            
+        print(f"[ACE-Step Baker] Чтение базового файла: {base_model_path}")
+        merged_sd = load_file(base_model_path)
+        
+        registry = getattr(dit_handler, "_lora_service", None).registry if hasattr(dit_handler, "_lora_service") else {}
+        
+        lora_prefix = "base_model.model."
+        base_prefix = "decoder."
+
+        for adapter_name, strength in active_adapters.items():
+            if strength == 0.0:
+                continue
+                
+            lora_path = registry.get(adapter_name, {}).get("path", "")
+            if not lora_path or not os.path.exists(lora_path):
+                print(f"[ACE-Step Baker] ❌ Предупреждение: не найден путь для адаптера {adapter_name}")
+                continue
+                
+            print(f"[ACE-Step Baker] 💉 Запекание LoRA: {adapter_name} (Strength: {strength})")
+            lora_sd = self.load_lora_sd(lora_path)
+            
+            if lora_sd is None:
+                print(f"[ACE-Step Baker] ❌ Не удалось загрузить веса для {adapter_name}")
+                continue
+            
+            peft_config = dit_handler.model.decoder.peft_config.get(adapter_name)
+            if peft_config:
+                lora_r = peft_config.r
+                lora_alpha = peft_config.lora_alpha
+            else:
+                lora_r, lora_alpha = 64, 64 
+                
+            scale = (lora_alpha / lora_r) * strength
+            
+            merged_count = 0
+            for lora_key, lora_tensor in lora_sd.items():
+                if "lora_A" in lora_key:
+                    # LoRA key: base_model.model.layers.0...
+                    # Target key: decoder.layers.0...
+                    base_key = lora_key.replace(lora_prefix, base_prefix).replace(".lora_A.", ".")
+                    lora_b_key = lora_key.replace("lora_A", "lora_B")
+                    
+                    if base_key in merged_sd and lora_b_key in lora_sd:
+                        W = merged_sd[base_key]
+                        A = lora_tensor
+                        B = lora_sd[lora_b_key]
+                        
+                        orig_dtype = W.dtype
+                        
+                        W_f32 = W.to(torch.float32)
+                        A_f32 = A.to(torch.float32)
+                        B_f32 = B.to(torch.float32)
+                        
+                        if W.ndim == 2 and A.ndim == 2 and B.ndim == 2:
+                            delta_W = B_f32 @ A_f32
+                            W_f32 += delta_W * scale
+                            merged_sd[base_key] = W_f32.to(orig_dtype)
+                            merged_count += 1
+                            
+                elif "lora_B" in lora_key:
+                    continue
+                    
+                else:
+                    # Bias и другие параметры
+                    base_key = lora_key.replace(lora_prefix, base_prefix)
+                        
+                    if base_key in merged_sd:
+                        W = merged_sd[base_key]
+                        orig_dtype = W.dtype
+                        
+                        W_f32 = W.to(torch.float32)
+                        L_f32 = lora_tensor.to(torch.float32)
+                        
+                        W_f32 = W_f32 + (L_f32 - W_f32) * strength
+                        merged_sd[base_key] = W_f32.to(orig_dtype)
+                        merged_count += 1
+
+            print(f"[ACE-Step Baker] Успешно слито матриц: {merged_count}")
+
+        print(f"[ACE-Step Baker] 💾 Сохранение итоговой модели в {save_path} ...")
+        save_file(merged_sd, save_path)
+        print(f"[ACE-Step Baker] ✨ Запекание завершено! Итоговый размер: {os.path.getsize(save_path) / (1024**3):.2f} ГБ")
+        
+        return (model, save_path)
 
 # ============================================================================
 # 3. Настройка параметров LLM
@@ -576,13 +725,16 @@ class AceStepMusicGenerator:
 NODE_CLASS_MAPPINGS = {
     "AceStepModelLoader": AceStepModelLoader,
     "AceStepLoraLoader": AceStepLoraLoader,
+    "AceStepLoraBaker": AceStepLoraBaker,
     "AceStepLMConfig": AceStepLMConfig,
     "AceStepPromptEnhancer": AceStepPromptEnhancer,
     "AceStepMusicGenerator": AceStepMusicGenerator
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepModelLoader": "ACE-Step Model Loader 🎵",
     "AceStepLoraLoader": "ACE-Step LoRA Loader 💊",
+    "AceStepLoraBaker": "ACE-Step LoRA Baker 🍳",
     "AceStepLMConfig": "ACE-Step LM Config ⚙️",
     "AceStepPromptEnhancer": "ACE-Step Prompt Enhancer ✍️",
     "AceStepMusicGenerator": "ACE-Step Music Generator 🎵"
