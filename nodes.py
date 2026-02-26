@@ -394,6 +394,7 @@ class AceStepPromptEnhancer:
         return {
             "required": {
                 "model": ("ACESTEP_MODEL",),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "caption": ("STRING", {"multiline": True, "default": "pop song"}),
                 "lyrics": ("STRING", {"multiline": True, "default": ""}),
                 "keep_orig_caption": ("BOOLEAN", {"default": False, "tooltip": "Отдать на выход оригинальный Caption, игнорируя результат LLM"}),
@@ -413,7 +414,7 @@ class AceStepPromptEnhancer:
     FUNCTION = "enhance"
     CATEGORY = "ACE-Step"
 
-    def enhance(self, model, caption, lyrics, keep_orig_caption, keep_orig_lyrics,
+    def enhance(self, model, seed, caption, lyrics, keep_orig_caption, keep_orig_lyrics,
                 lm_config=None, bpm_override=0, keyscale_override="", 
                 time_signature_override="", language_override="none"):
         
