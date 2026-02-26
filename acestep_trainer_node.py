@@ -177,7 +177,6 @@ class ACEStepProdigyPlusConfig:
         inputs.update({
             "d_coef": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
             "d0": ("FLOAT", {"default": 1e-6, "min": 1e-8, "step": 1e-7, "precision": 8}),
-            # FIX: Limits for Beta3
             "beta3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.99, "step": 0.01, "tooltip": "Set to -1.0 for Auto"}), 
             "prodigy_steps": ("INT", {"default": 0, "min": 0}),
             "schedulefree_c": ("FLOAT", {"default": 0.0, "min": 0.0}),
@@ -555,7 +554,6 @@ class ACEStepTrainer:
                 "dataset_config": ("ACESTEP_DATASET",),
                 "model_config": ("ACESTEP_MODEL",),
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
-                # FIX: Seed Limits
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
                 "offload_enc": ("BOOLEAN", {"default": False}),
@@ -564,7 +562,6 @@ class ACEStepTrainer:
             "optional": {
                 "preview_config": ("ACESTEP_PREVIEW",),
             },
-            # FIX: Hidden params for Workflow Saving
             "hidden": {
                 "unique_id": "UNIQUE_ID",
                 "prompt": "PROMPT", 
@@ -582,13 +579,18 @@ class ACEStepTrainer:
         if not glob.glob(os.path.join(path, "*.pt")): return False
         return True
 
-    # Функция сохранения картинки графика на диск
-    def save_graph_to_disk(self, epochs, losses, emas, output_dir):
+    def save_graph_to_disk(self, epochs, losses, emas, output_dir, saved_epochs=None):
+        if saved_epochs is None:
+            saved_epochs =[]
         try:
-            fig = Figure(figsize=(8, 6), dpi=100) # Побольше разрешение для файла
+            fig = Figure(figsize=(8, 6), dpi=100)
             ax = fig.add_subplot(111)
             ax.set_facecolor('#f0f0f0')
             ax.grid(True, linestyle='--', color='#999999', alpha=0.5)
+            
+            # Отметки сохранений
+            for se in saved_epochs:
+                ax.axvline(x=se, color='#888888', linestyle=':', linewidth=1.5, alpha=0.8)
             
             ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
             ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
@@ -606,16 +608,30 @@ class ACEStepTrainer:
         except Exception as e:
             print(f"⚠️ Failed to save graph to disk: {e}")
 
-    # Функция отправки превью в UI (маленькая)
-    def send_loss_update(self, node_id, epochs, losses, emas):
-        fig = Figure(figsize=(4, 3), dpi=100, facecolor='#2b2b2b')
+    def send_loss_update(self, node_id, epochs, losses, emas, elapsed_str="", eta_str="", saved_epochs=None):
+        if saved_epochs is None:
+            saved_epochs =[]
+            
+        fig = Figure(figsize=(4.5, 3.5), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
         ax.grid(True, linestyle='--', color='#444444', alpha=0.3)
         ax.tick_params(colors='#e0e0e0', labelsize=8)
         for spine in ax.spines.values(): spine.set_color('#444444')
+        
+        # Отметки сохранений пунктирными линиями
+        for se in saved_epochs:
+            ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
+            
         ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
         ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
+        
+        # Отображение времени и лоссов над графиком
+        last_loss = losses[-1] if losses else 0.0
+        last_ema = emas[-1] if emas else 0.0
+        title = f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f}\nElapsed: {elapsed_str} | ETA: {eta_str}"
+        ax.set_title(title, color='#e0e0e0', fontsize=9, pad=8)
+        
         ax.legend(loc='upper right', facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         fig.tight_layout()
         canvas = FigureCanvasAgg(fig)
@@ -637,7 +653,6 @@ class ACEStepTrainer:
             checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
             output_dir = dataset_config["output_dir"].strip('"')
             
-            # --- FIX: Save Workflow to output_dir ---
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
 
@@ -648,7 +663,6 @@ class ACEStepTrainer:
                         json.dump(extra_pnginfo["workflow"], f, indent=2)
                 except Exception as e:
                     print(f"⚠️ Failed to save workflow: {e}")
-            # ----------------------------------------
 
             dataset_name = "default_dataset"
             if clean_source:
@@ -775,11 +789,20 @@ class ACEStepTrainer:
             training_state = {"should_stop": False}
             start_time = time.time()
 
-            epoch_history =[]
+            epoch_history = []
             loss_history = []
             ema_history =[]
             ema_loss = None
             ema_alpha = 0.1
+            
+            saved_epochs = []
+            current_epoch = 0.0
+
+            # Хелпер для форматирования времени (HH:MM:SS)
+            def fmt_time(secs):
+                m, s = divmod(int(max(0, secs)), 60)
+                h, m = divmod(m, 60)
+                return f"{h:02d}:{m:02d}:{s:02d}"
 
             for update in trainer.train(training_state):
                 if mm.processing_interrupted():
@@ -798,26 +821,53 @@ class ACEStepTrainer:
                     loss_history.append(loss)
                     ema_history.append(ema_loss)
 
-                    # Send to UI
+                    # Подсчет времени (Затраченное / Оставшееся)
+                    elapsed = time.time() - start_time
+                    if update.step > 0:
+                        time_per_step = elapsed / update.step
+                        remaining_steps = total_steps_approx - update.step
+                        eta_secs = remaining_steps * time_per_step
+                    else:
+                        eta_secs = 0
+                        
+                    elapsed_str = fmt_time(elapsed)
+                    eta_str = fmt_time(eta_secs)
+
+                    # Отправка обновленного графика в ноду ComfyUI (каждые 5 шагов)
                     if update.step % 5 == 0 and unique_id is not None:
                         try:
                             node_id_str = unique_id[0] if isinstance(unique_id, list) else str(unique_id)
-                            self.send_loss_update(node_id_str, epoch_history, loss_history, ema_history)
+                            self.send_loss_update(
+                                node_id_str, 
+                                epoch_history, 
+                                loss_history, 
+                                ema_history,
+                                elapsed_str,
+                                eta_str,
+                                saved_epochs
+                            )
                         except Exception: pass
 
                 if update.msg:
                     is_spam = ("Step" in update.msg and "Loss" in update.msg) or ("Epoch" in update.msg and "Loss" in update.msg)
-                    if not is_spam: print(f"[LOG] {update.msg}")
+                    if not is_spam: 
+                        print(f"[LOG] {update.msg}")
+                        
+                    # Отслеживаем сохранения для отрисовки вертикальных линий
+                    msg_lower = update.msg.lower()
+                    if "save" in msg_lower or "saving" in msg_lower or "saved" in msg_lower:
+                        if epoch_history:
+                            last_ep = epoch_history[-1]
+                            # Проверяем, что не отмечаем одно и то же сохранение многократно
+                            if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
+                                saved_epochs.append(last_ep)
 
-            # --- FIX: Save Final Graph to Disk ---
+            # Сохранение финального графика на диск (с вертикальными линиями)
             if loss_history:
-                self.save_graph_to_disk(epoch_history, loss_history, ema_history, output_dir)
-            # -------------------------------------
+                self.save_graph_to_disk(epoch_history, loss_history, ema_history, output_dir, saved_epochs)
 
             elapsed = time.time() - start_time
-            m, s = divmod(int(elapsed), 60)
-            h, m = divmod(m, 60)
-            print(f"\n🎉 Finished in {h:02d}:{m:02d}:{s:02d}")
+            print(f"\n🎉 Finished in {fmt_time(elapsed)}")
             mm.soft_empty_cache()
             return (output_dir,)
 
