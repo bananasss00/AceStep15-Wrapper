@@ -257,13 +257,84 @@ class ACEStepPreviewConfig:
                 "prev_bpm": ("STRING", {"default": ""}),
                 "prev_key": ("STRING", {"default": ""}),
                 "prev_ts": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "dataset_config": ("ACESTEP_DATASET",),
             }
         }
-    RETURN_TYPES = ("ACESTEP_PREVIEW",)
+    RETURN_TYPES = ("ACESTEP_PREVIEW", "STRING")
+    RETURN_NAMES = ("preview_config", "dataset_indices")
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
+    
     def get_config(self, **kwargs):
-        return (kwargs,)
+        dataset_config = kwargs.pop("dataset_config", None)
+        indices_str = "⚠️ Please connect 'Dataset Config' to see the predicted list of files and indices."
+        
+        if dataset_config is not None:
+            clean_source = dataset_config.get("data_source", "").strip('"')
+            
+            if not clean_source or not os.path.exists(clean_source):
+                indices_str = f"⚠️ Data source not found:\n{clean_source}\nPlease provide a valid directory or .json file in 'Dataset Config'."
+            else:
+                basenames =[]
+                
+                # Если передан JSON
+                if clean_source.lower().endswith('.json'):
+                    try:
+                        with open(clean_source, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            
+                            # Умный поиск семплов в зависимости от структуры JSON
+                            samples_list =[]
+                            if isinstance(data, dict) and "samples" in data and isinstance(data["samples"], list):
+                                # Формат ACE-Step V2: {"metadata": {...}, "samples": [{...}, {...}]}
+                                samples_list = data["samples"]
+                            elif isinstance(data, list):
+                                # Простой массив: [{...}, {...}]
+                                samples_list = data
+                            elif isinstance(data, dict):
+                                # Словарь где ключи это ID: {"id1": {"audio_path": "..."}, ...}
+                                samples_list =[v for v in data.values() if isinstance(v, dict)]
+                            
+                            # Извлекаем пути к файлам
+                            for item in samples_list:
+                                if isinstance(item, dict):
+                                    path_key = next((k for k in["audio_path", "audio", "path", "file", "filename"] if k in item), None)
+                                    if path_key and item[path_key]:
+                                        basenames.append(os.path.basename(item[path_key]))
+                    except Exception as e:
+                        indices_str = f"⚠️ Error reading JSON: {e}"
+                        return (kwargs, indices_str)
+                        
+                # Если передана директория с аудио
+                elif os.path.isdir(clean_source):
+                    valid_exts = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus'}
+                    try:
+                        for f in os.listdir(clean_source):
+                            if os.path.isfile(os.path.join(clean_source, f)):
+                                ext = os.path.splitext(f)[1].lower()
+                                if ext in valid_exts:
+                                    basenames.append(f)
+                    except Exception as e:
+                        indices_str = f"⚠️ Error reading directory: {e}"
+                        return (kwargs, indices_str)
+
+                if not basenames:
+                    indices_str = f"⚠️ No valid audio files found in data source:\n{clean_source}"
+                else:
+                    # В тренере файлы считываются через sorted(glob(".../*.pt"))
+                    # Эмулируем это: генерируем имена .pt файлов и сортируем по алфавиту
+                    pt_names = [os.path.splitext(b)[0] + ".pt" for b in basenames]
+                    pt_names = sorted(list(set(pt_names)))
+                    
+                    lines =[f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
+                    for idx, pt in enumerate(pt_names):
+                        lines.append(f"[{idx}] ➔ {pt}")
+                    
+                    indices_str = "\n".join(lines)
+
+        return (kwargs, indices_str)
 
 
 # ======================================================================
