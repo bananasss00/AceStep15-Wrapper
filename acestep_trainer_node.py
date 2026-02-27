@@ -681,7 +681,7 @@ class ACEStepTrainer:
         if not glob.glob(os.path.join(path, "*.pt")): return False
         return True
 
-    def save_graph_to_disk(self, epochs, losses, emas, output_dir, saved_epochs=None):
+    def save_graph_to_disk(self, epochs, losses, emas, lrs, output_dir, saved_epochs=None):
         if saved_epochs is None:
             saved_epochs =[]
         try:
@@ -694,12 +694,23 @@ class ACEStepTrainer:
             for se in saved_epochs:
                 ax.axvline(x=se, color='#888888', linestyle=':', linewidth=1.5, alpha=0.8)
             
-            ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
-            ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
+            ln1 = ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
+            ln2 = ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
             ax.set_xlabel("Epochs")
             ax.set_ylabel("Loss")
+
+            # Вторая ось Y для Learning Rate
+            ax2 = ax.twinx()
+            ln3 = ax2.plot(epochs, lrs, color='#2196f3', linestyle=':', linewidth=1.5, label='LR')
+            ax2.set_ylabel("Learning Rate", color='#2196f3')
+            ax2.tick_params(axis='y', labelcolor='#2196f3')
+
+            # Объединенная легенда
+            lns = ln1 + ln2 + ln3
+            labs =[l.get_label() for l in lns]
+            ax.legend(lns, labs, loc='upper right')
+            
             ax.set_title("Training Progress")
-            ax.legend()
             
             fig.tight_layout()
             
@@ -710,11 +721,12 @@ class ACEStepTrainer:
         except Exception as e:
             print(f"⚠️ Failed to save graph to disk: {e}")
 
-    def send_loss_update(self, node_id, epochs, losses, emas, elapsed_str="", eta_str="", saved_epochs=None):
+    def send_loss_update(self, node_id, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None):
         if saved_epochs is None:
             saved_epochs =[]
             
-        fig = Figure(figsize=(4.5, 3.5), dpi=100, facecolor='#2b2b2b')
+        # Увеличили высоту графика (с 3.5 до 4.2), чтобы влезла многострочная шапка и легенда внизу
+        fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
         ax.grid(True, linestyle='--', color='#444444', alpha=0.3)
@@ -725,17 +737,35 @@ class ACEStepTrainer:
         for se in saved_epochs:
             ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
             
-        ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
-        ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
+        ln1 = ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
+        ln2 = ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
         
-        # Отображение времени и лоссов над графиком
+        # Вторая ось Y для Learning Rate
+        ax2 = ax.twinx()
+        ax2.tick_params(colors='#2196f3', labelsize=8)
+        for spine in ax2.spines.values(): spine.set_color('#444444')
+        ln3 = ax2.plot(epochs, lrs, color='#2196f3', linestyle=':', linewidth=1.5, alpha=0.8, label='LR')
+
+        # Формируем заголовок с новой статистикой
         last_loss = losses[-1] if losses else 0.0
         last_ema = emas[-1] if emas else 0.0
-        title = f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f}\nElapsed: {elapsed_str} | ETA: {eta_str}"
-        ax.set_title(title, color='#e0e0e0', fontsize=9, pad=8)
+        last_lr = lrs[-1] if lrs else 0.0
         
-        ax.legend(loc='upper right', facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
-        fig.tight_layout()
+        title_lines =[
+            f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
+            f"Time: {elapsed_str} (ETA: {eta_str})",
+            f"Speed: {step_time_str} | {epoch_time_str}"
+        ]
+        ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
+        
+        # Объединенная легенда внизу под графиком
+        lns = ln1 + ln2 + ln3
+        labs = [l.get_label() for l in lns]
+        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
+                  facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
+        
+        fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
+        
         canvas = FigureCanvasAgg(fig)
         buf = BytesIO()
         canvas.print_png(buf)
@@ -911,6 +941,7 @@ class ACEStepTrainer:
             epoch_history = []
             loss_history = []
             ema_history =[]
+            lr_history =[]
             ema_loss = None
             ema_alpha = 0.1
             
@@ -932,6 +963,8 @@ class ACEStepTrainer:
                 if update.kind == "step":
                     pbar.update(1)
                     loss = update.loss
+                    current_lr = getattr(update, "lr", 0.0) # Безопасно достаем LR из update
+                    
                     if ema_loss is None: ema_loss = loss
                     else: ema_loss = ema_alpha * loss + (1 - ema_alpha) * ema_loss
 
@@ -939,6 +972,7 @@ class ACEStepTrainer:
                     epoch_history.append(current_epoch)
                     loss_history.append(loss)
                     ema_history.append(ema_loss)
+                    lr_history.append(current_lr)
 
                     # Подсчет времени (Затраченное / Оставшееся)
                     elapsed = time.time() - start_time
@@ -946,8 +980,25 @@ class ACEStepTrainer:
                         time_per_step = elapsed / update.step
                         remaining_steps = total_steps_approx - update.step
                         eta_secs = remaining_steps * time_per_step
+                        
+                        # Форматируем скорость шага
+                        if time_per_step < 1.0:
+                            step_time_str = f"{int(time_per_step * 1000)}ms/it"
+                        else:
+                            step_time_str = f"{time_per_step:.2f}s/it"
+                            
+                        # Считаем время на эпоху
+                        time_per_epoch = time_per_step * steps_per_epoch
+                        ep_m, ep_s = divmod(int(time_per_epoch), 60)
+                        ep_h, ep_m = divmod(ep_m, 60)
+                        if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
+                        elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
+                        else: epoch_time_str = f"{ep_s}s/ep"
+                        
                     else:
                         eta_secs = 0
+                        step_time_str = "0s/it"
+                        epoch_time_str = "0s/ep"
                         
                     elapsed_str = fmt_time(elapsed)
                     eta_str = fmt_time(eta_secs)
@@ -961,8 +1012,11 @@ class ACEStepTrainer:
                                 epoch_history, 
                                 loss_history, 
                                 ema_history,
+                                lr_history,
                                 elapsed_str,
                                 eta_str,
+                                step_time_str,
+                                epoch_time_str,
                                 saved_epochs
                             )
                         except Exception: pass
@@ -981,9 +1035,9 @@ class ACEStepTrainer:
                             if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                 saved_epochs.append(last_ep)
 
-            # Сохранение финального графика на диск (с вертикальными линиями)
+            # Сохранение финального графика на диск (с вертикальными линиями и LR)
             if loss_history:
-                self.save_graph_to_disk(epoch_history, loss_history, ema_history, output_dir, saved_epochs)
+                self.save_graph_to_disk(epoch_history, loss_history, ema_history, lr_history, output_dir, saved_epochs)
 
             elapsed = time.time() - start_time
             print(f"\n🎉 Finished in {fmt_time(elapsed)}")
