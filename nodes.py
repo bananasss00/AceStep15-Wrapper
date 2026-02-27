@@ -518,6 +518,7 @@ class AceStepMusicGenerator:
         """
         Ручное управление слоями PEFT для обхода ограничений ACE-Step и старых версий PEFT.
         Использует add_weighted_adapter для безопасного смешивания нескольких LoRA.
+        Поддерживает LoKr (LyCORIS), игнорируя вызовы PEFT.
         """
         if not dit_handler.lora_loaded:
             return
@@ -526,29 +527,36 @@ class AceStepMusicGenerator:
         decoder = getattr(dit_handler.model, "decoder", None)
         combo_name = "comfy_mixed_lora"
         
+        # Определяем тип адаптера: PEFT (обычная LoRA) или LyCORIS (LoKr)
+        is_lokr = getattr(dit_handler, "_adapter_type", None) == "lokr" or hasattr(decoder, "_lycoris_net")
+        is_peft = hasattr(decoder, "peft_config") and bool(decoder.peft_config)
+        
         # Если нет запрашиваемых адаптеров (байпасс всех нод)
         if not requested_adapters:
             if unload_unused:
-                print("[ACE-Step] Запрошенных LoRA нет. Полная выгрузка PEFT...")
+                print("[ACE-Step] Запрошенных LoRA нет. Полная выгрузка...")
                 dit_handler.unload_lora()
             else:
                 print("[ACE-Step] Запрошенных LoRA нет. Отключаем слои...")
-                if decoder and hasattr(decoder, "disable_adapter_layers"):
+                if is_peft and hasattr(decoder, "disable_adapter_layers"):
                     decoder.disable_adapter_layers()
+                # Для LoKr мы просто ставим scale в 0
+                if is_lokr and loaded_adapters:
+                    try:
+                        dit_handler.set_lora_scale(loaded_adapters[0], 0.0)
+                    except: pass
                 dit_handler.use_lora = False
             return
 
-        active_names = []
-        active_weights = []
+        active_names =[]
+        active_weights =[]
         
         for name in loaded_adapters:
-            # Игнорируем наш временный адаптер для смешивания при переборе
             if name == combo_name:
                 continue
 
             if name in requested_adapters:
                 weight = float(requested_adapters[name])
-                # Записываем вес для внутреннего стейта ACE-Step
                 dit_handler._active_loras[name] = weight
                 
                 if weight > 0.0:
@@ -566,50 +574,58 @@ class AceStepMusicGenerator:
                 else:
                     dit_handler._active_loras[name] = 0.0
 
-        # Активация адаптеров (Обход ошибки TypeError: unhashable type: 'list')
         if decoder is not None:
             if active_names:
-                if hasattr(decoder, "enable_adapter_layers"):
-                    decoder.enable_adapter_layers()
-                
-                # Если адаптеров несколько, смешиваем их в один виртуальный
-                if len(active_names) > 1 and hasattr(decoder, "add_weighted_adapter"):
-                    try:
-                        if combo_name in decoder.peft_config:
-                            decoder.delete_adapter(combo_name)
-                        
-                        # Линейное объединение весов
-                        decoder.add_weighted_adapter(
-                            adapters=active_names, 
-                            weights=active_weights, 
-                            adapter_name=combo_name, 
-                            combination_type="linear"
-                        )
-                        decoder.set_adapter(combo_name)
-                        print(f"[ACE-Step] Смешаны мульти-LoRA: {active_names} с весами {active_weights}")
-                    except Exception as e:
-                        print(f"[ACE-Step] Не удалось смешать адаптеры: {e}. Включаем только первый: {active_names[0]}")
-                        decoder.set_adapter(active_names[0])
-                else:
-                    # Если адаптер один, просто активируем его
-                    adapter_name = active_names[0]
-                    try:
-                        decoder.set_adapter(active_names)
-                    except TypeError:
-                        # Fallback для старых PEFT
-                        decoder.set_adapter(adapter_name)
+                # --- ЛОГИКА ТОЛЬКО ДЛЯ PEFT (Обычная LoRA) ---
+                if is_peft:
+                    if hasattr(decoder, "enable_adapter_layers"):
+                        decoder.enable_adapter_layers()
                     
-                    try:
-                        dit_handler.set_lora_scale(adapter_name, active_weights[0])
-                        # print(f"[ACE-Step] Применен вес {active_weights[0]} для LoRA '{adapter_name}'")
-                    except Exception as e:
-                        print(f"[ACE-Step] Ошибка применения веса LoRA: {e}")
+                    if len(active_names) > 1 and hasattr(decoder, "add_weighted_adapter"):
+                        try:
+                            if combo_name in decoder.peft_config:
+                                decoder.delete_adapter(combo_name)
+                            decoder.add_weighted_adapter(
+                                adapters=active_names, 
+                                weights=active_weights, 
+                                adapter_name=combo_name, 
+                                combination_type="linear"
+                            )
+                            decoder.set_adapter(combo_name)
+                            print(f"[ACE-Step] Смешаны мульти-LoRA: {active_names} с весами {active_weights}")
+                        except Exception as e:
+                            print(f"[ACE-Step] Не удалось смешать адаптеры: {e}. Включаем только первый: {active_names[0]}")
+                            decoder.set_adapter(active_names[0])
+                    else:
+                        adapter_name = active_names[0]
+                        try:
+                            # Защита от вылета, если адаптер есть в списке, но не в PEFT
+                            if adapter_name in decoder.peft_config:
+                                try:
+                                    decoder.set_adapter(active_names)
+                                except TypeError:
+                                    decoder.set_adapter(adapter_name)
+                        except Exception as e:
+                            print(f"[ACE-Step] Warning PEFT set_adapter: {e}")
+
+                # --- ОБЩАЯ ЛОГИКА УСТАНОВКИ ВЕСА (Работает и для LyCORIS/LoKr) ---
+                adapter_name = active_names[0]
+                try:
+                    # В случае PEFT multi-LoRA мы уже смешали веса через add_weighted_adapter
+                    scale_to_apply = active_weights[0] if not (is_peft and len(active_names) > 1) else 1.0
+                    dit_handler.set_lora_scale(adapter_name, scale_to_apply)
+                except Exception as e:
+                    print(f"[ACE-Step] Ошибка применения веса LoRA: {e}")
                         
                 dit_handler.use_lora = True
                 dit_handler.lora_scale = active_weights[0] if active_weights else 1.0
             else:
-                if hasattr(decoder, "disable_adapter_layers"):
+                if is_peft and hasattr(decoder, "disable_adapter_layers"):
                     decoder.disable_adapter_layers()
+                if is_lokr and loaded_adapters:
+                    try:
+                        dit_handler.set_lora_scale(loaded_adapters[0], 0.0)
+                    except: pass
                 dit_handler.use_lora = False
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 

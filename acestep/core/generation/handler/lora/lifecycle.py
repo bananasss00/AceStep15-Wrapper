@@ -11,12 +11,10 @@ from loguru import logger
 from acestep.constants import DEBUG_MODEL_LOADING
 from acestep.debug_utils import debug_log
 from acestep.training.configs import LoKRConfig
-# from peft import PeftModel, PeftConfig 
-
-from peft.utils.save_and_load import set_peft_model_state_dict
 
 # Понадобится для чтения safetensors в память
 try:
+    from peft.utils.save_and_load import set_peft_model_state_dict
     from safetensors.torch import load_file as load_safetensors
 except ImportError:
     load_safetensors = None
@@ -163,6 +161,15 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
     lycoris_net.apply_to()
     decoder._lycoris_net = lycoris_net
     lycoris_net.load_weights(weights_path)
+    
+    # ФИКС: Принудительно конвертируем сеть Lycoris в тот же формат (bfloat16) и device, что и базовая модель
+    try:
+        sample_param = next(decoder.parameters())
+        lycoris_net.to(device=sample_param.device, dtype=sample_param.dtype)
+        logger.info(f"Cast LyCORIS network to {sample_param.device} / {sample_param.dtype}")
+    except Exception as e:
+        logger.warning(f"Failed to cast LyCORIS network dtype: {e}")
+        
     return lycoris_net
 
 
@@ -174,28 +181,21 @@ def _default_adapter_name_from_path(lora_path: str) -> str:
 
 def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias: bool = False) -> str:
     """
-    Load a LoRA adapter. 
-    If ignore_bias=True, loads weights into RAM, removes bias keys, and injects into PEFT 
-    to avoid 'only 1 adapter with bias' errors.
+    Load a LoRA or LoKr adapter. 
     """
     if self.model is None:
         return "❌ Model not initialized."
 
-
     if not lora_path or not os.path.exists(lora_path):
         return f"❌ LoRA path not found: {lora_path}"
     try:
-        from peft import PeftModel, PeftConfig  # УЖЕ ИМПОРТИРОВАНО В НАЧАЛЕ
+        from peft import PeftModel, PeftConfig 
     except ImportError:
-        if lokr_weights_path is None:
-            return "❌ PEFT library not installed. Please install with: pip install peft"
-        PeftModel = None  # type: ignore[assignment]
-        PeftConfig = None  # type: ignore[assignment]
-    
+        PeftModel = None
+        PeftConfig = None
 
     effective_name = adapter_name.strip() if adapter_name else _default_adapter_name_from_path(lora_path)
     
-    # Проверка на уже загруженный адаптер
     _active_loras = getattr(self, "_active_loras", None)
     if _active_loras is None:
         self._active_loras = {}
@@ -205,28 +205,55 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
         return f"✅ Adapter '{effective_name}' already loaded."
 
     decoder = self.model.decoder
-    is_peft = isinstance(decoder, PeftModel)
+    is_peft = isinstance(decoder, PeftModel) if PeftModel else False
 
-    # --- ЛОГИКА IN-MEMORY FILTERING ---
+    # 1. СНАЧАЛА проверяем, не LoKr ли это. 
+    lokr_weights_path = _resolve_lokr_weights_path(lora_path)
+    
+    if lokr_weights_path is not None:
+        # ЭТО LOKR
+        try:
+            if is_peft:
+                return "❌ LoKr cannot be mixed with PEFT models. Unload PEFT LoRAs first."
+            
+            logger.info(f"Loading LoKr '{effective_name}' (ignore_bias flag is ignored for LoKr)")
+            if self._base_decoder is None:
+                sd = decoder.state_dict()
+                self._base_decoder = {k: v.detach().cpu().clone() for k, v in sd.items()}
+
+            _load_lokr_adapter(decoder, lokr_weights_path)
+            self.model.decoder = decoder
+            self._adapter_type = "lokr"
+            
+            self.model.decoder.to(self.device).eval()
+            self.lora_loaded = True
+            self.use_lora = True
+            self._active_loras[effective_name] = 1.0
+            
+            self._ensure_lora_registry()
+            self._rebuild_lora_registry(lora_path=lora_path)
+            self._lora_service.set_active_adapter(effective_name)
+            self._lora_active_adapter = effective_name
+            
+            return f"✅ LoKr '{effective_name}' loaded."
+        except Exception as e:
+            logger.exception("Failed to load LoKr")
+            return f"❌ Failed to load LoKr: {e}"
+
+    # 2. ЕСЛИ ЭТО PEFT LORA И ВКЛЮЧЕН ignore_bias
     if ignore_bias:
         try:
-            logger.info(f"Loading LoRA '{effective_name}' with in-memory bias filtering...")
-            
-            # 1. Загружаем и патчим конфиг в памяти
+            logger.info(f"Loading PEFT LoRA '{effective_name}' with in-memory bias filtering...")
             config = PeftConfig.from_pretrained(lora_path)
             if hasattr(config, 'bias'):
-                config.bias = "none" # Принудительно отключаем bias в конфиге
+                config.bias = "none" 
             
-            # 2. Загружаем веса в память
             state_dict = None
-            
-            # Пробуем safetensors
             if load_safetensors:
                 st_files = glob.glob(os.path.join(lora_path, "*.safetensors"))
                 if st_files:
                     state_dict = load_safetensors(st_files[0])
             
-            # Пробуем bin, если safetensors нет или не сработал
             if state_dict is None:
                 bin_files = glob.glob(os.path.join(lora_path, "*.bin"))
                 if bin_files:
@@ -235,90 +262,58 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
             if state_dict is None:
                 return "❌ Could not find weights (.safetensors or .bin) in LoRA path."
 
-            # 3. Фильтруем веса (удаляем bias)
             clean_state_dict = {k: v for k, v in state_dict.items() if "bias" not in k}
             removed_count = len(state_dict) - len(clean_state_dict)
             if removed_count > 0:
                 logger.info(f"Filtered {removed_count} bias keys from state_dict.")
 
-            # 4. Применяем к модели
             if not is_peft:
-                # Первый адаптер: создаем PeftModel
-                # Backup base model
                 if self._base_decoder is None:
                     base_sd = decoder.state_dict()
                     self._base_decoder = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
-                
                 if hasattr(decoder, "peft_config"): del decoder.peft_config
                 
-                # Инициализируем пустую PeftModel с нашим конфигом (она создаст слои, но веса будут случайные)
                 self.model.decoder = PeftModel(decoder, config, adapter_name=effective_name)
                 self._adapter_type = "lora"
             else:
-                # Добавляем новый адаптер (создает слои)
                 self.model.decoder.add_adapter(effective_name, config)
             
-            # 5. Загружаем наши очищенные веса в созданные слои
-            # set_peft_model_state_dict сама разберется с префиксами для конкретного адаптера
-            # Важно: set_peft_model_state_dict ожидает ключи вида "base_model.model.layers...",
-            # а в файле они могут быть короче. Peft обычно хендлит это, но проверим.
-            
-            # Простой способ: используем внутренний метод load_state_dict PEFT-модели для конкретного адаптера? 
-            # Нет, надежнее использовать утилиту set_peft_model_state_dict.
-            # Но ключи в state_dict могут требовать переименования, если они сохранены без префиксов.
-            
-            # Попытка загрузки
             incompatible = set_peft_model_state_dict(self.model.decoder, clean_state_dict, adapter_name=effective_name)
             if incompatible and incompatible.unexpected_keys:
                  logger.warning(f"Unexpected keys during in-memory load: {incompatible.unexpected_keys[:5]}")
             
-            # Успех
             self.model.decoder.to(self.device).eval()
             self.lora_loaded = True
             self.use_lora = True
             self._active_loras[effective_name] = 1.0
             
-            # Обновляем реестр и активируем
             self._ensure_lora_registry()
-            # Важно: rebuild_lora_registry обычно сканирует файлы, но у нас файл не совпадает с тем, что в памяти.
-            # Передадим lora_path, чтобы он нашел targets из json, это безопасно.
             self._rebuild_lora_registry(lora_path=lora_path) 
             self._lora_service.set_active_adapter(effective_name)
             self._lora_active_adapter = effective_name
             
-            return f"✅ LoRA '{effective_name}' loaded (RAM filtered)."
+            return f"✅ PEFT LoRA '{effective_name}' loaded (RAM filtered)."
 
         except Exception as e:
             logger.exception("In-memory LoRA load failed")
             return f"❌ In-memory load failed: {e}"
 
-    # --- СТАНДАРТНАЯ ЛОГИКА (Если ignore_bias=False или LoKr) ---
-    
-    # ... (здесь идет остаток оригинальной функции для случая LoKr или стандартной загрузки) ...
-    # Я приведу полный код функции ниже, чтобы вы просто скопировали и вставили.
-
-    # [ВСТАВИТЬ СТАРЫЙ КОД ТУТ ДЛЯ LOKR И ОБЫЧНОЙ ЗАГРУЗКИ]
-    # Для краткости ответа, вот полная комбинированная функция:
-
-    lokr_weights_path = _resolve_lokr_weights_path(lora_path)
-    
+    # 3. СТАНДАРТНАЯ ЗАГРУЗКА PEFT LORA
     try:
+        if PeftModel is None:
+            return "❌ PEFT library not installed. Please install with: pip install peft"
+
+        if getattr(self, "_adapter_type", None) == "lokr":
+            return "❌ PEFT LoRA cannot be mixed with loaded LoKr. Unload LoKr first."
+
         if not is_peft:
             if self._base_decoder is None:
                 sd = decoder.state_dict()
                 self._base_decoder = {k: v.detach().cpu().clone() for k, v in sd.items()}
-
-            if lokr_weights_path is not None:
-                _load_lokr_adapter(decoder, lokr_weights_path)
-                self.model.decoder = decoder
-                self._adapter_type = "lokr"
-            else:
-                if hasattr(decoder, "peft_config"): del decoder.peft_config
-                self.model.decoder = PeftModel.from_pretrained(decoder, lora_path, adapter_name=effective_name, is_trainable=False)
-                self._adapter_type = "lora"
+            if hasattr(decoder, "peft_config"): del decoder.peft_config
+            self.model.decoder = PeftModel.from_pretrained(decoder, lora_path, adapter_name=effective_name, is_trainable=False)
+            self._adapter_type = "lora"
         else:
-            if lokr_weights_path is not None:
-                return "❌ LoKr cannot be added to PEFT model."
             self.model.decoder.load_adapter(lora_path, adapter_name=effective_name)
             self._adapter_type = "lora"
 
@@ -332,7 +327,7 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
         self._lora_service.set_active_adapter(effective_name)
         self._lora_active_adapter = effective_name
         
-        return f"✅ LoRA '{effective_name}' loaded."
+        return f"✅ PEFT LoRA '{effective_name}' loaded."
 
     except Exception as e:
         return f"❌ Failed: {e}"
