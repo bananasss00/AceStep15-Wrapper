@@ -220,19 +220,25 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
 
     decoder = self.model.decoder
 
-    # --- ЗАЩИТА ОТ НАСЛОЕНИЯ (LAYERING) LOKR ---
-    # Если мы пытаемся загрузить LoKr, а в модели УЖЕ висит LyCORIS-сеть от прошлой генерации,
-    # мы обязаны полностью её выгрузить и вернуть базовые веса, иначе будет ШУМ.
-    if lokr_weights_path is not None and getattr(decoder, "_lycoris_net", None) is not None:
-        logger.info("Another LoKr adapter is active. Unloading it to prevent layering...")
+    # --- ЗАЩИТА ОТ "ПРИЗРАЧНОГО ЭФФЕКТА" И КОНФЛИКТОВ ---
+    # 1. Если сейчас активен LoKr, а мы грузим ЛЮБУЮ новую лору (PEFT или LoKr), 
+    # мы ОБЯЗАНЫ полностью выгрузить LoKr, иначе его скрытые хуки останутся в модели.
+    if getattr(decoder, "_lycoris_net", None) is not None:
+        logger.info("LoKr adapter is active. Unloading it to prevent ghost effects...")
         self.unload_lora()
-        
-        # После выгрузки нужно заново получить чистый декодер
         decoder = self.model.decoder
-        # Восстанавливаем словарь активных лор, так как unload_lora его очистил
         _active_loras = self._active_loras 
 
     is_peft = PeftModel is not None and isinstance(decoder, PeftModel)
+
+    # 2. Если мы грузим LoKr, а модель сейчас PEFT, 
+    # мы ОБЯЗАНЫ выгрузить PEFT, т.к. LyCORIS нельзя вешать поверх PEFT-оболочки.
+    if lokr_weights_path is not None and is_peft:
+        logger.info("PEFT adapter is active, but requested LoKr. Unloading PEFT...")
+        self.unload_lora()
+        decoder = self.model.decoder
+        is_peft = False
+        _active_loras = self._active_loras
 
     # --- ЛОГИКА IN-MEMORY FILTERING ---
     # ВАЖНО: Применяем игнорирование bias ТОЛЬКО если это не LoKr

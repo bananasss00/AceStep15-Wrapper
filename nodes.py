@@ -516,8 +516,7 @@ class AceStepMusicGenerator:
 
     def _sync_loras(self, dit_handler, requested_adapters, unload_unused):
         """
-        Ручное управление слоями PEFT для обхода ограничений ACE-Step и старых версий PEFT.
-        Использует add_weighted_adapter для безопасного смешивания нескольких LoRA.
+        Ручное управление слоями PEFT и множителями LyCORIS (LoKr).
         """
         if not dit_handler.lora_loaded:
             return
@@ -526,6 +525,7 @@ class AceStepMusicGenerator:
         decoder = getattr(dit_handler.model, "decoder", None)
         combo_name = "comfy_mixed_lora"
         is_lokr = getattr(dit_handler, "_adapter_type", None) == "lokr"
+        lyco_net = getattr(decoder, "_lycoris_net", None) if is_lokr and decoder else None
         
         # Если нет запрашиваемых адаптеров (байпасс всех нод)
         if not requested_adapters:
@@ -537,16 +537,24 @@ class AceStepMusicGenerator:
                 if not is_lokr and decoder and hasattr(decoder, "disable_adapter_layers"):
                     decoder.disable_adapter_layers()
                 
-                # Для LoKr сбрасываем веса
-                if is_lokr:
+                # Для LoKr сбрасываем веса в 0.0
+                if is_lokr and lyco_net is not None:
+                    if hasattr(lyco_net, "set_multiplier"):
+                        lyco_net.set_multiplier(0.0)
+                    else:
+                        lyco_net.multiplier = 0.0
+                        for m in lyco_net.modules():
+                            if hasattr(m, "multiplier"): m.multiplier = 0.0
+                    
                     for name in loaded_adapters:
+                        dit_handler._active_loras[name] = 0.0
                         try: dit_handler.set_lora_scale(name, 0.0)
                         except: pass
                         
                 dit_handler.use_lora = False
             return
 
-        active_names = []
+        active_names =[]
         active_weights =[]
         
         for name in loaded_adapters:
@@ -573,20 +581,30 @@ class AceStepMusicGenerator:
                         return
                 else:
                     dit_handler._active_loras[name] = 0.0
-                    if is_lokr:
-                        try: dit_handler.set_lora_scale(name, 0.0)
-                        except: pass
 
-        # Активация адаптеров (Обход ошибки ValueError / TypeError)
+        # Активация адаптеров
         if decoder is not None:
             if active_names:
-                if is_lokr:
-                    # Для LyCORIS/LoKr мы НЕ вызываем PEFT методы
+                if is_lokr and lyco_net is not None:
                     adapter_name = active_names[0]
+                    scale = active_weights[0]
+                    
                     try:
-                        dit_handler.set_lora_scale(adapter_name, active_weights[0])
-                    except Exception as e:
-                        print(f"[ACE-Step] Ошибка применения веса LoKr: {e}")
+                        dit_handler.set_lora_scale(adapter_name, scale)
+                    except Exception:
+                        pass
+                        
+                    # --- ПРИНУДИТЕЛЬНАЯ ЗАПИСЬ СИЛЫ (MULTIPLIER) В LYCORIS ---
+                    if hasattr(lyco_net, "set_multiplier"):
+                        lyco_net.set_multiplier(scale)
+                    else:
+                        lyco_net.multiplier = scale
+                        # На всякий случай проталкиваем во все дочерние модули
+                        for m in lyco_net.modules():
+                            if hasattr(m, "multiplier"):
+                                m.multiplier = scale
+                                
+                    print(f"[ACE-Step] Вес LoKr '{adapter_name}' установлен на {scale}")
                 else:
                     # Для обычных PEFT адаптеров
                     if hasattr(decoder, "enable_adapter_layers"):
@@ -629,8 +647,24 @@ class AceStepMusicGenerator:
                 dit_handler.use_lora = True
                 dit_handler.lora_scale = active_weights[0] if active_weights else 1.0
             else:
+                # Если запрошенных активных адаптеров нет (все веса 0.0)
                 if not is_lokr and hasattr(decoder, "disable_adapter_layers"):
                     decoder.disable_adapter_layers()
+                    # ФИКС "ПРИЗРАЧНОЙ ЛОРЫ": Принудительно сбрасываем масштаб (scale) всех загруженных PEFT,
+                    # так как disable_adapter_layers иногда пропускает остаточные веса.
+                    for name in loaded_adapters:
+                        try: dit_handler.set_lora_scale(name, 0.0)
+                        except: pass
+                    
+                # Отключаем LoKr, если запрашиваемый вес был 0.0
+                if is_lokr and lyco_net is not None:
+                    if hasattr(lyco_net, "set_multiplier"):
+                        lyco_net.set_multiplier(0.0)
+                    else:
+                        lyco_net.multiplier = 0.0
+                        for m in lyco_net.modules():
+                            if hasattr(m, "multiplier"): m.multiplier = 0.0
+                            
                 dit_handler.use_lora = False
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
