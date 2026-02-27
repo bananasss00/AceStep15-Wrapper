@@ -27,7 +27,7 @@ from server import PromptServer
 
 # Пытаемся импортировать библиотеку ACE-Step
 try:
-    from acestep.training_v2.configs import LoRAConfigV2, TrainingConfigV2
+    from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
     from acestep.training_v2.trainer_fixed import FixedLoRATrainer
     from acestep.training_v2.model_loader import load_decoder_for_training
     from acestep.training_v2.preprocess import preprocess_audio_files
@@ -122,9 +122,40 @@ class ACEStepModelConfig:
     CATEGORY = "ACE-Step/Configs"
 
     def get_config(self, **kwargs):
+        kwargs["adapter_type"] = "lora"
         return (kwargs,)
 
+# ======================================================================
+# 2.5 MODEL & LOKR CONFIG NODE
+# ======================================================================
+class ACEStepLoKRConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "linear_dim": ("INT", {"default": 64, "min": 1, "max": 1024}),
+                "linear_alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
+                "factor": ("INT", {"default": -1, "min": -1, "max": 256, "tooltip": "-1 means auto factor"}),
+                "decompose_both": ("BOOLEAN", {"default": False}),
+                "use_tucker": ("BOOLEAN", {"default": False}),
+                "use_scalar": ("BOOLEAN", {"default": False}),
+                "weight_decompose": ("BOOLEAN", {"default": False, "tooltip": "DoRA-style weight decomposition"}),
+                "target_modules": ("STRING", {"default": "q_proj k_proj v_proj o_proj", "multiline": True}),
+                "attn_type": (["both", "self", "cross"], {"default": "both"}),
+                "inf_steps": ("INT", {"default": 8, "min": 1}),
+                "shift": ("FLOAT", {"default": 3.0, "min": 0.0, "step": 0.1}),
+                "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+    RETURN_TYPES = ("ACESTEP_MODEL",) # Тот же тип, чтобы подключалось к тренеру
+    FUNCTION = "get_config"
+    CATEGORY = "ACE-Step/Configs"
 
+    def get_config(self, **kwargs):
+        kwargs["adapter_type"] = "lokr" # Указываем, что это LoKR
+        return (kwargs,)
+    
 # ======================================================================
 # 3. OPTIMIZER CONFIG NODES
 # ======================================================================
@@ -771,19 +802,36 @@ class ACEStepTrainer:
                 raise ValueError("❌ No .pt files found! Cannot proceed.")
 
             resolved_modules = resolve_target_modules(model_config["target_modules"].split(), model_config["attn_type"])
+            
+            # Определяем тип адаптера
+            adapter_type = model_config.get("adapter_type", "lora")
 
-            lora_cfg = LoRAConfigV2(
-                r=model_config["rank"], 
-                alpha=model_config["alpha"], 
-                dropout=model_config["dropout"], 
-                target_modules=resolved_modules, 
-                bias=model_config["bias"], 
-                attention_type=model_config["attn_type"]
-            )
+            if adapter_type == "lokr":
+                adapter_cfg = LoKRConfigV2(
+                    linear_dim=model_config["linear_dim"],
+                    linear_alpha=model_config["linear_alpha"],
+                    factor=model_config["factor"],
+                    decompose_both=model_config["decompose_both"],
+                    use_tucker=model_config["use_tucker"],
+                    use_scalar=model_config["use_scalar"],
+                    weight_decompose=model_config["weight_decompose"],
+                    target_modules=resolved_modules,
+                    attention_type=model_config["attn_type"]
+                )
+            else:
+                adapter_cfg = LoRAConfigV2(
+                    r=model_config["rank"], 
+                    alpha=model_config["alpha"], 
+                    dropout=model_config["dropout"], 
+                    target_modules=resolved_modules, 
+                    bias=model_config["bias"], 
+                    attention_type=model_config["attn_type"]
+                )
 
             prev_cfg = preview_config if preview_config is not None else {}
             
             train_cfg = TrainingConfigV2(
+                adapter_type=adapter_type,
                 learning_rate=optimizer_config["learning_rate"], 
                 batch_size=dataset_config["batch_size"], 
                 gradient_accumulation_steps=dataset_config["grad_accum"],
@@ -850,7 +898,7 @@ class ACEStepTrainer:
             model.train()
 
             print("\n🔥 [Phase 3] Starting Training Loop...")
-            trainer = FixedLoRATrainer(model, lora_cfg, train_cfg)
+            trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
             
             eff_batch = max(1, dataset_config["batch_size"] * dataset_config["grad_accum"])
             steps_per_epoch = max(1, dataset_len // eff_batch)
@@ -948,6 +996,7 @@ class ACEStepTrainer:
 NODE_CLASS_MAPPINGS = {
     "ACEStepDatasetConfig": ACEStepDatasetConfig,
     "ACEStepModelConfig": ACEStepModelConfig,
+    "ACEStepLoKRConfig": ACEStepLoKRConfig,
     "ACEStepAdamWConfig": ACEStepAdamWConfig,
     "ACEStepProdigyConfig": ACEStepProdigyConfig,
     "ACEStepProdigyPlusConfig": ACEStepProdigyPlusConfig,
@@ -962,6 +1011,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ACEStepDatasetConfig": "📦 Dataset Config",
     "ACEStepModelConfig": "🧠 Model & LoRA Config",
+    "ACEStepLoKRConfig": "🧠 Model & LoKR Config",
     "ACEStepAdamWConfig": "🟢 Optimizer: AdamW",
     "ACEStepProdigyConfig": "🟠 Optimizer: Prodigy",
     "ACEStepProdigyPlusConfig": "🔴 Optimizer: Prodigy PLUS",
