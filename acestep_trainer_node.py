@@ -48,6 +48,25 @@ try:
 except:
     pass
 # ============================================================================
+
+try:
+    if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
+        FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
+
+        def custom_generate_preview(self, output_dir, step, device):
+            orig_dir = self.training_config.dataset_dir
+            if hasattr(self, "main_tensor_dir"):
+                self.training_config.dataset_dir = self.main_tensor_dir
+            try:
+                self._original_generate_preview(output_dir, step, device)
+            finally:
+                self.training_config.dataset_dir = orig_dir
+
+        FixedLoRATrainer._generate_preview = custom_generate_preview
+except NameError:
+    pass
+# ============================================================================
+
 def bypass_safe_path(user_path, base=None):
     if base is not None:
         root = os.path.normpath(os.path.abspath(base))
@@ -725,10 +744,11 @@ def custom_training_step(self, batch: dict) -> torch.Tensor:
 
         # Применяем веса регуляризации и усредняем по батчу
         diffusion_loss = (loss_per_sample * weights).mean()
+        unweighted_loss = loss_per_sample.mean()
         # ---------------------------------------------
 
     diffusion_loss = diffusion_loss.float()
-    self.training_losses.append(diffusion_loss.item())
+    self.training_losses.append(unweighted_loss.item())
     return diffusion_loss
 
 # Подменяем функцию в классе:
@@ -1046,6 +1066,7 @@ class ACEStepTrainer:
 
             print("\n🔥 [Phase 3] Starting Training Loop...")
             trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
+            trainer.main_tensor_dir = main_tensor_dir
             
             eff_batch = max(1, dataset_config["batch_size"] * dataset_config["grad_accum"])
             steps_per_epoch = max(1, dataset_len // eff_batch)
