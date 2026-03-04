@@ -488,6 +488,7 @@ class AceStepMusicGenerator:
                 "thinking": ("BOOLEAN", {"default": True, "tooltip": "Генерация аудио-кодов через LLM"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
+                "merge_loras": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "reference_audio": ("AUDIO",),
@@ -668,7 +669,7 @@ class AceStepMusicGenerator:
                 dit_handler.use_lora = False
 
     def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
-                 guidance_scale, shift, thinking, seed, unload_unused_loras, 
+                 guidance_scale, shift, thinking, seed, unload_unused_loras, merge_loras, 
                  reference_audio=None, source_audio=None, vocal_language="unknown", 
                  bpm=0, key_scale="", time_signature="", lm_config=None):
         
@@ -677,6 +678,22 @@ class AceStepMusicGenerator:
         active_adapters = model.get("active_adapters", {})
 
         self._sync_loras(dit_handler, active_adapters, unload_unused_loras)
+
+        is_merged = False
+        if merge_loras:
+            # =================================================================
+            # ОПТИМИЗАЦИЯ VRAM: Слияние LoRA с базовой моделью "на лету"
+            # Это убирает накладные расходы на VRAM во время forward pass
+            # =================================================================
+            decoder = getattr(dit_handler.model, "decoder", None)
+            if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
+                try:
+                    print("[ACE-Step] Оптимизация VRAM: Временное слияние (merge) LoRA...")
+                    decoder.merge_adapter()
+                    is_merged = True
+                except Exception as e:
+                    print(f"[ACE-Step] Предупреждение: не удалось выполнить merge_adapter: {e}")
+            # =================================================================
 
         if thinking and llm_handler is None:
             thinking = False
@@ -775,6 +792,18 @@ class AceStepMusicGenerator:
             return ({"waveform": output_audio_tensor.unsqueeze(0), "sample_rate": output_sample_rate},)
 
         finally:
+
+            # =================================================================
+            # ВОЗВРАТ СОСТОЯНИЯ: Отменяем слияние после генерации
+            # =================================================================
+            if is_merged and hasattr(decoder, "unmerge_adapter"):
+                try:
+                    print("[ACE-Step] Отмена слияния (unmerge) LoRA...")
+                    decoder.unmerge_adapter()
+                except Exception as e:
+                    print(f"[ACE-Step] Ошибка при unmerge_adapter: {e}")
+            # =================================================================
+
             if ref_path and os.path.exists(ref_path): os.remove(ref_path)
             if src_path and os.path.exists(src_path): os.remove(src_path)
 
