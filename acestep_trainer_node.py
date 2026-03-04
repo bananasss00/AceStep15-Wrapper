@@ -912,9 +912,8 @@ class ACEStepTrainer:
             else:
                 print(f"📂 [Phase 1] Found existing main tensors in: {main_tensor_dir}")
 
-            final_tensor_dir = main_tensor_dir
-
-            # ===[PHASE 1.5] PREPROCESSING & MIXING REGULARIZATION DATASET ===
+            # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
+            reg_tensor_dir = None
             if reg_source and os.path.exists(reg_source):
                 reg_dataset_name = os.path.splitext(os.path.basename(os.path.normpath(reg_source)))[0]
                 reg_dataset_name = re.sub(r'[\\/*?:"<>|]', "", reg_dataset_name).replace(" ", "_")
@@ -937,40 +936,12 @@ class ACEStepTrainer:
                 else:
                     print(f"📂 [Phase 1.5] Found existing REG tensors in: {reg_tensor_dir}")
 
-                # Создаем папку MIXED, чтобы не портить оригинальные данные
-                mixed_tensor_dir = os.path.join(tensor_root, f"{dataset_name}_MIX_{reg_dataset_name}")
-                if not self._check_tensors_exist(mixed_tensor_dir):
-                    print("📦 Creating Mixed Dataset (Main + Regularization)...")
-                    os.makedirs(mixed_tensor_dir, exist_ok=True)
-                    
-                    # 1. Копируем основу
-                    for pt in glob.glob(os.path.join(main_tensor_dir, "*.pt")):
-                        shutil.copy(pt, os.path.join(mixed_tensor_dir, os.path.basename(pt)))
-
-                    # 2. Копируем регуляризацию, помечая её метадатой
-                    for pt in glob.glob(os.path.join(reg_tensor_dir, "*.pt")):
-                        data = torch.load(pt, map_location="cpu")
-                        if "metadata" not in data: data["metadata"] = {}
-                        data["metadata"]["is_reg"] = True # Пометка для лосса!
-                        
-                        new_path = os.path.join(mixed_tensor_dir, "reg_" + os.path.basename(pt))
-                        torch.save(data, new_path)
-                else:
-                    print(f"📂 [Phase 1.5] Found existing MIXED dataset in: {mixed_tensor_dir}")
-                
-                # Подсовываем смешанный датасет тренеру
-                final_tensor_dir = mixed_tensor_dir
-            # =================================================================
-
-
-            tensor_files = glob.glob(os.path.join(final_tensor_dir, "*.pt"))
+            tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
             if dataset_len == 0:
                 raise ValueError("❌ No .pt files found! Cannot proceed.")
 
             resolved_modules = resolve_target_modules(model_config["target_modules"].split(), model_config["attn_type"])
-            
-            # Определяем тип адаптера
             adapter_type = model_config.get("adapter_type", "lora")
 
             if adapter_type == "lokr":
@@ -1014,7 +985,7 @@ class ACEStepTrainer:
                 cfg_ratio=model_config["cfg_ratio"],
                 device=gpu_info.device, 
                 precision=gpu_info.precision, 
-                dataset_dir=final_tensor_dir,
+                dataset_dir=main_tensor_dir,
                 checkpoint_dir=checkpoint_dir, 
                 model_variant=model_config["model_variant"], 
                 num_workers=0 if os.name == 'nt' else 4,
@@ -1064,12 +1035,53 @@ class ACEStepTrainer:
 
             model.train()
 
-            print("\n🔥 [Phase 3] Starting Training Loop...")
+            print("\n🔥 Starting Training Loop...")
             trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
             trainer.main_tensor_dir = main_tensor_dir
             
+            import acestep.training.data_module as dm_module
+            original_setup = dm_module.PreprocessedDataModule.setup
+
+            def balanced_setup(self_dm, stage=None):
+                main_ds = dm_module.PreprocessedTensorDataset(main_tensor_dir)
+                if reg_tensor_dir and os.path.exists(reg_tensor_dir):
+                    reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
+                    
+                    class BalancedWrapper(torch.utils.data.Dataset):
+                        def __init__(self, m_ds, r_ds):
+                            self.m_ds = m_ds
+                            self.r_ds = r_ds
+                            # размер = максимум из двух * 2
+                            self.target_len = max(len(m_ds), len(r_ds))
+                            
+                        def __len__(self):
+                            return self.target_len * 2
+                            
+                        def __getitem__(self, idx):
+                            if idx % 2 == 0:
+                                return self.m_ds[(idx // 2) % len(self.m_ds)]
+                            else:
+                                item = dict(self.r_ds[(idx // 2) % len(self.r_ds)])
+                                item["metadata"] = dict(item.get("metadata", {}))
+                                item["metadata"]["is_reg"] = True
+                                return item
+                                
+                    self_dm.train_dataset = BalancedWrapper(main_ds, reg_ds)
+                    print(f"⚖️ In-Memory Dataset Balanced: Main ({len(main_ds)}) | Reg ({len(reg_ds)}) -> Total Epoch Size: {len(self_dm.train_dataset)}")
+                else:
+                    self_dm.train_dataset = main_ds
+                self_dm.val_dataset = None
+
+            dm_module.PreprocessedDataModule.setup = balanced_setup
+            # =================================================================
+
+            # Считаем длину для статусбара с учетом балансировки
+            actual_dataset_len = dataset_len
+            if reg_tensor_dir and os.path.exists(reg_tensor_dir):
+                actual_dataset_len = max(dataset_len, len(glob.glob(os.path.join(reg_tensor_dir, "*.pt")))) * 2
+
             eff_batch = max(1, dataset_config["batch_size"] * dataset_config["grad_accum"])
-            steps_per_epoch = max(1, dataset_len // eff_batch)
+            steps_per_epoch = max(1, actual_dataset_len // eff_batch)
             total_steps_approx = steps_per_epoch * dataset_config["epochs"]
 
             pbar = ProgressBar(total_steps_approx)
@@ -1082,9 +1094,7 @@ class ACEStepTrainer:
             lr_history =[]
             ema_loss = None
             ema_alpha = 0.1
-            
             saved_epochs =[]
-            current_epoch = 0.0
             
             elapsed_str = "00:00:00"
             eta_str = "00:00:00"
@@ -1122,19 +1132,13 @@ class ACEStepTrainer:
                             time_per_step = elapsed / update.step
                             remaining_steps = total_steps_approx - update.step
                             eta_secs = remaining_steps * time_per_step
-                            
-                            if time_per_step < 1.0:
-                                step_time_str = f"{int(time_per_step * 1000)}ms/it"
-                            else:
-                                step_time_str = f"{time_per_step:.2f}s/it"
-                                
+                            step_time_str = f"{int(time_per_step * 1000)}ms/it" if time_per_step < 1.0 else f"{time_per_step:.2f}s/it"
                             time_per_epoch = time_per_step * steps_per_epoch
                             ep_m, ep_s = divmod(int(time_per_epoch), 60)
                             ep_h, ep_m = divmod(ep_m, 60)
                             if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
                             elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
                             else: epoch_time_str = f"{ep_s}s/ep"
-                            
                         else:
                             eta_secs = 0
                             step_time_str = "0s/it"
@@ -1154,10 +1158,8 @@ class ACEStepTrainer:
                             except Exception: pass
 
                     if update.msg:
-                        is_spam = ("Step" in update.msg and "Loss" in update.msg) or ("Epoch" in update.msg and "Loss" in update.msg)
-                        if not is_spam: 
+                        if not (("Step" in update.msg and "Loss" in update.msg) or ("Epoch" in update.msg and "Loss" in update.msg)):
                             print(f"[LOG] {update.msg}")
-                            
                         msg_lower = update.msg.lower()
                         if "save" in msg_lower or "saving" in msg_lower or "saved" in msg_lower:
                             if epoch_history:
@@ -1166,7 +1168,8 @@ class ACEStepTrainer:
                                     saved_epochs.append(last_ep)
 
             finally:
-                # ВАЖНО: Блок finally выполняется ВСЕГДА (Остановка, Ошибка, Успех)
+                dm_module.PreprocessedDataModule.setup = original_setup
+                
                 if loss_history:
                     print(f"📊 Saving final training graph to: {output_dir}/loss_graph.png")
                     self.process_loss_graph(
