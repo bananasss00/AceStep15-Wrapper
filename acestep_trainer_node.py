@@ -9,6 +9,8 @@ import json
 import torch
 import base64
 import copy
+import shutil
+import torch.nn.functional as F
 from io import BytesIO
 
 # Для графиков
@@ -34,6 +36,9 @@ try:
     from acestep.training_v2.gpu_utils import detect_gpu
     from acestep.training_v2.cli.validation import resolve_target_modules
     from acestep.training_v2.estimate import run_estimation
+    from acestep.training_v2.fixed_lora_module import FixedLoRAModule
+    from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
+    from contextlib import nullcontext
 except ImportError as e:
     print(f"⚠️[ACE-Step] Failed to import acestep modules: {e}")
 
@@ -87,6 +92,10 @@ class ACEStepDatasetConfig:
                 "save_every": ("INT", {"default": 10, "min": 0}),
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
+            },
+            "optional": {
+                "reg_data_source": ("STRING", {"default": "", "tooltip": "Path to regularization audio/json"}),
+                "reg_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Loss weight for reg samples"}),
             }
         }
     RETURN_TYPES = ("ACESTEP_DATASET",)
@@ -648,6 +657,86 @@ class ACEStepLoRAResize:
 # ======================================================================
 # 7. MAIN TRAINER NODE
 # ======================================================================
+# ======================================================================
+# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ
+# ======================================================================
+CURRENT_REG_WEIGHT = 1.0
+
+def custom_training_step(self, batch: dict) -> torch.Tensor:
+    global CURRENT_REG_WEIGHT
+    
+    if self.device_type in ("cuda", "xpu", "mps"):
+        autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+    else:
+        autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        nb = self.transfer_non_blocking
+        target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+
+        bsz = target_latents.shape[0]
+
+        if self._null_cond_emb is not None and self._cfg_ratio > 0.0:
+            encoder_hidden_states = apply_cfg_dropout(
+                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio
+            )
+
+        x1 = torch.randn_like(target_latents)
+        x0 = target_latents
+
+        t, r = sample_timesteps(
+            batch_size=bsz, device=self.device, dtype=self.dtype,
+            data_proportion=self._data_proportion, timestep_mu=self._timestep_mu,
+            timestep_sigma=self._timestep_sigma, use_meanflow=False
+        )
+        t_ = t.unsqueeze(-1).unsqueeze(-1)
+        xt = t_ * x1 + (1.0 - t_) * x0
+
+        if self.force_input_grads_for_checkpointing:
+            xt = xt.requires_grad_(True)
+
+        decoder_outputs = self.model.decoder(
+            hidden_states=xt, timestep=t, timestep_r=t,
+            attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
+        )
+
+        flow = x1 - x0
+
+        # --- НАША КАСТОМНАЯ ЛОГИКА РЕГУЛЯРИЗАЦИИ ---
+        # Вычисляем ошибку без усреднения (reduction='none')
+        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
+        
+        # Усредняем по размерностям Sequence и Features, оставляя только размерность Batch -> [B]
+        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+
+        # Достаем флаг is_reg из метадаты (если он есть)
+        metadata = batch.get("metadata",[])
+        weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
+
+        for i in range(bsz):
+            meta = metadata[i] if i < len(metadata) else {}
+            if meta.get("is_reg", False):
+                weights[i] = CURRENT_REG_WEIGHT
+
+        # Применяем веса регуляризации и усредняем по батчу
+        diffusion_loss = (loss_per_sample * weights).mean()
+        # ---------------------------------------------
+
+    diffusion_loss = diffusion_loss.float()
+    self.training_losses.append(diffusion_loss.item())
+    return diffusion_loss
+
+# Подменяем функцию в классе:
+try:
+    FixedLoRAModule.training_step = custom_training_step
+except NameError:
+    pass # Защита, если импорт ACE-Step не удался
+
 class ACEStepTrainer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -785,6 +874,14 @@ class ACEStepTrainer:
             checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
             output_dir = dataset_config["output_dir"].strip('"')
             
+            # --- ИЗВЛЕЧЕНИЕ НАСТРОЕК РЕГУЛЯРИЗАЦИИ ---
+            reg_source = dataset_config.get("reg_data_source", "").strip('"')
+            reg_weight = dataset_config.get("reg_weight", 1.0)
+            
+            global CURRENT_REG_WEIGHT
+            CURRENT_REG_WEIGHT = reg_weight
+            # -----------------------------------------
+
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
 
@@ -801,30 +898,82 @@ class ACEStepTrainer:
                 dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
             
-            final_tensor_dir = os.path.join(tensor_root, dataset_name)
+            main_tensor_dir = os.path.join(tensor_root, dataset_name)
             gpu_info = detect_gpu("auto", "auto")
 
-            if not self._check_tensors_exist(final_tensor_dir):
+            # === [PHASE 1] PREPROCESSING MAIN DATASET ===
+            if not self._check_tensors_exist(main_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
-                print(f"🔨 [Phase 1] Tensors not found. Starting Preprocessing...")
+                print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
                     preprocess_audio_files(
                         audio_dir=None if is_json else clean_source,
                         dataset_json=clean_source if is_json else None,
-                        output_dir=final_tensor_dir,
+                        output_dir=main_tensor_dir,
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
                         max_duration=dataset_config["max_duration"],
                         device=gpu_info.device,
                         precision=gpu_info.precision,
-                        progress_callback=lambda c,t,m: print(f"[PRE] {m}")
+                        progress_callback=lambda c,t,m: print(f"[PRE-MAIN] {m}")
                     )
                 except Exception as e:
-                    raise RuntimeError(f"❌ Preprocessing failed: {e}")
+                    raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
             else:
-                print(f"📂 [Phase 1] Found existing tensors in: {final_tensor_dir}")
+                print(f"📂 [Phase 1] Found existing main tensors in: {main_tensor_dir}")
+
+            final_tensor_dir = main_tensor_dir
+
+            # ===[PHASE 1.5] PREPROCESSING & MIXING REGULARIZATION DATASET ===
+            if reg_source and os.path.exists(reg_source):
+                reg_dataset_name = os.path.splitext(os.path.basename(os.path.normpath(reg_source)))[0]
+                reg_dataset_name = re.sub(r'[\\/*?:"<>|]', "", reg_dataset_name).replace(" ", "_")
+                reg_tensor_dir = os.path.join(tensor_root, reg_dataset_name + "_REG")
+
+                if not self._check_tensors_exist(reg_tensor_dir):
+                    print(f"🔨 [Phase 1.5] Preprocessing Regularization Data...")
+                    is_json = reg_source.lower().endswith('.json')
+                    preprocess_audio_files(
+                        audio_dir=None if is_json else reg_source,
+                        dataset_json=reg_source if is_json else None,
+                        output_dir=reg_tensor_dir,
+                        checkpoint_dir=checkpoint_dir,
+                        variant=model_config["model_variant"],
+                        max_duration=dataset_config["max_duration"],
+                        device=gpu_info.device,
+                        precision=gpu_info.precision,
+                        progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
+                    )
+                else:
+                    print(f"📂 [Phase 1.5] Found existing REG tensors in: {reg_tensor_dir}")
+
+                # Создаем папку MIXED, чтобы не портить оригинальные данные
+                mixed_tensor_dir = os.path.join(tensor_root, f"{dataset_name}_MIX_{reg_dataset_name}")
+                if not self._check_tensors_exist(mixed_tensor_dir):
+                    print("📦 Creating Mixed Dataset (Main + Regularization)...")
+                    os.makedirs(mixed_tensor_dir, exist_ok=True)
+                    
+                    # 1. Копируем основу
+                    for pt in glob.glob(os.path.join(main_tensor_dir, "*.pt")):
+                        shutil.copy(pt, os.path.join(mixed_tensor_dir, os.path.basename(pt)))
+
+                    # 2. Копируем регуляризацию, помечая её метадатой
+                    for pt in glob.glob(os.path.join(reg_tensor_dir, "*.pt")):
+                        data = torch.load(pt, map_location="cpu")
+                        if "metadata" not in data: data["metadata"] = {}
+                        data["metadata"]["is_reg"] = True # Пометка для лосса!
+                        
+                        new_path = os.path.join(mixed_tensor_dir, "reg_" + os.path.basename(pt))
+                        torch.save(data, new_path)
+                else:
+                    print(f"📂 [Phase 1.5] Found existing MIXED dataset in: {mixed_tensor_dir}")
+                
+                # Подсовываем смешанный датасет тренеру
+                final_tensor_dir = mixed_tensor_dir
+            # =================================================================
+
 
             tensor_files = glob.glob(os.path.join(final_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
