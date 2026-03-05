@@ -91,6 +91,7 @@ class LLMHandler:
             self.llm = None
             self.llm_tokenizer = None
             self.constrained_processor = None
+            self._hf_model_for_scoring = None
             self.llm_initialized = False
             self.llm_backend = None
             self._mlx_model = None

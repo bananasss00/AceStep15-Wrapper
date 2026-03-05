@@ -410,7 +410,8 @@ def remove_lora(self, adapter_name: str) -> str:
                 mem_before = self._memory_allocated() / (1024**3)
                 logger.info(f"VRAM before LoRA unload: {mem_before:.2f}GB")
             self.model.decoder = decoder.get_base_model()
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             self.model.decoder.eval()
             self.lora_loaded = False
@@ -467,6 +468,7 @@ def unload_lora(self) -> str:
             else:
                 logger.warning("Decoder has _lycoris_net but no restore() method; continuing with state_dict restore")
             self.model.decoder._lycoris_net = None
+            del lycoris_net
 
         try:
             from peft import PeftModel
@@ -487,14 +489,16 @@ def unload_lora(self) -> str:
                 del self.model.decoder._peft_config
 
             logger.info("Restoring base decoder state from backup")
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
         else:
             logger.info("Restoring base decoder from state_dict backup")
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:

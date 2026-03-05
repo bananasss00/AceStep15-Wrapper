@@ -36,23 +36,63 @@ def cleanup_all_acestep():
     
     print("\n[ACE-Step] Системная очистка памяти ComfyUI. Выгрузка ACE-Step из VRAM...\n")
     for dit_handler, llm_handler in GLOBAL_ACESTEP_HANDLERS:
+        # 1. Выгрузка LLM
         try:
             if llm_handler:
                 llm_handler.unload()
-        except: pass
+        except Exception as e:
+            print(f"[ACE-Step] Ошибка выгрузки LLM: {e}")
+            
+        # 2. Тотальная зачистка DiT и LoKr/LoRA
         try:
             if dit_handler:
+                # А. Заставляем модель снять с себя хуки LoKr и PEFT
+                if getattr(dit_handler, 'lora_loaded', False) and hasattr(dit_handler, 'unload_lora'):
+                    try:
+                        dit_handler.unload_lora()
+                    except:
+                        pass
+                
+                # Б. УБИВАЕМ СКРЫТЫЕ ССЫЛКИ LoKr/LoRA (Именно они вызывали утечку!)
+                if hasattr(dit_handler, '_lora_service') and dit_handler._lora_service is not None:
+                    dit_handler._lora_service.decoder = None
+                    if hasattr(dit_handler._lora_service, 'registry'):
+                        dit_handler._lora_service.registry.clear()
+                    dit_handler._lora_service = None
+                
+                if hasattr(dit_handler, '_lora_adapter_registry') and isinstance(dit_handler._lora_adapter_registry, dict):
+                    dit_handler._lora_adapter_registry.clear()
+                
+                if hasattr(dit_handler, '_active_loras') and isinstance(dit_handler._active_loras, dict):
+                    dit_handler._active_loras.clear()
+
+                # В. Убиваем бэкап весов в RAM (иначе RAM будет переполняться)
+                if hasattr(dit_handler, '_base_decoder'):
+                    dit_handler._base_decoder = None
+
+                # Г. Удаляем основные тензоры
                 dit_handler.model = None
                 dit_handler.vae = None
                 dit_handler.text_encoder = None
-                dit_handler._base_decoder = None
-        except: pass
+                dit_handler.silence_latent = None 
+                
+                # Д. Очистка MLX (для пользователей Mac)
+                dit_handler.mlx_decoder = None
+                dit_handler.mlx_vae = None
+        except Exception as e: 
+            print(f"[ACE-Step] Ошибка выгрузки DiT: {e}")
     
     GLOBAL_ACESTEP_HANDLERS.clear()
+    
+    gc.collect()
+    gc.collect()
+    
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    gc.collect()
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+        
     print("[ACE-Step] Память успешно освобождена.")
 
 if not hasattr(mm, "_original_unload_all_models_acestep"):
