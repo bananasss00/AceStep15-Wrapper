@@ -533,10 +533,10 @@ class AceStepMusicGenerator:
             "optional": {
                 "reference_audio": ("AUDIO",),
                 "source_audio": ("AUDIO",),
-                "vocal_language": (["unknown", "en", "zh", "ja", "ru"], {"default": "unknown"}),
+                "vocal_language": (["unknown", "en", "ja", "zh", "es", "de", "fr", "pt", "ru", "it", "nl", "pl", "tr", "vi", "cs", "fa", "id", "ko", "uk", "hu", "ar", "sv", "ro", "el"], {"default": "unknown"}),
                 "bpm": ("INT", {"default": 0}),
-                "key_scale": ("STRING", {"default": ""}),
-                "time_signature": ("STRING", {"default": ""}),
+                "key_scale": ([""] + [f"{root} {quality}" for quality in ["major", "minor"] for root in ["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]], {"default": ""}),
+                "time_signature": (['', '2', '3', '4', '6'], {"default": ""}),
                 "lm_config": ("ACESTEP_LM_CONFIG",),
             }
         }
