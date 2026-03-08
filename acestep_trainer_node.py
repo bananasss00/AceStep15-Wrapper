@@ -214,7 +214,7 @@ class ACEStepProdigyConfig:
     def INPUT_TYPES(cls):
         inputs = get_base_opt_params(1.0)
         inputs.update({
-            "d_coef": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+            "d_coef": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01}),
             "d0": ("FLOAT", {"default": 1e-6, "min": 1e-8, "step": 1e-7, "precision": 8}),
             "use_bias_correction": ("BOOLEAN", {"default": False}),
             "safeguard_warmup": ("BOOLEAN", {"default": True}),
@@ -234,7 +234,7 @@ class ACEStepProdigyPlusConfig:
     def INPUT_TYPES(cls):
         inputs = get_base_opt_params(1.0)
         inputs.update({
-            "d_coef": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+            "d_coef": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01}),
             "d0": ("FLOAT", {"default": 1e-6, "min": 1e-8, "step": 1e-7, "precision": 8}),
             "beta3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.99, "step": 0.01, "tooltip": "Set to -1.0 for Auto"}), 
             "prodigy_steps": ("INT", {"default": 0, "min": 0}),
@@ -416,9 +416,47 @@ class ACEStepEstimator:
     FUNCTION = "estimate"
     CATEGORY = "ACE-Step/Training"
 
-    def _check_tensors_exist(self, path):
-        if not os.path.exists(path): return False
-        if not glob.glob(os.path.join(path, "*.pt")): return False
+    def _check_and_prepare_cache(self, source_path, tensor_dir):
+        """Проверяет актуальность кеша. Если JSON/аудио новее тензоров, сносит старый кеш."""
+        if not os.path.exists(tensor_dir):
+            return False
+
+        pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
+        if not pt_files:
+            return False
+
+        # Если источник не передан, просто верим кешу
+        if not source_path or not os.path.exists(source_path):
+            return True
+
+        # Берем дату самого старого тензора (любое изменение ПОСЛЕ генерации первого тензора = кеш инвалид)
+        oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
+        source_mtime = 0
+
+        # Узнаем дату изменения исходника
+        if os.path.isfile(source_path):
+            source_mtime = os.path.getmtime(source_path)
+        elif os.path.isdir(source_path):
+            source_mtime = os.path.getmtime(source_path)
+            for root, _, files in os.walk(source_path):
+                for file in files:
+                    if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
+                        fpath = os.path.join(root, file)
+                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+
+        # Если источник изменился позже, чем были созданы тензоры
+        if source_mtime > oldest_tensor_time:
+            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            for f in pt_files:
+                try: os.remove(f)
+                except: pass
+            # Удаляем манифест на всякий случай, если он остался от v1
+            manifest_path = os.path.join(tensor_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                try: os.remove(manifest_path)
+                except: pass
+            return False
+
         return True
 
     def estimate(self, dataset_config, model_config, est_batches, top_k, granularity):
@@ -439,7 +477,7 @@ class ACEStepEstimator:
             final_tensor_dir = os.path.join(tensor_root, dataset_name)
             gpu_info = detect_gpu("auto", "auto")
 
-            if not self._check_tensors_exist(final_tensor_dir):
+            if not self._check_and_prepare_cache(clean_source, final_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨 Preprocessing required for estimation...")
@@ -785,9 +823,43 @@ class ACEStepTrainer:
     FUNCTION = "train_model"
     CATEGORY = "ACE-Step/Training"
 
-    def _check_tensors_exist(self, path):
-        if not os.path.exists(path): return False
-        if not glob.glob(os.path.join(path, "*.pt")): return False
+    def _check_and_prepare_cache(self, source_path, tensor_dir):
+        """Проверяет актуальность кеша. Если JSON/аудио новее тензоров, сносит старый кеш."""
+        if not os.path.exists(tensor_dir):
+            return False
+
+        pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
+        if not pt_files:
+            return False
+
+        if not source_path or not os.path.exists(source_path):
+            return True
+
+        oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
+        source_mtime = 0
+
+        if os.path.isfile(source_path):
+            source_mtime = os.path.getmtime(source_path)
+        elif os.path.isdir(source_path):
+            source_mtime = os.path.getmtime(source_path)
+            for root, _, files in os.walk(source_path):
+                for file in files:
+                    if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
+                        fpath = os.path.join(root, file)
+                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+
+        if source_mtime > oldest_tensor_time:
+            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            for f in pt_files:
+                try: os.remove(f)
+                except: pass
+            
+            manifest_path = os.path.join(tensor_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                try: os.remove(manifest_path)
+                except: pass
+            return False
+
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
@@ -890,7 +962,7 @@ class ACEStepTrainer:
             gpu_info = detect_gpu("auto", "auto")
 
             # === [PHASE 1] PREPROCESSING MAIN DATASET ===
-            if not self._check_tensors_exist(main_tensor_dir):
+            if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
@@ -910,7 +982,7 @@ class ACEStepTrainer:
                 except Exception as e:
                     raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
             else:
-                print(f"📂 [Phase 1] Found existing main tensors in: {main_tensor_dir}")
+                print(f"📂 [Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
             # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
             reg_tensor_dir = None
@@ -919,7 +991,7 @@ class ACEStepTrainer:
                 reg_dataset_name = re.sub(r'[\\/*?:"<>|]', "", reg_dataset_name).replace(" ", "_")
                 reg_tensor_dir = os.path.join(tensor_root, reg_dataset_name + "_REG")
 
-                if not self._check_tensors_exist(reg_tensor_dir):
+                if not self._check_and_prepare_cache(reg_source, reg_tensor_dir):
                     print(f"🔨 [Phase 1.5] Preprocessing Regularization Data...")
                     is_json = reg_source.lower().endswith('.json')
                     preprocess_audio_files(
@@ -934,7 +1006,7 @@ class ACEStepTrainer:
                         progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
                     )
                 else:
-                    print(f"📂 [Phase 1.5] Found existing REG tensors in: {reg_tensor_dir}")
+                    print(f"📂 [Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
 
             tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
