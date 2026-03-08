@@ -1263,6 +1263,8 @@ class AceStepHandler(
                     
                     # Release original pred_latents to free VRAM before VAE decode
                     del pred_latents
+                    import gc
+                    gc.collect()
                     self._empty_cache()
                     
                     logger.debug(f"[generate_music] Before VAE decode: allocated={self._memory_allocated()/1024**3:.2f}GB, max={self._max_memory_allocated()/1024**3:.2f}GB")
@@ -1286,7 +1288,7 @@ class AceStepHandler(
                                 _effective_free = get_effective_free_vram_gb()
                                 logger.info(f"[generate_music] Effective free VRAM before VAE decode: {_effective_free:.2f} GB")
                                 # If less than 0.5 GB free, VAE decode on GPU will almost certainly OOM
-                                if _effective_free < 0.5:
+                                if _effective_free < 0.15:
                                     logger.warning(f"[generate_music] Only {_effective_free:.2f} GB free VRAM; auto-enabling CPU VAE decode")
                                     _vae_cpu = True
                         if _vae_cpu:
