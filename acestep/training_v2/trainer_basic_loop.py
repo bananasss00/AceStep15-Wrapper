@@ -22,6 +22,9 @@ from acestep.training_v2.optim import build_optimizer, build_scheduler
 from acestep.training_v2.tensorboard_utils import TrainingLogger
 from acestep.training_v2.trainer_helpers import configure_memory_features, save_checkpoint, save_final
 from acestep.training_v2.ui import TrainingUpdate
+from acestep.training_v2.fixed_lora_module import (
+    _get_effective_lr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +62,7 @@ def _flush_accumulated(
     global_step += 1
 
     avg_loss = accumulated_loss * cfg.gradient_accumulation_steps / accumulation_step
-    _lr = scheduler.get_last_lr()[0]
+    _lr = _get_effective_lr(optimizer, scheduler)
     updates: List[TrainingUpdate] = []
 
     if global_step % cfg.log_every == 0:

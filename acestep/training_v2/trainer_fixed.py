@@ -43,6 +43,7 @@ from acestep.training_v2.fixed_lora_module import (
     FixedLoRAModule,
     _normalize_device_type,
     _select_compute_dtype,
+    _get_effective_lr,
     _select_fabric_precision,
 )
 from acestep.training_v2.trainer_helpers import (
@@ -674,7 +675,7 @@ class FixedLoRATrainer:
                     else:
                         ema_loss = ema_alpha * avg_loss + (1 - ema_alpha) * ema_loss
 
-                    _lr = scheduler.get_last_lr()[0]
+                    _lr = _get_effective_lr(optimizer, scheduler)
                     if global_step % cfg.log_every == 0:
                         tb.log_loss(avg_loss, global_step)
                         tb.log_lr(_lr, global_step)
@@ -709,7 +710,7 @@ class FixedLoRATrainer:
                 global_step += 1
 
                 avg_loss = accumulated_loss * cfg.gradient_accumulation_steps / accumulation_step
-                _lr = scheduler.get_last_lr()[0]
+                _lr = _get_effective_lr(optimizer, scheduler)
                 if global_step % cfg.log_every == 0:
                     tb.log_loss(avg_loss, global_step)
                     tb.log_lr(_lr, global_step)

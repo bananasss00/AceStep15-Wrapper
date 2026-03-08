@@ -95,6 +95,17 @@ def _select_fabric_precision(device_type: str) -> str:
         return "16-mixed"
     return "32-true"
 
+def _get_effective_lr(optimizer: Any, scheduler: Any) -> float:
+    """Extracts true learning rate including Prodigy's 'd' factor."""
+    lr = scheduler.get_last_lr()[0]
+    if hasattr(optimizer, "param_groups"):
+        for param_group in optimizer.param_groups:
+            if "d" in param_group:
+                d_val = param_group["d"]
+                d_val = d_val.item() if hasattr(d_val, "item") else d_val
+                return lr * float(d_val)
+    return lr
+
 
 # ===========================================================================
 # FixedLoRAModule -- corrected training step
