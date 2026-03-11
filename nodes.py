@@ -11,6 +11,7 @@ import glob
 import comfy.utils
 import comfy.model_management as mm
 import gc
+import re
 
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -380,16 +381,28 @@ class AceStepLoraBaker:
         
         return (model, save_path)
     
+def _find_lora_weight_file(path):
+    """Ищет safetensors/bin файл внутри папки или возвращает сам путь, если это файл"""
+    if os.path.isfile(path):
+        return path
+    if os.path.isdir(path):
+        for ext in ["safetensors", "bin"]:
+            p = os.path.join(path, f"adapter_model.{ext}")
+            if os.path.exists(p): return p
+            p = os.path.join(path, f"lokr_weights.{ext}")
+            if os.path.exists(p): return p
+    return None
+
 class AceStepLoraAnalyzer:
     """
-    Анализирует веса матрицы внутри LoRA и показывает, 
+    Анализирует веса матрицы внутри LoRA (из папки) и показывает, 
     какие слои (в процентах) имеют наибольшее влияние.
     """
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Полный путь к safetensors файлу"}),
+                "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Полный путь к папке LoRA"}),
             }
         }
 
@@ -400,12 +413,14 @@ class AceStepLoraAnalyzer:
 
     def analyze(self, lora_path):
         lora_path = lora_path.strip()
-        if not os.path.exists(lora_path):
-            return (f"❌ Ошибка: Файл не найден по пути {lora_path}",)
+        weight_file = _find_lora_weight_file(lora_path)
+        
+        if not weight_file or not os.path.exists(weight_file):
+            return (f"❌ Ошибка: Файл весов не найден по пути {lora_path}",)
         
         try:
             from safetensors.torch import load_file
-            sd = load_file(lora_path) if lora_path.endswith('.safetensors') else torch.load(lora_path, map_location="cpu", weights_only=True)
+            sd = load_file(weight_file) if weight_file.endswith('.safetensors') else torch.load(weight_file, map_location="cpu", weights_only=True)
             
             # Собираем пары матриц A и B
             layer_pairs = {}
@@ -419,7 +434,7 @@ class AceStepLoraAnalyzer:
                 elif "lora_B" in k:
                     layer_pairs[base_key]["B"] = v
 
-            # Вычисляем влияние (используем субмультипликативность нормы Фробениуса для экономии RAM)
+            # Вычисляем влияние 
             influence_data = {}
             max_influence = 0.0
             
@@ -435,12 +450,10 @@ class AceStepLoraAnalyzer:
             if max_influence == 0:
                 return ("⚠️ В файле не найдены стандартные веса LoRA (lora_A / lora_B). Возможно это LoKr/LyCORIS без стандартной номенклатуры.",)
 
-            # Формируем отчет
             report = f"📊 АНАЛИЗ ВЛИЯНИЯ LoRA (100% = самый сильный слой)\n"
-            report += f"Файл: {os.path.basename(lora_path)}\n"
+            report += f"Путь: {lora_path}\n"
             report += "=" * 60 + "\n\n"
 
-            # Группируем по типам
             block_avgs = {"self_attn": [], "cross_attn": [], "mlp": [], "other": []}
 
             sorted_layers = sorted(influence_data.items(), key=lambda x: x[1], reverse=True)
@@ -468,117 +481,124 @@ class AceStepLoraAnalyzer:
 class AceStepAdvancedLoraLoader:
     """
     Продвинутый загрузчик, позволяющий умножать веса конкретных блоков 
-    (Self-Attn, Cross-Attn, MLP) и диапазонов слоев (0-5, 6-11 и т.д.).
+    и индивидуально настраивать каждый из 24 слоев модели.
     """
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("ACESTEP_MODEL",),
-                "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Путь к LoRA"}),
-                "global_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
-                
-                # --- Block Multipliers ---
-                "self_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Self-Attention (Q, K, V, O)"}),
-                "cross_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Cross-Attention (Связь с текстом/аудио)"}),
-                "mlp_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "MLP (Gate, Up, Down) - отвечает за общие знания"}),
-                "embed_proj_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Входные/Выходные проекции и эмбеддинги времени"}),
-                
-                # --- Layer Multipliers ---
-                "layers_0_to_5": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "layers_6_to_11": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "layers_12_to_17": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "layers_18_to_23": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                
-                "ignore_bias_error": ("BOOLEAN", {"default": True}),
-            }
+        req = {
+            "model": ("ACESTEP_MODEL",),
+            "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Путь к папке LoRA"}),
+            "global_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+            
+            "self_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Self-Attention (Q, K, V, O)"}),
+            "cross_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Cross-Attention (Связь с текстом/аудио)"}),
+            "mlp_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "MLP (Gate, Up, Down)"}),
+            "embed_proj_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Проекции и эмбеддинги времени"}),
+            
+            "ignore_bias_error": ("BOOLEAN", {"default": True}),
         }
+        # Динамически генерируем ползунки для 24 слоев
+        for i in range(24):
+            req[f"layer_{i:02d}_mult"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05})
+            
+        return {"required": req}
 
     RETURN_TYPES = ("ACESTEP_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_advanced"
     CATEGORY = "ACE-Step/LoRA Tools"
 
-    def get_multiplier(self, key, kwargs):
-        """Определяет множитель для конкретного ключа на основе настроек пользователя"""
+    def get_multiplier(self, key, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, layer_kwargs):
         scale = 1.0
         
         # 1. По типу блока
-        if "self_attn" in key: scale *= kwargs["self_attn_mult"]
-        elif "cross_attn" in key: scale *= kwargs["cross_attn_mult"]
-        elif "mlp" in key: scale *= kwargs["mlp_mult"]
+        if "self_attn" in key: scale *= self_attn_mult
+        elif "cross_attn" in key: scale *= cross_attn_mult
+        elif "mlp" in key: scale *= mlp_mult
         elif any(x in key for x in ["proj_in", "proj_out", "time_embed", "condition_embedder"]):
-            scale *= kwargs["embed_proj_mult"]
+            scale *= embed_proj_mult
             
-        # 2. По номеру слоя (от 0 до 23)
-        import re
+        # 2. По номеру слоя
         match = re.search(r"\.layers\.(\d+)\.", key)
         if match:
             layer_idx = int(match.group(1))
-            if 0 <= layer_idx <= 5: scale *= kwargs["layers_0_to_5"]
-            elif 6 <= layer_idx <= 11: scale *= kwargs["layers_6_to_11"]
-            elif 12 <= layer_idx <= 17: scale *= kwargs["layers_12_to_17"]
-            elif 18 <= layer_idx <= 23: scale *= kwargs["layers_18_to_23"]
+            arg_name = f"layer_{layer_idx:02d}_mult"
+            scale *= layer_kwargs.get(arg_name, 1.0)
             
         return scale
 
-    def load_advanced(self, model, lora_path, global_strength, **kwargs):
+    def load_advanced(self, model, lora_path, global_strength, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, ignore_bias_error, **kwargs):
         lora_path = lora_path.strip()
         if global_strength == 0.0 or not lora_path or not os.path.exists(lora_path):
+            return (model,)
+
+        weight_file = _find_lora_weight_file(lora_path)
+        if not weight_file:
+            print(f"[ACE-Step Advanced LoRA] ❌ Ошибка: Файл весов не найден в {lora_path}")
             return (model,)
 
         import hashlib
         import folder_paths
         from safetensors.torch import load_file, save_file
         
-        # Создаем уникальный хэш на основе пути и всех множителей
-        settings_str = f"{lora_path}_{global_strength}_" + "_".join([f"{k}:{v}" for k, v in kwargs.items()])
+        # Генерируем хэш на основе всех множителей
+        settings_str = f"{lora_path}_{global_strength}_{self_attn_mult}_{cross_attn_mult}_{mlp_mult}_{embed_proj_mult}_" + "_".join([f"{k}:{v}" for k, v in kwargs.items()])
         hash_str = hashlib.md5(settings_str.encode()).hexdigest()[:12]
         
-        base_name = os.path.basename(lora_path).split('.')[0]
+        base_name = os.path.basename(lora_path.rstrip("/\\"))
+        if base_name == "adapter_model" or base_name == "lokr_weights":
+            base_name = os.path.basename(os.path.dirname(lora_path))
+            
         adapter_name = f"adv_{base_name}_{hash_str}"
         
-        # Файл, куда мы сохраним пропатченную LoRA для загрузки движком
+        # Создаем ПАПКУ во временной директории, чтобы PEFT нашел config.json
         temp_dir = folder_paths.get_temp_directory()
-        temp_lora_path = os.path.join(temp_dir, f"{adapter_name}.safetensors")
+        temp_lora_dir = os.path.join(temp_dir, adapter_name)
+        os.makedirs(temp_lora_dir, exist_ok=True)
         
-        # Если такой файл еще не сгенерирован — генерируем
-        if not os.path.exists(temp_lora_path):
-            print(f"[ACE-Step Advanced LoRA] 🛠️ Генерация отфильтрованных весов: {adapter_name}...")
-            sd = load_file(lora_path) if lora_path.endswith('.safetensors') else torch.load(lora_path, map_location="cpu", weights_only=True)
+        temp_weight_path = os.path.join(temp_lora_dir, "adapter_model.safetensors")
+        temp_config_path = os.path.join(temp_lora_dir, "adapter_config.json")
+        
+        if not os.path.exists(temp_weight_path):
+            print(f"[ACE-Step Advanced LoRA] 🛠️ Генерация модифицированной LoRA в {temp_lora_dir}...")
             
+            # Копируем конфиг, если он есть (нужно для PEFT)
+            orig_config = os.path.join(lora_path if os.path.isdir(lora_path) else os.path.dirname(lora_path), "adapter_config.json")
+            if os.path.exists(orig_config):
+                shutil.copy2(orig_config, temp_config_path)
+            else:
+                # Fallback конфиг, если это специфичный формат
+                with open(temp_config_path, "w") as f:
+                    f.write('{"peft_type": "LORA", "r": 64, "lora_alpha": 64, "target_modules": []}')
+
+            # Применяем множители
+            sd = load_file(weight_file) if weight_file.endswith('.safetensors') else torch.load(weight_file, map_location="cpu", weights_only=True)
             new_sd = {}
             modified_count = 0
             
             for k, v in sd.items():
-                # Мы применяем множители только к одной матрице из пары (lora_B), 
-                # этого достаточно для линейного масштабирования выхода слоя
                 if "lora_B" in k or "lora_down" in k:
-                    mult = self.get_multiplier(k, kwargs)
+                    mult = self.get_multiplier(k, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, kwargs)
                     new_sd[k] = v * mult
                     if mult != 1.0:
                         modified_count += 1
                 else:
                     new_sd[k] = v
             
-            save_file(new_sd, temp_lora_path)
-            print(f"[ACE-Step Advanced LoRA] ✅ Сохранен патч. Модифицировано слоев: {modified_count}")
+            save_file(new_sd, temp_weight_path)
+            print(f"[ACE-Step Advanced LoRA] ✅ Сохранено. Модифицировано матриц: {modified_count}")
 
-        # Вызываем стандартный загрузчик из ACE-Step, подсунув ему наш пропатченный файл
+        # Вызываем стандартный загрузчик, передавая ПАПКУ
         dit_handler = model["dit_handler"]
-        ignore_bias_error = kwargs.get("ignore_bias_error", True)
+        final_adapter_name = adapter_name + ("_nb" if ignore_bias_error else "")
         
-        suffix = "_nb" if ignore_bias_error else ""
-        final_adapter_name = adapter_name + suffix
-        
-        load_msg = dit_handler.add_lora(temp_lora_path, adapter_name=final_adapter_name, ignore_bias=ignore_bias_error)
+        load_msg = dit_handler.add_lora(temp_lora_dir, adapter_name=final_adapter_name, ignore_bias=ignore_bias_error)
 
         if "❌" in load_msg and "already loaded" not in load_msg:
-            print(f"[ACE-Step] Ошибка загрузки Продвинутой LoRA {final_adapter_name}: {load_msg}")
+            print(f"[ACE-Step] Ошибка загрузки Продвинутой LoRA: {load_msg}")
             return (model,)
         else:
             new_active = model["active_adapters"].copy()
-            # Глобальную силу передаем движку
             new_active[final_adapter_name] = float(global_strength)
             new_model = model.copy()
             new_model["active_adapters"] = new_active
