@@ -379,6 +379,210 @@ class AceStepLoraBaker:
         print(f"[ACE-Step Baker] ✨ Запекание завершено! Итоговый размер: {os.path.getsize(save_path) / (1024**3):.2f} ГБ")
         
         return (model, save_path)
+    
+class AceStepLoraAnalyzer:
+    """
+    Анализирует веса матрицы внутри LoRA и показывает, 
+    какие слои (в процентах) имеют наибольшее влияние.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Полный путь к safetensors файлу"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("analysis_report",)
+    FUNCTION = "analyze"
+    CATEGORY = "ACE-Step/LoRA Tools"
+
+    def analyze(self, lora_path):
+        lora_path = lora_path.strip()
+        if not os.path.exists(lora_path):
+            return (f"❌ Ошибка: Файл не найден по пути {lora_path}",)
+        
+        try:
+            from safetensors.torch import load_file
+            sd = load_file(lora_path) if lora_path.endswith('.safetensors') else torch.load(lora_path, map_location="cpu", weights_only=True)
+            
+            # Собираем пары матриц A и B
+            layer_pairs = {}
+            for k, v in sd.items():
+                base_key = k.replace(".lora_B.weight", "").replace(".lora_A.weight", "")
+                if base_key not in layer_pairs:
+                    layer_pairs[base_key] = {}
+                
+                if "lora_A" in k:
+                    layer_pairs[base_key]["A"] = v
+                elif "lora_B" in k:
+                    layer_pairs[base_key]["B"] = v
+
+            # Вычисляем влияние (используем субмультипликативность нормы Фробениуса для экономии RAM)
+            influence_data = {}
+            max_influence = 0.0
+            
+            for k, mats in layer_pairs.items():
+                if "A" in mats and "B" in mats:
+                    norm_A = torch.norm(mats["A"].float()).item()
+                    norm_B = torch.norm(mats["B"].float()).item()
+                    influence = norm_A * norm_B
+                    influence_data[k] = influence
+                    if influence > max_influence:
+                        max_influence = influence
+            
+            if max_influence == 0:
+                return ("⚠️ В файле не найдены стандартные веса LoRA (lora_A / lora_B). Возможно это LoKr/LyCORIS без стандартной номенклатуры.",)
+
+            # Формируем отчет
+            report = f"📊 АНАЛИЗ ВЛИЯНИЯ LoRA (100% = самый сильный слой)\n"
+            report += f"Файл: {os.path.basename(lora_path)}\n"
+            report += "=" * 60 + "\n\n"
+
+            # Группируем по типам
+            block_avgs = {"self_attn": [], "cross_attn": [], "mlp": [], "other": []}
+
+            sorted_layers = sorted(influence_data.items(), key=lambda x: x[1], reverse=True)
+            for k, infl in sorted_layers:
+                percent = (infl / max_influence) * 100
+                report += f"[{percent:5.1f}%] {k}\n"
+                
+                if "self_attn" in k: block_avgs["self_attn"].append(percent)
+                elif "cross_attn" in k: block_avgs["cross_attn"].append(percent)
+                elif "mlp" in k: block_avgs["mlp"].append(percent)
+                else: block_avgs["other"].append(percent)
+
+            report += "\n" + "=" * 60 + "\n"
+            report += "📈 СРЕДНЕЕ ВЛИЯНИЕ ПО БЛОКАМ:\n"
+            for b_name, b_list in block_avgs.items():
+                avg = sum(b_list) / len(b_list) if b_list else 0.0
+                report += f" • {b_name.upper()}: {avg:.1f}%\n"
+
+            return (report,)
+            
+        except Exception as e:
+            return (f"❌ Ошибка при анализе: {str(e)}",)
+
+
+class AceStepAdvancedLoraLoader:
+    """
+    Продвинутый загрузчик, позволяющий умножать веса конкретных блоков 
+    (Self-Attn, Cross-Attn, MLP) и диапазонов слоев (0-5, 6-11 и т.д.).
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("ACESTEP_MODEL",),
+                "lora_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Путь к LoRA"}),
+                "global_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+                
+                # --- Block Multipliers ---
+                "self_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Self-Attention (Q, K, V, O)"}),
+                "cross_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Cross-Attention (Связь с текстом/аудио)"}),
+                "mlp_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "MLP (Gate, Up, Down) - отвечает за общие знания"}),
+                "embed_proj_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Входные/Выходные проекции и эмбеддинги времени"}),
+                
+                # --- Layer Multipliers ---
+                "layers_0_to_5": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "layers_6_to_11": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "layers_12_to_17": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "layers_18_to_23": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                
+                "ignore_bias_error": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_advanced"
+    CATEGORY = "ACE-Step/LoRA Tools"
+
+    def get_multiplier(self, key, kwargs):
+        """Определяет множитель для конкретного ключа на основе настроек пользователя"""
+        scale = 1.0
+        
+        # 1. По типу блока
+        if "self_attn" in key: scale *= kwargs["self_attn_mult"]
+        elif "cross_attn" in key: scale *= kwargs["cross_attn_mult"]
+        elif "mlp" in key: scale *= kwargs["mlp_mult"]
+        elif any(x in key for x in ["proj_in", "proj_out", "time_embed", "condition_embedder"]):
+            scale *= kwargs["embed_proj_mult"]
+            
+        # 2. По номеру слоя (от 0 до 23)
+        import re
+        match = re.search(r"\.layers\.(\d+)\.", key)
+        if match:
+            layer_idx = int(match.group(1))
+            if 0 <= layer_idx <= 5: scale *= kwargs["layers_0_to_5"]
+            elif 6 <= layer_idx <= 11: scale *= kwargs["layers_6_to_11"]
+            elif 12 <= layer_idx <= 17: scale *= kwargs["layers_12_to_17"]
+            elif 18 <= layer_idx <= 23: scale *= kwargs["layers_18_to_23"]
+            
+        return scale
+
+    def load_advanced(self, model, lora_path, global_strength, **kwargs):
+        lora_path = lora_path.strip()
+        if global_strength == 0.0 or not lora_path or not os.path.exists(lora_path):
+            return (model,)
+
+        import hashlib
+        import folder_paths
+        from safetensors.torch import load_file, save_file
+        
+        # Создаем уникальный хэш на основе пути и всех множителей
+        settings_str = f"{lora_path}_{global_strength}_" + "_".join([f"{k}:{v}" for k, v in kwargs.items()])
+        hash_str = hashlib.md5(settings_str.encode()).hexdigest()[:12]
+        
+        base_name = os.path.basename(lora_path).split('.')[0]
+        adapter_name = f"adv_{base_name}_{hash_str}"
+        
+        # Файл, куда мы сохраним пропатченную LoRA для загрузки движком
+        temp_dir = folder_paths.get_temp_directory()
+        temp_lora_path = os.path.join(temp_dir, f"{adapter_name}.safetensors")
+        
+        # Если такой файл еще не сгенерирован — генерируем
+        if not os.path.exists(temp_lora_path):
+            print(f"[ACE-Step Advanced LoRA] 🛠️ Генерация отфильтрованных весов: {adapter_name}...")
+            sd = load_file(lora_path) if lora_path.endswith('.safetensors') else torch.load(lora_path, map_location="cpu", weights_only=True)
+            
+            new_sd = {}
+            modified_count = 0
+            
+            for k, v in sd.items():
+                # Мы применяем множители только к одной матрице из пары (lora_B), 
+                # этого достаточно для линейного масштабирования выхода слоя
+                if "lora_B" in k or "lora_down" in k:
+                    mult = self.get_multiplier(k, kwargs)
+                    new_sd[k] = v * mult
+                    if mult != 1.0:
+                        modified_count += 1
+                else:
+                    new_sd[k] = v
+            
+            save_file(new_sd, temp_lora_path)
+            print(f"[ACE-Step Advanced LoRA] ✅ Сохранен патч. Модифицировано слоев: {modified_count}")
+
+        # Вызываем стандартный загрузчик из ACE-Step, подсунув ему наш пропатченный файл
+        dit_handler = model["dit_handler"]
+        ignore_bias_error = kwargs.get("ignore_bias_error", True)
+        
+        suffix = "_nb" if ignore_bias_error else ""
+        final_adapter_name = adapter_name + suffix
+        
+        load_msg = dit_handler.add_lora(temp_lora_path, adapter_name=final_adapter_name, ignore_bias=ignore_bias_error)
+
+        if "❌" in load_msg and "already loaded" not in load_msg:
+            print(f"[ACE-Step] Ошибка загрузки Продвинутой LoRA {final_adapter_name}: {load_msg}")
+            return (model,)
+        else:
+            new_active = model["active_adapters"].copy()
+            # Глобальную силу передаем движку
+            new_active[final_adapter_name] = float(global_strength)
+            new_model = model.copy()
+            new_model["active_adapters"] = new_active
+            return (new_model,)
 
 # ============================================================================
 # 3. Настройка параметров LLM
@@ -853,7 +1057,9 @@ NODE_CLASS_MAPPINGS = {
     "AceStepLoraBaker": AceStepLoraBaker,
     "AceStepLMConfig": AceStepLMConfig,
     "AceStepPromptEnhancer": AceStepPromptEnhancer,
-    "AceStepMusicGenerator": AceStepMusicGenerator
+    "AceStepMusicGenerator": AceStepMusicGenerator,
+    "AceStepLoraAnalyzer": AceStepLoraAnalyzer,
+    "AceStepAdvancedLoraLoader": AceStepAdvancedLoraLoader
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -862,5 +1068,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepLoraBaker": "ACE-Step LoRA Baker 🍳",
     "AceStepLMConfig": "ACE-Step LM Config ⚙️",
     "AceStepPromptEnhancer": "ACE-Step Prompt Enhancer ✍️",
-    "AceStepMusicGenerator": "ACE-Step Music Generator 🎵"
+    "AceStepMusicGenerator": "ACE-Step Music Generator 🎵",
+    "AceStepLoraAnalyzer": "ACE-Step LoRA Analyzer 🔬",
+    "AceStepAdvancedLoraLoader": "ACE-Step Advanced LoRA Loader 🎛️"
 }
