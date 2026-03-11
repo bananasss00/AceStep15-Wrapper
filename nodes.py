@@ -395,8 +395,8 @@ def _find_lora_weight_file(path):
 
 class AceStepLoraAnalyzer:
     """
-    Анализирует веса матрицы внутри LoRA (из папки) и показывает, 
-    какие слои (в процентах) имеют наибольшее влияние.
+    Анализирует веса матрицы внутри LoRA (из папки).
+    Выдает два отчета: полный (по всем модулям) и сокращенный (усредненный по слоям).
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -406,8 +406,9 @@ class AceStepLoraAnalyzer:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("analysis_report",)
+    # Теперь два выхода STRING
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("detailed_report", "lite_report")
     FUNCTION = "analyze"
     CATEGORY = "ACE-Step/LoRA Tools"
 
@@ -416,7 +417,8 @@ class AceStepLoraAnalyzer:
         weight_file = _find_lora_weight_file(lora_path)
         
         if not weight_file or not os.path.exists(weight_file):
-            return (f"❌ Ошибка: Файл весов не найден по пути {lora_path}",)
+            msg = f"❌ Ошибка: Файл весов не найден по пути {lora_path}"
+            return (msg, msg)
         
         try:
             from safetensors.torch import load_file
@@ -434,7 +436,7 @@ class AceStepLoraAnalyzer:
                 elif "lora_B" in k:
                     layer_pairs[base_key]["B"] = v
 
-            # Вычисляем влияние 
+            # Вычисляем влияние каждого саб-модуля
             influence_data = {}
             max_influence = 0.0
             
@@ -448,34 +450,78 @@ class AceStepLoraAnalyzer:
                         max_influence = influence
             
             if max_influence == 0:
-                return ("⚠️ В файле не найдены стандартные веса LoRA. Возможно это LoKr без стандартной номенклатуры.",)
+                msg = "⚠️ В файле не найдены стандартные веса LoRA. Возможно это LoKr без стандартной номенклатуры."
+                return (msg, msg)
 
-            report = f"📊 АНАЛИЗ ВЛИЯНИЯ LoRA (100% = самый сильный слой)\n"
-            report += f"Путь: {lora_path}\n"
-            report += "=" * 60 + "\n\n"
-
+            # ==========================================
+            # СБОР ДАННЫХ ДЛЯ ОТЧЕТОВ
+            # ==========================================
             block_avgs = {"self_attn": [], "cross_attn": [], "mlp": [], "other": []}
+            layer_influences = {} # {индекс_слоя: [значение_влияния1, значение_влияния2, ...]}
 
+            detailed_report = f"📊 ПОЛНЫЙ АНАЛИЗ ВЛИЯНИЯ (100% = самый сильный модуль)\n"
+            detailed_report += f"Путь: {lora_path}\n"
+            detailed_report += "=" * 60 + "\n\n"
+
+            # 1. Формируем детальный отчет и собираем статистику
             sorted_layers = sorted(influence_data.items(), key=lambda x: x[1], reverse=True)
             for k, infl in sorted_layers:
                 percent = (infl / max_influence) * 100
-                report += f"[{percent:5.1f}%] {k}\n"
+                detailed_report += f"[{percent:5.1f}%] {k}\n"
                 
+                # Статистика по блокам
                 if "self_attn" in k: block_avgs["self_attn"].append(percent)
                 elif "cross_attn" in k: block_avgs["cross_attn"].append(percent)
                 elif "mlp" in k: block_avgs["mlp"].append(percent)
                 else: block_avgs["other"].append(percent)
 
-            report += "\n" + "=" * 60 + "\n"
-            report += "📈 СРЕДНЕЕ ВЛИЯНИЕ ПО БЛОКАМ:\n"
+                # Группировка по номеру слоя для Lite-отчета
+                match = re.search(r"\.layers\.(\d+)\.", k)
+                if match:
+                    l_idx = int(match.group(1))
+                    if l_idx not in layer_influences:
+                        layer_influences[l_idx] = []
+                    layer_influences[l_idx].append(infl)
+
+            # 2. Формируем LITE отчет (усреднение по слою)
+            lite_report = f"📊 СВОДНЫЙ АНАЛИЗ ПО СЛОЯМ (100% = самый сильный слой)\n"
+            lite_report += f"Путь: {lora_path}\n"
+            lite_report += "=" * 60 + "\n\n"
+
+            layer_avgs = {}
+            max_layer_avg = 0.0
+            
+            # Усредняем саб-модули внутри одного слоя
+            for l_idx, infl_list in layer_influences.items():
+                avg = sum(infl_list) / len(infl_list)
+                layer_avgs[l_idx] = avg
+                if avg > max_layer_avg:
+                    max_layer_avg = avg
+
+            # Сортируем слои по силе влияния и добавляем в лайт-отчет
+            sorted_layer_avgs = sorted(layer_avgs.items(), key=lambda x: x[1], reverse=True)
+            for l_idx, avg_infl in sorted_layer_avgs:
+                percent = (avg_infl / max_layer_avg) * 100 if max_layer_avg > 0 else 0
+                lite_report += f"[{percent:5.1f}%] Layer {l_idx:02d}\n"
+
+            if not layer_influences:
+                lite_report += "⚠️ Специфичных слоев .layers.XX. не найдено.\n"
+
+            # 3. Добавляем общую статистику в конец ОБОИХ отчетов
+            summary_text = "\n" + "=" * 60 + "\n"
+            summary_text += "📈 СРЕДНЕЕ ВЛИЯНИЕ ПО БЛОКАМ:\n"
             for b_name, b_list in block_avgs.items():
                 avg = sum(b_list) / len(b_list) if b_list else 0.0
-                report += f" • {b_name.upper()}: {avg:.1f}%\n"
+                summary_text += f" • {b_name.upper()}: {avg:.1f}%\n"
 
-            return (report,)
+            detailed_report += summary_text
+            lite_report += summary_text
+
+            return (detailed_report, lite_report)
             
         except Exception as e:
-            return (f"❌ Ошибка при анализе: {str(e)}",)
+            msg = f"❌ Ошибка при анализе: {str(e)}"
+            return (msg, msg)
 
 
 class AceStepAdvancedLoraLoader:
