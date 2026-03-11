@@ -45,7 +45,7 @@ def set_use_lora(self, use_lora: bool) -> str:
 
 
 def set_lora_scale(self, adapter_name_or_scale: str | float, scale: float | None = None) -> str:
-    """Set LoRA scale (0–1). Call as set_lora_scale(scale) or set_lora_scale(adapter_name, scale)."""
+    """Set LoRA scale. Call as set_lora_scale(scale) or set_lora_scale(adapter_name, scale)."""
     if not self.lora_loaded:
         return "⚠️ No LoRA loaded"
 
@@ -60,11 +60,11 @@ def set_lora_scale(self, adapter_name_or_scale: str | float, scale: float | None
     try:
         scale_value = float(scale_value)
     except (TypeError, ValueError):
-        return "❌ Invalid LoRA scale: please provide a numeric value between 0 and 1."
+        return "❌ Invalid LoRA scale: please provide a numeric value."
     if not math.isfinite(scale_value):
-        return "❌ Invalid LoRA scale: please provide a finite numeric value between 0 and 1."
+        return "❌ Invalid LoRA scale: please provide a finite numeric value."
 
-    scale_value = max(0.0, min(1.0, scale_value))
+    scale_value = max(0.0, scale_value)
     _active_loras = getattr(self, "_active_loras", None) or {}
     if not effective_name:
         effective_name = getattr(self, "_lora_active_adapter", None) or (
