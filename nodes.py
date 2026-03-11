@@ -434,6 +434,7 @@ class AceStepLoraAnalyzer:
                 elif "lora_B" in k:
                     layer_pairs[base_key]["B"] = v
 
+            # Вычисляем влияние 
             influence_data = {}
             max_influence = 0.0
             
@@ -492,6 +493,8 @@ class AceStepAdvancedLoraLoader:
             "cross_attn_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Cross-Attention (Связь с текстом/аудио)"}),
             "mlp_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "MLP (Gate, Up, Down)"}),
             "embed_proj_mult": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "Проекции и эмбеддинги времени"}),
+            
+            "ignore_bias_error": ("BOOLEAN", {"default": True}),
         }
         # 24 независимых ползунка для каждого слоя
         for i in range(24):
@@ -523,7 +526,7 @@ class AceStepAdvancedLoraLoader:
             
         return scale
 
-    def load_advanced(self, model, lora_path, global_strength, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, **kwargs):
+    def load_advanced(self, model, lora_path, global_strength, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, ignore_bias_error, **kwargs):
         lora_path = lora_path.strip()
         if global_strength == 0.0 or not lora_path or not os.path.exists(lora_path):
             return (model,)
@@ -543,40 +546,35 @@ class AceStepAdvancedLoraLoader:
         if base_name in ["adapter_model", "lokr_weights"]:
             base_name = os.path.basename(os.path.dirname(lora_path))
             
-        # Окончательное имя адаптера с пометкой _nb (no bias)
-        adapter_name = f"adv_{base_name}_{hash_str}_nb"
+        # Окончательное имя адаптера
+        adapter_name = f"adv_{base_name}_{hash_str}"
+        final_adapter_name = adapter_name + ("_nb" if ignore_bias_error else "")
         
         dit_handler = model["dit_handler"]
 
         # ==============================================================================
         # МАГИЯ IN-MEMORY ПАТЧИНГА
         # Временно перехватываем функцию чтения safetensors внутри самого ACE-Step.
-        # Это позволяет применить наши множители слоев прямо во время загрузки 
-        # словаря весов в оперативную память, не создавая ни одного файла на диске!
         # ==============================================================================
         import acestep.core.generation.handler.lora.lifecycle as lora_lifecycle
         
-        # Сохраняем оригинальные загрузчики
         orig_load_st = lora_lifecycle.load_safetensors
         orig_torch_load = torch.load
 
-        # Функция применения множителей
         def apply_multipliers_to_sd(sd):
             print(f"[ACE-Step Advanced LoRA] 💉 Модификация весов в оперативной памяти...")
             modified_count = 0
             for k, v in sd.items():
+                # Применяем умножение только к lora_B (этого достаточно для математики LoRA)
                 if "lora_B" in k or "lora_down" in k:
                     mult = self.get_multiplier(k, self_attn_mult, cross_attn_mult, mlp_mult, embed_proj_mult, kwargs)
                     if mult != 1.0:
-                        # Сохраняем оригинальный тип (bfloat16 и тд)
                         orig_dtype = v.dtype
-                        # Умножаем в float32 для точности, затем возвращаем родной тип
                         sd[k] = (v.float() * mult).to(orig_dtype)
                         modified_count += 1
             print(f"[ACE-Step Advanced LoRA] ✨ Изменено {modified_count} слоев. Передаю в движок.")
             return sd
 
-        # Хуки, которые перехватят словарь
         def hooked_load_st(path, *args, **kwargs_st):
             sd = orig_load_st(path, *args, **kwargs_st)
             return apply_multipliers_to_sd(sd)
@@ -585,19 +583,24 @@ class AceStepAdvancedLoraLoader:
             sd = orig_torch_load(path, *args, **kwargs_torch)
             return apply_multipliers_to_sd(sd)
 
-        # Применяем хуки
         lora_lifecycle.load_safetensors = hooked_load_st
         torch.load = hooked_torch_load
 
         try:
-            # Вызываем стандартный загрузчик, НО с оригинальным lora_path!
-            # PEFT без проблем прочитает родной adapter_config.json из родной папки (Фикс Ишью 1),
-            # А когда ACE-Step потянется за весами, сработают наши хуки (Фикс Ишью 2).
-            # ignore_bias=True обязательно, так как именно эта ветка использует загрузку state_dict напрямую
-            load_msg = dit_handler.add_lora(lora_path, adapter_name=adapter_name, ignore_bias=True)
+            # Вызываем стандартный загрузчик с оригинальной папкой (PEFT сам найдет adapter_config.json)
+            load_msg = dit_handler.add_lora(lora_path, adapter_name=final_adapter_name, ignore_bias=ignore_bias_error)
+            
+            # ФИКС ОШИБКИ KeyError В PEFT: Принудительно делаем новую лору активной сразу после загрузки.
+            # Это предотвращает краш PEFT при попытке генератора удалить старую неактивную лору.
+            decoder = getattr(dit_handler.model, "decoder", None)
+            if decoder is not None and hasattr(decoder, "set_adapter"):
+                try:
+                    decoder.set_adapter(final_adapter_name)
+                except Exception as e:
+                    print(f"[ACE-Step Advanced LoRA] Предупреждение при форсировании адаптера: {e}")
             
         finally:
-            # Всегда возвращаем оригинальные функции на место, даже в случае ошибки
+            # Возвращаем функции на место
             lora_lifecycle.load_safetensors = orig_load_st
             torch.load = orig_torch_load
 
@@ -605,9 +608,8 @@ class AceStepAdvancedLoraLoader:
             print(f"[ACE-Step] Ошибка In-Memory загрузки LoRA: {load_msg}")
             return (model,)
         else:
-            # Успешно загрузили! Применяем глобальную силу
             new_active = model["active_adapters"].copy()
-            new_active[adapter_name] = float(global_strength)
+            new_active[final_adapter_name] = float(global_strength)
             new_model = model.copy()
             new_model["active_adapters"] = new_active
             return (new_model,)
