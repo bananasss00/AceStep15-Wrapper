@@ -6,7 +6,6 @@ Supports training from preprocessed tensor files for optimal performance.
 """
 
 import os
-import json
 import shutil
 import time
 import random
@@ -35,18 +34,8 @@ from acestep.training.configs import TrainingConfig
 from acestep.training.data_module import PreprocessedDataModule
 from acestep.training.path_safety import safe_path
 
-
-# Turbo model shift=3.0 discrete timesteps (8 steps, same as inference)
-TURBO_SHIFT3_TIMESTEPS = [
-    1.0,
-    0.9545454545454546,
-    0.9,
-    0.8333333333333334,
-    0.75,
-    0.6428571428571429,
-    0.5,
-    0.3,
-]
+# --- ПРАВИЛЬНЫЙ ИМПОРТ ИЗ V2 (Continuous Timesteps + CFG Dropout) ---
+from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
 
 
 def _normalize_device_type(device: Any) -> str:
@@ -72,8 +61,6 @@ def _select_fabric_precision(device_type: str) -> str:
     if device_type in ("cuda", "xpu"):
         return "bf16-mixed"
     if device_type == "mps":
-        # Use AMP on MPS for better throughput. Trainable parameters are
-        # explicitly forced to fp32 before optimizer/Fabric setup.
         return "16-mixed"
     return "32-true"
 
@@ -112,7 +99,7 @@ def _ensure_optimizer_params_fp32(optimizer: torch.optim.Optimizer) -> Tuple[int
     casted = 0
     total = 0
     for group in optimizer.param_groups:
-        for p in group.get("params", []):
+        for p in group.get("params",[]):
             if p is None:
                 continue
             total += 1
@@ -123,43 +110,11 @@ def _ensure_optimizer_params_fp32(optimizer: torch.optim.Optimizer) -> Tuple[int
     return casted, total
 
 
-def sample_discrete_timestep(bsz, timesteps_tensor):
-    """Sample timesteps from discrete turbo shift=3 schedule.
-
-    For each sample in the batch, randomly select one of the 8 discrete timesteps
-    used by the turbo model with shift=3.0.
-
-    Args:
-        bsz: Batch size
-        device: Device
-        dtype: Data type (should be bfloat16)
-
-    Returns:
-        Tuple of (t, r) where both are the same sampled timestep
-    """
-    # Randomly select indices for each sample in batch
-    indices = torch.randint(
-        0, timesteps_tensor.shape[0], (bsz,), device=timesteps_tensor.device
-    )
-    t = timesteps_tensor[indices]
-
-    # r = t for this training setup
-    r = t
-
-    return t, r
-
-
 class PreprocessedFullFinetuneModule(nn.Module):
     """Full Fine-tuning Module using preprocessed tensors.
 
     This module trains ONLY the DiT decoder - encoder is not needed
     because all inputs are pre-computed tensors.
-
-    Training flow:
-    1. Load pre-computed tensors (target_latents, encoder_hidden_states, context_latents)
-    2. Sample noise and timestep
-    3. Forward through decoder only
-    4. Compute flow matching loss
     """
 
     def __init__(
@@ -169,14 +124,6 @@ class PreprocessedFullFinetuneModule(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ):
-        """Initialize the training module.
-
-        Args:
-            model: The AceStepConditionGenerationModel (only decoder will be used)
-            training_config: Training configuration
-            device: Device to use
-            dtype: Data type to use
-        """
         super().__init__()
 
         self.training_config = training_config
@@ -184,20 +131,26 @@ class PreprocessedFullFinetuneModule(nn.Module):
         self.device_type = _normalize_device_type(self.device)
         self.dtype = _select_compute_dtype(self.device_type)
         self.transfer_non_blocking = self.device_type in ("cuda", "xpu")
-        self.timesteps_tensor = torch.tensor(
-            TURBO_SHIFT3_TIMESTEPS, device=self.device, dtype=self.dtype
-        )
+        
+        # Динамически вытягиваем параметры таймстепов из конфига текущей модели (turbo/base/sft)
+        self.timestep_mu = getattr(model.config, 'timestep_mu', -0.4)
+        self.timestep_sigma = getattr(model.config, 'timestep_sigma', 1.0)
+        self.data_proportion = getattr(model.config, 'data_proportion', 0.5)
+        
+        # Получаем уровень CFG dropout из training_config (по умолчанию 0.15)
+        self.cfg_ratio = getattr(training_config, "cfg_ratio", 0.15)
+        
+        # Получаем эмбеддинг для безусловной генерации
+        if hasattr(model, "null_condition_emb"):
+            self._null_cond_emb = model.null_condition_emb
+        else:
+            self._null_cond_emb = None
 
-        # Store training losses
-        self.training_losses = []
+        self.training_losses =[]
 
         # OPTIMIZATION: Only register decoder as a submodule to save VRAM.
-        # The encoder, text_projector, null_condition_emb etc. are not used
-        # with preprocessed tensors - they stay in the original model but
-        # are NOT registered here, so Fabric won't move them to GPU.
         self.add_module("decoder", model.decoder)
 
-        # Enable gradient checkpointing if specified in config
         if getattr(training_config, "gradient_checkpointing", False):
             try:
                 if hasattr(self.decoder, "gradient_checkpointing_enable"):
@@ -214,31 +167,14 @@ class PreprocessedFullFinetuneModule(nn.Module):
         batch: Dict[str, torch.Tensor],
         record_loss: bool = True,
     ) -> torch.Tensor:
-        """Single training step using preprocessed tensors.
-
-        Note: This trains the full model, NO LoRA adapters are used.
-
-        Args:
-            batch: Dictionary containing pre-computed tensors:
-                - target_latents: [B, T, 64] - VAE encoded audio
-                - attention_mask: [B, T] - Valid audio mask
-                - encoder_hidden_states: [B, L, D] - Condition encoder output
-                - encoder_attention_mask: [B, L] - Condition mask
-                - context_latents: [B, T, 128] - Source context
-            record_loss: If True, append loss to training_losses (set False for validation).
-
-        Returns:
-            Loss tensor (float32 for stable backward)
-        """
-        # Use autocast for mixed precision training (bf16 on CUDA/XPU, fp16 on MPS)
         if self.device_type in ("cuda", "xpu", "mps"):
             autocast_ctx = torch.autocast(
                 device_type=self.device_type, dtype=self.dtype
             )
         else:
             autocast_ctx = nullcontext()
+            
         with autocast_ctx:
-            # Get tensors from batch (already on device from Fabric dataloader)
             target_latents = batch["target_latents"].to(
                 self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
             )  # x0
@@ -257,12 +193,26 @@ class PreprocessedFullFinetuneModule(nn.Module):
 
             bsz = target_latents.shape[0]
 
+            # ---- CFG Dropout (Правильный подход из V2) ----
+            if self._null_cond_emb is not None and self.cfg_ratio > 0.0:
+                encoder_hidden_states = apply_cfg_dropout(
+                    encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
+                )
+
             # Flow matching: sample noise x1 and interpolate with data x0
             x1 = torch.randn_like(target_latents)  # Noise
             x0 = target_latents  # Data
 
-            # Sample timesteps from discrete turbo shift=3 schedule (8 steps)
-            t, _ = sample_discrete_timestep(bsz, self.timesteps_tensor)
+            # ---- Continuous timestep sampling ----
+            t, r = sample_timesteps(
+                batch_size=bsz,
+                device=self.device,
+                dtype=self.dtype,
+                data_proportion=self.data_proportion,
+                timestep_mu=self.timestep_mu,
+                timestep_sigma=self.timestep_sigma,
+                use_meanflow=False,
+            )
             t_ = t.unsqueeze(-1).unsqueeze(-1)
 
             # Interpolate: x_t = t * x1 + (1 - t) * x0
@@ -279,11 +229,10 @@ class PreprocessedFullFinetuneModule(nn.Module):
                 context_latents=context_latents,
             )
 
-            # Flow matching loss: predict the flow field v = x1 - x0
+            # Flow matching loss
             flow = x1 - x0
             diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
 
-        # Convert loss to float32 for stable backward pass
         diffusion_loss = diffusion_loss.float()
 
         if record_loss:
@@ -298,21 +247,7 @@ def _save_complete_model(
     source_model_dir: str,
     variant: str = "turbo",
 ) -> str:
-    """Save a complete HuggingFace-compatible model checkpoint in BF16.
-
-    Merges trained decoder weights into the original model.safetensors file
-    by key matching, without requiring the 'transformers' library.
-
-    Args:
-        trained_decoder_state: Decoder state_dict from the training module.
-        output_dir: Directory to write the complete checkpoint.
-        source_model_dir: Path to the original model directory (contains
-            config.json, silence_latent.pt, and Python code files).
-        variant: Model variant name ('turbo', 'base', 'sft').
-
-    Returns:
-        The output_dir path.
-    """
+    """Save a complete HuggingFace-compatible model checkpoint in BF16."""
     os.makedirs(output_dir, exist_ok=True)
 
     safetensors_available = False
@@ -334,16 +269,12 @@ def _save_complete_model(
             logger.info("[Save] Loading original model safetensors...")
             original_state = st_load(original_path)
 
-            # Convert lazy dict to regular dict, keeping only tensors
             original_tensors: Dict[str, torch.Tensor] = {}
             for k, v in original_state.items():
                 if isinstance(v, torch.Tensor):
                     original_tensors[k] = v
             logger.info(f"[Save] Original model has {len(original_state)} keys, {len(original_tensors)} tensors")
 
-            # Build mapping from trained keys to original keys
-            # Trained keys have no prefix (e.g. 'layers.0.cross_attn.k_proj.weight')
-            # Original keys have 'decoder.' prefix (e.g. 'decoder.layers.0.cross_attn.k_proj.weight')
             cleaned_state: Dict[str, torch.Tensor] = {}
             for key, value in trained_decoder_state.items():
                 clean_key = key
@@ -353,8 +284,6 @@ def _save_complete_model(
                         break
                 cleaned_state[clean_key] = value
 
-            # Create a new regular dict for the merged output
-            # We need to clone tensors to avoid memory-mapped tensor issues
             merged_state: Dict[str, torch.Tensor] = {}
             merged_count = 0
             missing_count = 0
@@ -407,7 +336,7 @@ def _save_complete_model(
             os.path.join(output_dir, "model_state_dict.pt"),
         )
 
-    # Copy supporting files from source model directory
+    # Copy supporting files
     if source_model_dir and os.path.isdir(source_model_dir):
         _copy_model_support_files(source_model_dir, output_dir, variant)
 
@@ -419,26 +348,13 @@ def _copy_model_support_files(
     target_dir: str,
     variant: str = "turbo",
 ) -> None:
-    """Copy non-weight files required for ``AutoModel.from_pretrained()``.
-
-    Copies ``silence_latent.pt`` and the Python model code files
-    (``configuration_acestep_v15.py``, ``modeling_acestep_v15_*.py``)
-    from the source model directory into the target checkpoint directory.
-
-    Args:
-        source_dir: Path to the original model directory.
-        target_dir: Path to the output checkpoint directory.
-        variant: Model variant name for locating source code files.
-    """
-    # Copy silence_latent.pt
     src_silence = os.path.join(source_dir, "silence_latent.pt")
     if os.path.exists(src_silence):
         dst_silence = os.path.join(target_dir, "silence_latent.pt")
         shutil.copy2(src_silence, dst_silence)
         logger.info("[Save] Copied silence_latent.pt")
 
-    # Copy Python model code files from source or acestep/models/{variant}/
-    code_files = ["configuration_acestep_v15.py"]
+    code_files =["configuration_acestep_v15.py"]
     if variant == "turbo":
         code_files.append("modeling_acestep_v15_turbo.py")
     elif variant == "base":
@@ -449,7 +365,6 @@ def _copy_model_support_files(
     for filename in code_files:
         src_file = os.path.join(source_dir, filename)
         if not os.path.exists(src_file):
-            # Fall back to acestep/models/{variant}/
             project_root = os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
@@ -459,7 +374,7 @@ def _copy_model_support_files(
         if os.path.exists(src_file):
             dst_file = os.path.join(target_dir, filename)
             shutil.copy2(src_file, dst_file)
-            logger.info("[Save] Copied {filename}")
+            logger.info(f"[Save] Copied {filename}")
 
 
 class FullFinetuneTrainer:
@@ -475,20 +390,10 @@ class FullFinetuneTrainer:
         training_config: TrainingConfig,
         source_model_dir: Optional[str] = None,
     ):
-        """Initialize the trainer.
-
-        Args:
-            dit_handler: Initialized DiT handler (for model access)
-            training_config: Training configuration
-            source_model_dir: Path to original model checkpoint directory
-                for reconstructing complete HF-compatible checkpoints.
-        """
         self.dit_handler = dit_handler
-        # Extract device and dtype from the model's parameters
         param = next(self.dit_handler.parameters())
         self.device = param.device
         self.dtype = param.dtype
-        # Validate output_dir early so all downstream path operations are safe
         training_config.output_dir = safe_path(training_config.output_dir)
         self.training_config = training_config
 
@@ -496,8 +401,6 @@ class FullFinetuneTrainer:
         self.fabric = None
         self.is_training = False
 
-        # Source model directory for reconstructing complete checkpoints.
-        # Prefer explicit argument; fall back to config._name_or_path.
         self._source_model_dir: Optional[str] = None
         if source_model_dir and os.path.isdir(source_model_dir):
             self._source_model_dir = os.path.abspath(source_model_dir)
@@ -517,22 +420,9 @@ class FullFinetuneTrainer:
         training_state: Optional[Dict] = None,
         resume_from: Optional[str] = None,
     ) -> Generator[Tuple[int, float, str], None, None]:
-        """Train full model from preprocessed tensor files.
-
-        This is the recommended training method for best performance.
-
-        Args:
-            tensor_dir: Directory containing preprocessed .pt files
-            training_state: Optional state dict for stopping control
-            resume_from: Optional path to checkpoint directory to resume from
-
-        Yields:
-            Tuples of (step, loss, status_message)
-        """
         self.is_training = True
 
         try:
-            # Validate tensor directory
             try:
                 tensor_dir = safe_path(tensor_dir)
             except ValueError:
@@ -542,7 +432,6 @@ class FullFinetuneTrainer:
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
 
-            # Create training module
             torch.manual_seed(self.training_config.seed)
             random.seed(self.training_config.seed)
             if torch.cuda.is_available():
@@ -572,13 +461,10 @@ class FullFinetuneTrainer:
                 f"Unfroze {trainable_count} trainable parameters for full fine-tuning"
             )
 
-            # Free the original dit_handler to release encoder/unused parts from VRAM.
-            # Only the decoder was registered as a submodule in PreprocessedFullFinetuneModule.
             del self.dit_handler
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Create data module
             data_module = PreprocessedDataModule(
                 tensor_dir=tensor_dir,
                 batch_size=self.training_config.batch_size,
@@ -590,7 +476,6 @@ class FullFinetuneTrainer:
                 val_split=getattr(self.training_config, "val_split", 0.0),
             )
 
-            # Setup data
             data_module.setup("fit")
 
             if len(data_module.train_dataset) == 0:
@@ -622,8 +507,6 @@ class FullFinetuneTrainer:
         training_state: Optional[Dict],
         resume_from: Optional[str] = None,
     ) -> Generator[Tuple[int, float, str], None, None]:
-        """Train using Lightning Fabric."""
-        # Create output directory
         os.makedirs(self.training_config.output_dir, exist_ok=True)
 
         device_type = self.module.device_type
@@ -632,7 +515,6 @@ class FullFinetuneTrainer:
             device_type if device_type in ("cuda", "xpu", "mps", "cpu") else "auto"
         )
 
-        # Create TensorBoard logger when available; continue without it otherwise.
         tb_logger = None
         try:
             tb_logger = TensorBoardLogger(
@@ -643,7 +525,6 @@ class FullFinetuneTrainer:
                 f"TensorBoard logger unavailable, continuing without logger: {e}"
             )
 
-        # Initialize Fabric
         fabric_kwargs = {
             "accelerator": accelerator,
             "devices": 1,
@@ -660,8 +541,6 @@ class FullFinetuneTrainer:
             f"🚀 Starting full fine-tuning (device: {device_type}, precision: {precision})...",
         )
 
-        # Keep decoder weights in a stable dtype before optimizer/Fabric setup.
-        # Only MPS requires fp32 weights for stability; CUDA/XPU stay in bf16.
         if device_type == "mps":
             self.module.decoder = self.module.decoder.to(dtype=torch.float32)
             casted_trainable, total_trainable_tensors = _ensure_trainable_params_fp32(
@@ -671,10 +550,8 @@ class FullFinetuneTrainer:
                 f"Trainable tensor dtype fixup: casted {casted_trainable}/{total_trainable_tensors} to fp32"
             )
         else:
-            # CUDA/XPU: keep in bf16 to save VRAM (1.5B params = ~3GB vs ~6GB in fp32)
             logger.info("CUDA/XPU: keeping decoder weights in bf16 for VRAM efficiency")
 
-        # Get dataloader
         train_loader = data_module.train_dataloader()
         val_loader = (
             data_module.val_dataloader()
@@ -687,15 +564,14 @@ class FullFinetuneTrainer:
             training_state["plot_loss"] = []
             training_state["plot_ema"] = []
             training_state["plot_val_steps"] = []
-            training_state["plot_val_loss"] = []
+            training_state["plot_val_loss"] =[]
             training_state["plot_best_step"] = None
         ema_loss = None
         ema_alpha = 0.1
         best_val_loss = float("inf")
         best_val_step = None
 
-        # Setup optimizer - all parameters (no LoRA filtering)
-        trainable_params = [p for p in self.module.parameters() if p.requires_grad]
+        trainable_params =[p for p in self.module.parameters() if p.requires_grad]
 
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
@@ -707,7 +583,6 @@ class FullFinetuneTrainer:
             f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters",
         )
 
-        # Calculate total steps
         steps_per_epoch = max(
             1,
             math.ceil(
@@ -717,7 +592,6 @@ class FullFinetuneTrainer:
         total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
 
-        # Optimizer selection via factory
         optimizer = build_optimizer(
             params=trainable_params,
             optimizer_type=self.training_config.optimizer_type,
@@ -727,7 +601,6 @@ class FullFinetuneTrainer:
             optimizer_kwargs=getattr(self.training_config, "optimizer_kwargs", {}),
         )
 
-        # Scheduler via factory
         scheduler = build_scheduler(
             optimizer=optimizer,
             scheduler_type=getattr(self.training_config, "scheduler_type", "cosine"),
@@ -737,7 +610,6 @@ class FullFinetuneTrainer:
             optimizer_type=self.training_config.optimizer_type,
         )
 
-        # Setup with Fabric - the full decoder
         self.module, optimizer = self.fabric.setup(self.module, optimizer)
         if device_type == "mps":
             casted_opt_params, total_opt_params = _ensure_optimizer_params_fp32(
@@ -748,7 +620,6 @@ class FullFinetuneTrainer:
             )
         train_loader = self.fabric.setup_dataloaders(train_loader)
 
-        # Handle resume from checkpoint (load AFTER Fabric setup)
         start_epoch = 0
         global_step = 0
         checkpoint_info = None
@@ -767,7 +638,6 @@ class FullFinetuneTrainer:
             try:
                 yield 0, 0.0, f"🔄 Loading checkpoint from {resume_from}..."
 
-                # Load full model checkpoint
                 checkpoint_path = os.path.join(resume_from, "model_state_dict.pt")
                 if os.path.exists(checkpoint_path):
                     model_state_dict = torch.load(
@@ -776,7 +646,7 @@ class FullFinetuneTrainer:
                         weights_only=True,
                     )
                     self.module.load_state_dict(model_state_dict)
-                    start_epoch = 0  # We don't save epoch in this simple approach
+                    start_epoch = 0
                     global_step = 0
                     yield 0, 0.0, "✅ Resumed from checkpoint"
                 else:
@@ -794,7 +664,6 @@ class FullFinetuneTrainer:
         elif resume_from:
             yield 0, 0.0, f"⚠️ Checkpoint path not found: {resume_from}, starting fresh"
 
-        # Training loop
         accumulation_step = 0
         accumulated_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
@@ -807,7 +676,6 @@ class FullFinetuneTrainer:
             epoch_start_time = time.time()
 
             for _batch_idx, batch in enumerate(train_loader):
-                # Check for stop signal
                 if training_state and training_state.get("should_stop", False):
                     yield (
                         global_step,
@@ -816,16 +684,13 @@ class FullFinetuneTrainer:
                     )
                     return
 
-                # Forward pass
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
 
-                # Backward pass
                 self.fabric.backward(loss)
                 accumulated_loss += loss.item()
                 accumulation_step += 1
 
-                # Optimizer step
                 if (
                     accumulation_step
                     >= self.training_config.gradient_accumulation_steps
@@ -860,7 +725,6 @@ class FullFinetuneTrainer:
 
                     global_step += 1
 
-                    # Log
                     avg_loss = accumulated_loss / accumulation_step
                     if global_step % self.training_config.log_every_n_steps == 0:
                         if training_state is not None:
@@ -888,8 +752,6 @@ class FullFinetuneTrainer:
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
-            # Flush remainder to avoid dropping gradients when epoch length is not
-            # divisible by gradient_accumulation_steps.
             if accumulation_step > 0:
                 nonfinite_grads, grad_tensors = _count_nonfinite_grads(trainable_params)
                 if nonfinite_grads > 0:
@@ -942,7 +804,6 @@ class FullFinetuneTrainer:
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
-            # End of epoch
             epoch_time = time.time() - epoch_start_time
             avg_epoch_loss = epoch_loss / max(num_updates, 1)
             if training_state is not None:
@@ -950,7 +811,6 @@ class FullFinetuneTrainer:
                     ema_loss = avg_epoch_loss
                 else:
                     ema_loss = ema_alpha * avg_epoch_loss + (1 - ema_alpha) * ema_loss
-                # Avoid duplicating the last step if it was already logged in the batch loop
                 plot_steps = training_state["plot_steps"]
                 if not plot_steps or plot_steps[-1] != global_step:
                     training_state["plot_steps"].append(global_step)
@@ -958,7 +818,6 @@ class FullFinetuneTrainer:
                     training_state["plot_ema"].append(ema_loss)
             self.fabric.log("train/epoch_loss", avg_epoch_loss, step=epoch + 1)
 
-            # Validation and best checkpoint (if validation set exists)
             if val_loader is not None:
                 self.module.eval()
                 total_val_loss = 0.0
@@ -988,7 +847,6 @@ class FullFinetuneTrainer:
                     self._source_model_dir,
                 )
 
-            # Save checkpoint
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(
                     self.training_config.output_dir,
@@ -1007,7 +865,6 @@ class FullFinetuneTrainer:
                     f"💾 Checkpoint saved at epoch {epoch + 1}",
                 )
 
-        # Save final model
         final_path = os.path.join(self.training_config.output_dir, "final")
         os.makedirs(final_path, exist_ok=True)
         _save_complete_model(
@@ -1037,7 +894,7 @@ class FullFinetuneTrainer:
 
         train_loader = data_module.train_dataloader()
 
-        trainable_params = [p for p in self.module.parameters() if p.requires_grad]
+        trainable_params =[p for p in self.module.parameters() if p.requires_grad]
 
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
@@ -1052,7 +909,6 @@ class FullFinetuneTrainer:
         total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
 
-        # Optimizer selection via factory
         optimizer = build_optimizer(
             params=trainable_params,
             optimizer_type=self.training_config.optimizer_type,
@@ -1062,7 +918,6 @@ class FullFinetuneTrainer:
             optimizer_kwargs=getattr(self.training_config, "optimizer_kwargs", {}),
         )
 
-        # Scheduler via factory
         scheduler = build_scheduler(
             optimizer=optimizer,
             scheduler_type=getattr(self.training_config, "scheduler_type", "cosine"),

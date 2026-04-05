@@ -42,14 +42,18 @@ try:
 except ImportError as e:
     print(f"⚠️[ACE-Step] Failed to import acestep v2 modules: {e}")
 
-# Импортируем модули полного файнтюна
 try:
     from acestep.training.configs import TrainingConfig
-    from acestep.training.full_finetune import FullFinetuneTrainer, PreprocessedFullFinetuneModule, sample_discrete_timestep
+    from acestep.training.full_finetune import FullFinetuneTrainer, PreprocessedFullFinetuneModule
     FINETUNE_AVAILABLE = True
 except ImportError as e:
     print(f"⚠️[ACE-Step] Failed to import finetune modules: {e}")
     FINETUNE_AVAILABLE = False
+
+try:
+    from acestep.training_v2.gpu_utils import detect_gpu
+except ImportError:
+    detect_gpu = None
 
 # ============================================================================
 try:
@@ -98,6 +102,9 @@ acestep.training.lora_utils.safe_path = bypass_safe_path
 
 import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
+
+import acestep.training.lora_checkpoint
+acestep.training.lora_checkpoint.safe_path = bypass_safe_path
 
 try:
     import acestep.training.full_finetune
@@ -671,7 +678,7 @@ class ACEStepLoRAResize:
             target_rank = min(target_rank, old_r)
             
             layer_name = base_key.replace("base_model.model.", "").rstrip(".")
-            if dynamic_method in ["sv_fro", "sv_ratio"]:
+            if dynamic_method in["sv_fro", "sv_ratio"]:
                 rank_pattern[layer_name] = target_rank
 
             U_r = U[:, :target_rank]
@@ -688,7 +695,7 @@ class ACEStepLoRAResize:
             del A, B, W, U, S, Vh, U_r, S_r, Vh_r, sqrt_S, new_A, new_B
 
         new_config = copy.deepcopy(config)
-        if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
+        if dynamic_method in["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
             new_config["alpha_pattern"] = rank_pattern 
             new_config["r"] = max(rank_pattern.values()) 
@@ -808,10 +815,22 @@ def custom_finetune_training_step(self, batch: dict, record_loss: bool = True) -
 
         bsz = target_latents.shape[0]
 
+        if getattr(self, "_null_cond_emb", None) is not None and getattr(self, "cfg_ratio", 0.0) > 0.0:
+            encoder_hidden_states = apply_cfg_dropout(
+                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
+            )
+
         x1 = torch.randn_like(target_latents)
         x0 = target_latents
 
-        t, _ = sample_discrete_timestep(bsz, self.timesteps_tensor)
+        # Используем continuous logit-normal семплирование
+        t, r = sample_timesteps(
+            batch_size=bsz, device=self.device, dtype=self.dtype,
+            data_proportion=getattr(self, "data_proportion", 0.5), 
+            timestep_mu=getattr(self, "timestep_mu", -0.4),
+            timestep_sigma=getattr(self, "timestep_sigma", 1.0), 
+            use_meanflow=False
+        )
         t_ = t.unsqueeze(-1).unsqueeze(-1)
         xt = t_ * x1 + (1.0 - t_) * x0
 
@@ -1063,7 +1082,7 @@ class ACEStepTrainer:
                         progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
                     )
                 else:
-                    print(f"📂 [Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
+                    print(f"📂[Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
 
             tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
@@ -1319,6 +1338,7 @@ class ACEStepFinetuneTrainer:
             "required": {
                 "dataset_config": ("ACESTEP_DATASET",),
                 "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
@@ -1432,7 +1452,7 @@ class ACEStepFinetuneTrainer:
         fig.clf()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, optimizer_config, seed, grad_ckpt, vram_cleanup, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, vram_cleanup, unique_id=None, prompt=None, extra_pnginfo=None):
         if not FINETUNE_AVAILABLE:
             raise RuntimeError("❌ Full fine-tuning modules are not available. Check your installation.")
 
@@ -1494,7 +1514,7 @@ class ACEStepFinetuneTrainer:
                 except Exception as e:
                     raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
             else:
-                print(f"📂 [Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
+                print(f"📂[Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
             # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
             reg_tensor_dir = None
@@ -1504,7 +1524,7 @@ class ACEStepFinetuneTrainer:
                 reg_tensor_dir = os.path.join(tensor_root, reg_dataset_name + "_REG")
 
                 if not self._check_and_prepare_cache(reg_source, reg_tensor_dir):
-                    print(f"🔨 [Phase 1.5] Preprocessing Regularization Data...")
+                    print(f"🔨[Phase 1.5] Preprocessing Regularization Data...")
                     is_json = reg_source.lower().endswith('.json')
                     preprocess_audio_files(
                         audio_dir=None if is_json else reg_source,
@@ -1543,12 +1563,13 @@ class ACEStepFinetuneTrainer:
                 num_workers=0 if os.name == 'nt' else 4,
                 log_every_n_steps=1,
             )
+            training_cfg.cfg_ratio = cfg_ratio
 
             print(f"🧠[Phase 2] Loading {model_variant} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_variant, device=device, precision=precision)
 
             if vram_cleanup:
-                print(f"🧹 [System] Aggressive VRAM Cleanup...")
+                print(f"🧹[System] Aggressive VRAM Cleanup...")
                 to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
                 for attr in to_kill:
                     if hasattr(model, attr):
@@ -1661,8 +1682,6 @@ class ACEStepFinetuneTrainer:
                         pbar.update(1)
                         
                         current_lr = training_cfg.learning_rate
-                        if trainer.fabric is not None and hasattr(trainer, "fabric"):
-                            pass 
                         
                         if ema_loss is None: ema_loss = loss
                         else: ema_loss = ema_alpha * loss + (1 - ema_alpha) * ema_loss
