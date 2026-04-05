@@ -40,7 +40,16 @@ try:
     from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
     from contextlib import nullcontext
 except ImportError as e:
-    print(f"⚠️[ACE-Step] Failed to import acestep modules: {e}")
+    print(f"⚠️[ACE-Step] Failed to import acestep v2 modules: {e}")
+
+# Импортируем модули полного файнтюна
+try:
+    from acestep.training.configs import TrainingConfig
+    from acestep.training.full_finetune import FullFinetuneTrainer, PreprocessedFullFinetuneModule, sample_discrete_timestep
+    FINETUNE_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️[ACE-Step] Failed to import finetune modules: {e}")
+    FINETUNE_AVAILABLE = False
 
 # ============================================================================
 try:
@@ -89,6 +98,12 @@ acestep.training.lora_utils.safe_path = bypass_safe_path
 
 import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
+
+try:
+    import acestep.training.full_finetune
+    acestep.training.full_finetune.safe_path = bypass_safe_path
+except ImportError:
+    pass
 # ============================================================================
 
 # ======================================================================
@@ -347,16 +362,12 @@ class ACEStepPreviewConfig:
                             # Умный поиск семплов в зависимости от структуры JSON
                             samples_list =[]
                             if isinstance(data, dict) and "samples" in data and isinstance(data["samples"], list):
-                                # Формат ACE-Step V2: {"metadata": {...}, "samples": [{...}, {...}]}
                                 samples_list = data["samples"]
                             elif isinstance(data, list):
-                                # Простой массив: [{...}, {...}]
                                 samples_list = data
                             elif isinstance(data, dict):
-                                # Словарь где ключи это ID: {"id1": {"audio_path": "..."}, ...}
                                 samples_list =[v for v in data.values() if isinstance(v, dict)]
                             
-                            # Извлекаем пути к файлам
                             for item in samples_list:
                                 if isinstance(item, dict):
                                     path_key = next((k for k in["audio_path", "audio", "path", "file", "filename"] if k in item), None)
@@ -382,9 +393,7 @@ class ACEStepPreviewConfig:
                 if not basenames:
                     indices_str = f"⚠️ No valid audio files found in data source:\n{clean_source}"
                 else:
-                    # В тренере файлы считываются через sorted(glob(".../*.pt"))
-                    # Эмулируем это: генерируем имена .pt файлов и сортируем по алфавиту
-                    pt_names = [os.path.splitext(b)[0] + ".pt" for b in basenames]
+                    pt_names =[os.path.splitext(b)[0] + ".pt" for b in basenames]
                     pt_names = sorted(list(set(pt_names)))
                     
                     lines =[f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
@@ -417,7 +426,6 @@ class ACEStepEstimator:
     CATEGORY = "ACE-Step/Training"
 
     def _check_and_prepare_cache(self, source_path, tensor_dir):
-        """Проверяет актуальность кеша. Если JSON/аудио новее тензоров, сносит старый кеш."""
         if not os.path.exists(tensor_dir):
             return False
 
@@ -425,15 +433,12 @@ class ACEStepEstimator:
         if not pt_files:
             return False
 
-        # Если источник не передан, просто верим кешу
         if not source_path or not os.path.exists(source_path):
             return True
 
-        # Берем дату самого старого тензора (любое изменение ПОСЛЕ генерации первого тензора = кеш инвалид)
         oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
         source_mtime = 0
 
-        # Узнаем дату изменения исходника
         if os.path.isfile(source_path):
             source_mtime = os.path.getmtime(source_path)
         elif os.path.isdir(source_path):
@@ -444,13 +449,11 @@ class ACEStepEstimator:
                         fpath = os.path.join(root, file)
                         source_mtime = max(source_mtime, os.path.getmtime(fpath))
 
-        # Если источник изменился позже, чем были созданы тензоры
         if source_mtime > oldest_tensor_time:
             print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
             for f in pt_files:
                 try: os.remove(f)
                 except: pass
-            # Удаляем манифест на всякий случай, если он остался от v1
             manifest_path = os.path.join(tensor_dir, "manifest.json")
             if os.path.exists(manifest_path):
                 try: os.remove(manifest_path)
@@ -475,7 +478,7 @@ class ACEStepEstimator:
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
             
             final_tensor_dir = os.path.join(tensor_root, dataset_name)
-            gpu_info = detect_gpu("auto", "auto")
+            gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
 
             if not self._check_and_prepare_cache(clean_source, final_tensor_dir):
                 if not clean_source:
@@ -490,8 +493,8 @@ class ACEStepEstimator:
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
                         max_duration=dataset_config["max_duration"],
-                        device=gpu_info.device,
-                        precision=gpu_info.precision,
+                        device=gpu_info.device if gpu_info else "cuda",
+                        precision=gpu_info.precision if gpu_info else "bf16",
                         progress_callback=lambda c,t,m: print(f"[PRE] {m}")
                     )
                 except Exception as e:
@@ -511,7 +514,7 @@ class ACEStepEstimator:
                 )
                 
                 top_modules_raw = [item["module"] for item in results]
-                top_modules = [m.replace("decoder.", "") for m in top_modules_raw]
+                top_modules =[m.replace("decoder.", "") for m in top_modules_raw]
                 result_str = " ".join(top_modules)
                 
                 print(f"✅ Estimation Complete. Top {top_k} modules found.")
@@ -712,10 +715,7 @@ class ACEStepLoRAResize:
 
 
 # ======================================================================
-# 7. MAIN TRAINER NODE
-# ======================================================================
-# ======================================================================
-# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ
+# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ (LoRA)
 # ======================================================================
 CURRENT_REG_WEIGHT = 1.0
 
@@ -764,14 +764,9 @@ def custom_training_step(self, batch: dict) -> torch.Tensor:
 
         flow = x1 - x0
 
-        # --- НАША КАСТОМНАЯ ЛОГИКА РЕГУЛЯРИЗАЦИИ ---
-        # Вычисляем ошибку без усреднения (reduction='none')
         unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
-        
-        # Усредняем по размерностям Sequence и Features, оставляя только размерность Batch -> [B]
         loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
 
-        # Достаем флаг is_reg из метадаты (если он есть)
         metadata = batch.get("metadata",[])
         weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
 
@@ -780,21 +775,89 @@ def custom_training_step(self, batch: dict) -> torch.Tensor:
             if meta.get("is_reg", False):
                 weights[i] = CURRENT_REG_WEIGHT
 
-        # Применяем веса регуляризации и усредняем по батчу
         diffusion_loss = (loss_per_sample * weights).mean()
         unweighted_loss = loss_per_sample.mean()
-        # ---------------------------------------------
 
     diffusion_loss = diffusion_loss.float()
     self.training_losses.append(unweighted_loss.item())
     return diffusion_loss
 
-# Подменяем функцию в классе:
 try:
     FixedLoRAModule.training_step = custom_training_step
 except NameError:
-    pass # Защита, если импорт ACE-Step не удался
+    pass 
 
+# ======================================================================
+# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ (Full Finetuning)
+# ======================================================================
+def custom_finetune_training_step(self, batch: dict, record_loss: bool = True) -> torch.Tensor:
+    global CURRENT_REG_WEIGHT
+    
+    if self.device_type in ("cuda", "xpu", "mps"):
+        autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+    else:
+        autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        nb = self.transfer_non_blocking
+        target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+
+        bsz = target_latents.shape[0]
+
+        x1 = torch.randn_like(target_latents)
+        x0 = target_latents
+
+        t, _ = sample_discrete_timestep(bsz, self.timesteps_tensor)
+        t_ = t.unsqueeze(-1).unsqueeze(-1)
+        xt = t_ * x1 + (1.0 - t_) * x0
+
+        decoder_outputs = self.decoder(
+            hidden_states=xt,
+            timestep=t,
+            timestep_r=t,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            context_latents=context_latents,
+        )
+
+        flow = x1 - x0
+
+        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
+        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+
+        metadata = batch.get("metadata",[])
+        weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
+
+        for i in range(bsz):
+            meta = metadata[i] if i < len(metadata) else {}
+            if meta.get("is_reg", False):
+                weights[i] = CURRENT_REG_WEIGHT
+
+        diffusion_loss = (loss_per_sample * weights).mean()
+        unweighted_loss = loss_per_sample.mean()
+
+    diffusion_loss = diffusion_loss.float()
+    
+    if record_loss:
+        self.training_losses.append(unweighted_loss.item())
+
+    return diffusion_loss
+
+if FINETUNE_AVAILABLE:
+    try:
+        PreprocessedFullFinetuneModule.training_step = custom_finetune_training_step
+    except NameError:
+        pass
+
+
+# ======================================================================
+# 7. MAIN TRAINER NODE (LoRA/LoKR)
+# ======================================================================
 class ACEStepTrainer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -824,7 +887,6 @@ class ACEStepTrainer:
     CATEGORY = "ACE-Step/Training"
 
     def _check_and_prepare_cache(self, source_path, tensor_dir):
-        """Проверяет актуальность кеша. Если JSON/аудио новее тензоров, сносит старый кеш."""
         if not os.path.exists(tensor_dir):
             return False
 
@@ -849,7 +911,7 @@ class ACEStepTrainer:
                         source_mtime = max(source_mtime, os.path.getmtime(fpath))
 
         if source_mtime > oldest_tensor_time:
-            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            print(f"⚠️[Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
             for f in pt_files:
                 try: os.remove(f)
                 except: pass
@@ -863,7 +925,6 @@ class ACEStepTrainer:
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
-        """Универсальная функция для отрисовки, отправки в UI и сохранения графика."""
         if saved_epochs is None:
             saved_epochs =[]
             
@@ -897,7 +958,7 @@ class ACEStepTrainer:
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
         
         lns = ln1 + ln2 + ln3
-        labs = [l.get_label() for l in lns]
+        labs =[l.get_label() for l in lns]
         ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
                   facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         
@@ -905,14 +966,12 @@ class ACEStepTrainer:
         
         canvas = FigureCanvasAgg(fig)
         
-        # Отправка в UI
         if node_id is not None:
             buf = BytesIO()
             canvas.print_png(buf)
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             PromptServer.instance.send_sync("acestep_loss_update", {"node": node_id, "image": f"data:image/png;base64,{b64}"})
             
-        # Сохранение на диск
         if output_dir is not None:
             try:
                 path = os.path.join(output_dir, "loss_graph.png")
@@ -926,7 +985,7 @@ class ACEStepTrainer:
     def train_model(self, dataset_config, model_config, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         with torch.enable_grad():
             print("\n" + "="*60)
-            print("🚀 ACE-Step Training Native Node (ComfyUI)")
+            print("🚀 ACE-Step LoRA/LoKR Training Node (ComfyUI)")
             print("="*60)
 
             clean_source = dataset_config["data_source"].strip('"')
@@ -934,13 +993,11 @@ class ACEStepTrainer:
             checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
             output_dir = dataset_config["output_dir"].strip('"')
             
-            # --- ИЗВЛЕЧЕНИЕ НАСТРОЕК РЕГУЛЯРИЗАЦИИ ---
             reg_source = dataset_config.get("reg_data_source", "").strip('"')
             reg_weight = dataset_config.get("reg_weight", 1.0)
             
             global CURRENT_REG_WEIGHT
             CURRENT_REG_WEIGHT = reg_weight
-            # -----------------------------------------
 
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
@@ -959,13 +1016,14 @@ class ACEStepTrainer:
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
             
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
-            gpu_info = detect_gpu("auto", "auto")
+            gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
+            device = gpu_info.device if gpu_info else "cuda"
+            precision = gpu_info.precision if gpu_info else "bf16"
 
-            # === [PHASE 1] PREPROCESSING MAIN DATASET ===
             if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
-                print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
+                print(f"🔨[Phase 1] Preprocessing Main Dataset...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
                     preprocess_audio_files(
@@ -975,8 +1033,8 @@ class ACEStepTrainer:
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
                         max_duration=dataset_config["max_duration"],
-                        device=gpu_info.device,
-                        precision=gpu_info.precision,
+                        device=device,
+                        precision=precision,
                         progress_callback=lambda c,t,m: print(f"[PRE-MAIN] {m}")
                     )
                 except Exception as e:
@@ -984,7 +1042,6 @@ class ACEStepTrainer:
             else:
                 print(f"📂 [Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
-            # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
             reg_tensor_dir = None
             if reg_source and os.path.exists(reg_source):
                 reg_dataset_name = os.path.splitext(os.path.basename(os.path.normpath(reg_source)))[0]
@@ -1001,8 +1058,8 @@ class ACEStepTrainer:
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
                         max_duration=dataset_config["max_duration"],
-                        device=gpu_info.device,
-                        precision=gpu_info.precision,
+                        device=device,
+                        precision=precision,
                         progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
                     )
                 else:
@@ -1055,8 +1112,8 @@ class ACEStepTrainer:
                 gradient_checkpointing=grad_ckpt, 
                 offload_encoder=offload_enc, 
                 cfg_ratio=model_config["cfg_ratio"],
-                device=gpu_info.device, 
-                precision=gpu_info.precision, 
+                device=device, 
+                precision=precision, 
                 dataset_dir=main_tensor_dir,
                 checkpoint_dir=checkpoint_dir, 
                 model_variant=model_config["model_variant"], 
@@ -1081,11 +1138,11 @@ class ACEStepTrainer:
                 preview_timesig=prev_cfg.get("prev_ts", "").strip() or None,
             )
 
-            print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {gpu_info.device} ({gpu_info.precision})...")
-            model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=gpu_info.device, precision=gpu_info.precision)
+            print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
+            model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
 
             if vram_cleanup:
-                print(f"🧹 [System] Aggressive VRAM Cleanup...")
+                print(f"🧹[System] Aggressive VRAM Cleanup...")
                 to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
                 for attr in to_kill:
                     if hasattr(model, attr):
@@ -1101,9 +1158,9 @@ class ACEStepTrainer:
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache(); torch.cuda.synchronize()
                 
-                model.decoder.to(gpu_info.device)
+                model.decoder.to(device)
                 if hasattr(model, "null_condition_emb") and model.null_condition_emb is not None:
-                    model.null_condition_emb.data = model.null_condition_emb.data.to(gpu_info.device)
+                    model.null_condition_emb.data = model.null_condition_emb.data.to(device)
 
             model.train()
 
@@ -1123,7 +1180,6 @@ class ACEStepTrainer:
                         def __init__(self, m_ds, r_ds):
                             self.m_ds = m_ds
                             self.r_ds = r_ds
-                            # размер = максимум из двух * 2
                             self.target_len = max(len(m_ds), len(r_ds))
                             
                         def __len__(self):
@@ -1145,9 +1201,7 @@ class ACEStepTrainer:
                 self_dm.val_dataset = None
 
             dm_module.PreprocessedDataModule.setup = balanced_setup
-            # =================================================================
 
-            # Считаем длину для статусбара с учетом балансировки
             actual_dataset_len = dataset_len
             if reg_tensor_dir and os.path.exists(reg_tensor_dir):
                 actual_dataset_len = max(dataset_len, len(glob.glob(os.path.join(reg_tensor_dir, "*.pt")))) * 2
@@ -1256,6 +1310,426 @@ class ACEStepTrainer:
             return (output_dir,)
 
 # ======================================================================
+# 8. FULL FINETUNE TRAINER NODE
+# ======================================================================
+class ACEStepFinetuneTrainer:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dataset_config": ("ACESTEP_DATASET",),
+                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "optimizer_config": ("ACESTEP_OPTIMIZER",),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "grad_ckpt": ("BOOLEAN", {"default": True}),
+                "vram_cleanup": ("BOOLEAN", {"default": True}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT", 
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_dir",)
+    FUNCTION = "train_finetune"
+    CATEGORY = "ACE-Step/Training"
+
+    def _check_and_prepare_cache(self, source_path, tensor_dir):
+        if not os.path.exists(tensor_dir):
+            return False
+
+        pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
+        if not pt_files:
+            return False
+
+        if not source_path or not os.path.exists(source_path):
+            return True
+
+        oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
+        source_mtime = 0
+
+        if os.path.isfile(source_path):
+            source_mtime = os.path.getmtime(source_path)
+        elif os.path.isdir(source_path):
+            source_mtime = os.path.getmtime(source_path)
+            for root, _, files in os.walk(source_path):
+                for file in files:
+                    if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
+                        fpath = os.path.join(root, file)
+                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+
+        if source_mtime > oldest_tensor_time:
+            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            for f in pt_files:
+                try: os.remove(f)
+                except: pass
+            
+            manifest_path = os.path.join(tensor_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                try: os.remove(manifest_path)
+                except: pass
+            return False
+
+        return True
+
+    def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
+        if saved_epochs is None:
+            saved_epochs =[]
+            
+        fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#2b2b2b')
+        ax.grid(True, linestyle='--', color='#444444', alpha=0.3)
+        ax.tick_params(colors='#e0e0e0', labelsize=8)
+        for spine in ax.spines.values(): spine.set_color('#444444')
+        
+        for se in saved_epochs:
+            ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
+            
+        ln1 = ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
+        ln2 = ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
+        
+        ax2 = ax.twinx()
+        ax2.tick_params(colors='#2196f3', labelsize=8)
+        for spine in ax2.spines.values(): spine.set_color('#444444')
+        ln3 = ax2.plot(epochs, lrs, color='#2196f3', linestyle=':', linewidth=1.5, alpha=0.8, label='LR')
+
+        last_loss = losses[-1] if losses else 0.0
+        last_ema = emas[-1] if emas else 0.0
+        last_lr = lrs[-1] if lrs else 0.0
+        
+        title_lines =[
+            f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
+            f"Time: {elapsed_str} (ETA: {eta_str})",
+            f"Speed: {step_time_str} | {epoch_time_str}"
+        ]
+        ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
+        
+        lns = ln1 + ln2 + ln3
+        labs = [l.get_label() for l in lns]
+        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
+                  facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
+        
+        fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
+        
+        canvas = FigureCanvasAgg(fig)
+        
+        if node_id is not None:
+            buf = BytesIO()
+            canvas.print_png(buf)
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            PromptServer.instance.send_sync("acestep_loss_update", {"node": node_id, "image": f"data:image/png;base64,{b64}"})
+            
+        if output_dir is not None:
+            try:
+                path = os.path.join(output_dir, "loss_graph.png")
+                canvas.print_png(path)
+            except Exception as e:
+                print(f"⚠️ Failed to save graph to disk: {e}")
+                
+        fig.clf()
+
+    @torch.inference_mode(False)
+    def train_finetune(self, dataset_config, model_variant, optimizer_config, seed, grad_ckpt, vram_cleanup, unique_id=None, prompt=None, extra_pnginfo=None):
+        if not FINETUNE_AVAILABLE:
+            raise RuntimeError("❌ Full fine-tuning modules are not available. Check your installation.")
+
+        global CURRENT_REG_WEIGHT
+
+        with torch.enable_grad():
+            print("\n" + "="*60)
+            print("🚀 ACE-Step Full Fine-Tuning Node (ComfyUI)")
+            print("="*60)
+
+            clean_source = dataset_config["data_source"].strip('"')
+            tensor_root = dataset_config["tensor_root"].strip('"')
+            checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
+            output_dir = dataset_config["output_dir"].strip('"')
+            
+            reg_source = dataset_config.get("reg_data_source", "").strip('"')
+            reg_weight = dataset_config.get("reg_weight", 1.0)
+            CURRENT_REG_WEIGHT = reg_weight
+
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+
+            if extra_pnginfo and "workflow" in extra_pnginfo:
+                print(f"💾 Saving workflow to {output_dir}/workflow.json")
+                try:
+                    with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
+                        json.dump(extra_pnginfo["workflow"], f, indent=2)
+                except Exception as e:
+                    print(f"⚠️ Failed to save workflow: {e}")
+
+            dataset_name = "default_dataset"
+            if clean_source:
+                dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
+                dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
+            
+            main_tensor_dir = os.path.join(tensor_root, dataset_name)
+            gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
+            device = gpu_info.device if gpu_info else "cuda"
+            precision = gpu_info.precision if gpu_info else "bf16"
+
+            # === [PHASE 1] PREPROCESSING MAIN DATASET ===
+            if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
+                if not clean_source:
+                    raise ValueError(f"❌ Tensors not found and no Data Source provided!")
+                print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
+                try:
+                    is_json = clean_source.lower().endswith('.json')
+                    preprocess_audio_files(
+                        audio_dir=None if is_json else clean_source,
+                        dataset_json=clean_source if is_json else None,
+                        output_dir=main_tensor_dir,
+                        checkpoint_dir=checkpoint_dir,
+                        variant=model_variant,
+                        max_duration=dataset_config["max_duration"],
+                        device=device,
+                        precision=precision,
+                        progress_callback=lambda c,t,m: print(f"[PRE-MAIN] {m}")
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
+            else:
+                print(f"📂 [Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
+
+            # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
+            reg_tensor_dir = None
+            if reg_source and os.path.exists(reg_source):
+                reg_dataset_name = os.path.splitext(os.path.basename(os.path.normpath(reg_source)))[0]
+                reg_dataset_name = re.sub(r'[\\/*?:"<>|]', "", reg_dataset_name).replace(" ", "_")
+                reg_tensor_dir = os.path.join(tensor_root, reg_dataset_name + "_REG")
+
+                if not self._check_and_prepare_cache(reg_source, reg_tensor_dir):
+                    print(f"🔨 [Phase 1.5] Preprocessing Regularization Data...")
+                    is_json = reg_source.lower().endswith('.json')
+                    preprocess_audio_files(
+                        audio_dir=None if is_json else reg_source,
+                        dataset_json=reg_source if is_json else None,
+                        output_dir=reg_tensor_dir,
+                        checkpoint_dir=checkpoint_dir,
+                        variant=model_variant,
+                        max_duration=dataset_config["max_duration"],
+                        device=device,
+                        precision=precision,
+                        progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
+                    )
+                else:
+                    print(f"📂 [Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
+
+            tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
+            dataset_len = len(tensor_files)
+            if dataset_len == 0:
+                raise ValueError("❌ No .pt files found! Cannot proceed.")
+
+            training_cfg = TrainingConfig(
+                learning_rate=optimizer_config["learning_rate"],
+                batch_size=dataset_config["batch_size"],
+                gradient_accumulation_steps=dataset_config["grad_accum"],
+                max_epochs=dataset_config["epochs"],
+                save_every_n_epochs=dataset_config["save_every"],
+                weight_decay=optimizer_config["weight_decay"],
+                max_grad_norm=optimizer_config["max_grad_norm"],
+                gradient_checkpointing=grad_ckpt,
+                seed=seed,
+                output_dir=output_dir,
+                optimizer_type=optimizer_config["optimizer"],
+                optimizer_kwargs=optimizer_config.get("optimizer_kwargs", {}),
+                scheduler_type=optimizer_config["scheduler"],
+                warmup_steps=optimizer_config["warmup_steps"],
+                num_workers=0 if os.name == 'nt' else 4,
+                log_every_n_steps=1,
+            )
+
+            print(f"🧠[Phase 2] Loading {model_variant} model on {device} ({precision})...")
+            model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_variant, device=device, precision=precision)
+
+            if vram_cleanup:
+                print(f"🧹 [System] Aggressive VRAM Cleanup...")
+                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                for attr in to_kill:
+                    if hasattr(model, attr):
+                        m = getattr(model, attr)
+                        if m is not None: setattr(model, attr, m.to("cpu"))
+                    if hasattr(model, "encoder") and hasattr(model.encoder, attr):
+                        m = getattr(model.encoder, attr)
+                        if m is not None: setattr(model.encoder, attr, m.to("cpu"))
+                if hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                    model.encoder.text_projector.to("cpu")
+
+                model.decoder.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available(): torch.cuda.empty_cache(); torch.cuda.synchronize()
+                
+                model.decoder.to(device)
+                if hasattr(model, "null_condition_emb") and model.null_condition_emb is not None:
+                    model.null_condition_emb.data = model.null_condition_emb.data.to(device)
+
+            model.train()
+
+            variant_dir = f"acestep-v15-{model_variant}"
+            source_model_dir = os.path.join(checkpoint_dir, variant_dir)
+            if not os.path.isdir(source_model_dir):
+                source_model_dir = os.path.join(checkpoint_dir, model_variant)
+            if not os.path.isdir(source_model_dir):
+                source_model_dir = checkpoint_dir
+
+            print("\n🔥 Starting Full Fine-Tuning Loop...")
+            trainer = FullFinetuneTrainer(
+                dit_handler=model,
+                training_config=training_cfg,
+                source_model_dir=source_model_dir,
+            )
+
+            import acestep.training.data_module as dm_module
+            original_setup = dm_module.PreprocessedDataModule.setup
+
+            def balanced_setup(self_dm, stage=None):
+                main_ds = dm_module.PreprocessedTensorDataset(main_tensor_dir)
+                if reg_tensor_dir and os.path.exists(reg_tensor_dir):
+                    reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
+                    
+                    class BalancedWrapper(torch.utils.data.Dataset):
+                        def __init__(self, m_ds, r_ds):
+                            self.m_ds = m_ds
+                            self.r_ds = r_ds
+                            self.target_len = max(len(m_ds), len(r_ds))
+                            
+                        def __len__(self):
+                            return self.target_len * 2
+                            
+                        def __getitem__(self, idx):
+                            if idx % 2 == 0:
+                                return self.m_ds[(idx // 2) % len(self.m_ds)]
+                            else:
+                                item = dict(self.r_ds[(idx // 2) % len(self.r_ds)])
+                                item["metadata"] = dict(item.get("metadata", {}))
+                                item["metadata"]["is_reg"] = True
+                                return item
+                                
+                    self_dm.train_dataset = BalancedWrapper(main_ds, reg_ds)
+                    print(f"⚖️ In-Memory Dataset Balanced: Main ({len(main_ds)}) | Reg ({len(reg_ds)}) -> Total Epoch Size: {len(self_dm.train_dataset)}")
+                else:
+                    self_dm.train_dataset = main_ds
+                self_dm.val_dataset = None
+
+            dm_module.PreprocessedDataModule.setup = balanced_setup
+
+            actual_dataset_len = dataset_len
+            if reg_tensor_dir and os.path.exists(reg_tensor_dir):
+                actual_dataset_len = max(dataset_len, len(glob.glob(os.path.join(reg_tensor_dir, "*.pt")))) * 2
+
+            eff_batch = max(1, dataset_config["batch_size"] * dataset_config["grad_accum"])
+            steps_per_epoch = max(1, actual_dataset_len // eff_batch)
+            total_steps_approx = steps_per_epoch * dataset_config["epochs"]
+
+            pbar = ProgressBar(total_steps_approx)
+            training_state = {"should_stop": False}
+            start_time = time.time()
+
+            epoch_history =[]
+            loss_history = []
+            ema_history = []
+            lr_history =[]
+            ema_loss = None
+            ema_alpha = 0.1
+            saved_epochs =[]
+            
+            elapsed_str = "00:00:00"
+            eta_str = "00:00:00"
+            step_time_str = "0s/it"
+            epoch_time_str = "0s/ep"
+
+            def fmt_time(secs):
+                m, s = divmod(int(max(0, secs)), 60)
+                h, m = divmod(m, 60)
+                return f"{h:02d}:{m:02d}:{s:02d}"
+
+            try:
+                for update in trainer.train_from_preprocessed(tensor_dir=main_tensor_dir, training_state=training_state):
+                    if mm.processing_interrupted():
+                        print("\n🛑 Training Interrupted by User via ComfyUI!")
+                        training_state["should_stop"] = True
+                        break
+
+                    step, loss, msg = update
+
+                    if "Step" in msg and "Loss:" in msg:
+                        pbar.update(1)
+                        
+                        current_lr = training_cfg.learning_rate
+                        if trainer.fabric is not None and hasattr(trainer, "fabric"):
+                            pass 
+                        
+                        if ema_loss is None: ema_loss = loss
+                        else: ema_loss = ema_alpha * loss + (1 - ema_alpha) * ema_loss
+
+                        current_epoch = step / steps_per_epoch
+                        epoch_history.append(current_epoch)
+                        loss_history.append(loss)
+                        ema_history.append(ema_loss)
+                        lr_history.append(current_lr)
+
+                        elapsed = time.time() - start_time
+                        if step > 0:
+                            time_per_step = elapsed / step
+                            remaining_steps = total_steps_approx - step
+                            eta_secs = remaining_steps * time_per_step
+                            step_time_str = f"{int(time_per_step * 1000)}ms/it" if time_per_step < 1.0 else f"{time_per_step:.2f}s/it"
+                            time_per_epoch = time_per_step * steps_per_epoch
+                            ep_m, ep_s = divmod(int(time_per_epoch), 60)
+                            ep_h, ep_m = divmod(ep_m, 60)
+                            if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
+                            elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
+                            else: epoch_time_str = f"{ep_s}s/ep"
+                        else:
+                            eta_secs = 0
+                            step_time_str = "0s/it"
+                            epoch_time_str = "0s/ep"
+                            
+                        elapsed_str = fmt_time(elapsed)
+                        eta_str = fmt_time(eta_secs)
+
+                        if step % 5 == 0 and unique_id is not None:
+                            try:
+                                node_id_str = unique_id[0] if isinstance(unique_id, list) else str(unique_id)
+                                self.process_loss_graph(
+                                    epoch_history, loss_history, ema_history, lr_history,
+                                    elapsed_str, eta_str, step_time_str, epoch_time_str,
+                                    saved_epochs, node_id=node_id_str
+                                )
+                            except Exception: pass
+
+                    if msg:
+                        if not ("Step" in msg and "Loss:" in msg):
+                            print(f"[LOG] {msg}")
+                        msg_lower = msg.lower()
+                        if "save" in msg_lower or "saving" in msg_lower or "saved" in msg_lower:
+                            if epoch_history:
+                                last_ep = epoch_history[-1]
+                                if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
+                                    saved_epochs.append(last_ep)
+
+            finally:
+                dm_module.PreprocessedDataModule.setup = original_setup
+                
+                if loss_history:
+                    print(f"📊 Saving final training graph to: {output_dir}/loss_graph.png")
+                    self.process_loss_graph(
+                        epoch_history, loss_history, ema_history, lr_history,
+                        elapsed_str, eta_str, step_time_str, epoch_time_str,
+                        saved_epochs, node_id=None, output_dir=output_dir
+                    )
+
+            elapsed = time.time() - start_time
+            print(f"\n🎉 Finished in {fmt_time(elapsed)}")
+            mm.soft_empty_cache()
+            return (output_dir,)
+
+# ======================================================================
 # REGISTRATION
 # ======================================================================
 NODE_CLASS_MAPPINGS = {
@@ -1271,6 +1745,7 @@ NODE_CLASS_MAPPINGS = {
     "ACEStepEstimator": ACEStepEstimator,
     "ACEStepLoRAResize": ACEStepLoRAResize,
     "ACEStepTrainer": ACEStepTrainer,
+    "ACEStepFinetuneTrainer": ACEStepFinetuneTrainer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1286,4 +1761,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ACEStepEstimator": "📊 ACE-Step Estimator",
     "ACEStepLoRAResize": "📉 ACE-Step LoRA Resize",
     "ACEStepTrainer": "▶️ ACE-Step Trainer",
+    "ACEStepFinetuneTrainer": "▶️ ACE-Step Full Finetune",
 }
