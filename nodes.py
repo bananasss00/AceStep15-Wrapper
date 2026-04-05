@@ -108,18 +108,30 @@ if not hasattr(mm, "_original_unload_all_models_acestep"):
 # ============================================================================
 # 1. Загрузчик основной модели
 # ============================================================================
+def get_available_acestep_models():
+    checkpoints_dir = os.path.join(ACESTEP_MODELS_DIR, "checkpoints")
+    models =["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft"] # Дефолтные
+    if os.path.exists(checkpoints_dir):
+        for d in os.listdir(checkpoints_dir):
+            if os.path.isdir(os.path.join(checkpoints_dir, d)) and d not in models:
+                models.append(d)
+    return models
+
 class AceStepModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "config_path": (["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft"], {"default": "acestep-v15-turbo"}),
+                "config_path": (get_available_acestep_models(), {"default": "acestep-v15-turbo"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "init_llm": ("BOOLEAN", {"default": True, "label_on": "Yes", "label_off": "No"}),
                 "lm_model_path": (["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-4B"], {"default": "acestep-5Hz-lm-1.7B"}),
                 "lm_backend": (["vllm", "pt", "mlx"], {"default": "vllm"}),
                 "use_flash_attention": ("BOOLEAN", {"default": True}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "custom_model_path": ("STRING", {"default": "", "placeholder": "Полный путь к папке модели (переопределяет выбор из списка выше)"}),
             }
         }
 
@@ -128,10 +140,18 @@ class AceStepModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "ACE-Step"
 
-    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, offload_to_cpu):
+    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, offload_to_cpu, custom_model_path=""):
         print(f"[ACE-Step] Инициализация. Целевая папка моделей: {ACESTEP_MODELS_DIR}")
         
         cleanup_all_acestep()
+        
+        # Если передан кастомный путь и он существует, используем его вместо выбранного из списка
+        if custom_model_path.strip():
+            if os.path.exists(custom_model_path.strip()):
+                config_path = custom_model_path.strip()
+                print(f"[ACE-Step] 📂 Используем кастомный путь к модели: {config_path}")
+            else:
+                print(f"[ACE-Step] ⚠️ Кастомный путь не найден: {custom_model_path}. Возврат к {config_path}")
         
         dit_handler = AceStepHandler()
         llm_handler = LLMHandler()
@@ -148,6 +168,9 @@ class AceStepModelLoader:
             offload_to_cpu=offload_to_cpu,
             offload_dit_to_cpu=offload_to_cpu
         )
+        
+        # Сохраняем имя (или кастомный путь) для ноды Baker (чтобы она знала, с чем мерджить)
+        dit_handler.last_init_params = {"config_path": config_path}
 
         if not enable_gen:
             raise RuntimeError(f"Ошибка инициализации DiT модели: {status}")
@@ -172,7 +195,6 @@ class AceStepModelLoader:
             if not lm_success:
                 print(f"[ACE-Step] Warning LLM: {lm_status}")
 
-        # Регистрируем хендлеры в глобальном массиве для последующей очистки
         GLOBAL_ACESTEP_HANDLERS.append((dit_handler, llm_handler if llm_handler.llm_initialized else None))
 
         return ({"dit_handler": dit_handler, "llm_handler": llm_handler if llm_handler.llm_initialized else None, "active_adapters": {}},)

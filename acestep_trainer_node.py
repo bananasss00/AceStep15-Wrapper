@@ -229,7 +229,7 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
         if os.path.exists(src_silence):
             shutil.copy2(src_silence, os.path.join(output_dir, "silence_latent.pt"))
             
-        code_files =["config.json", "configuration_acestep_v15.py"]
+        code_files =["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
         if variant == "turbo": code_files.append("modeling_acestep_v15_turbo.py")
         elif variant == "base": code_files.append("modeling_acestep_v15_base.py")
         elif variant == "sft": code_files.append("modeling_acestep_v15_sft.py")
@@ -2131,6 +2131,161 @@ class ACEStepFinetuneTrainer:
             return (output_dir,)
 
 # ======================================================================
+# 9. LORA EXTRACTOR NODE
+# ======================================================================
+class ACEStepLoRAExtractor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo)"}),
+                "finetuned_model_path": ("STRING", {"default": "", "placeholder": "Путь к папке файнтюна"}),
+                "output_path": ("STRING", {"default": "./extracted_lora"}),
+                "rank": ("INT", {"default": 32, "min": 1}),
+                "alpha": ("INT", {"default": 32, "min": 1}),
+                "target_modules": ("STRING", {"default": "q_proj k_proj v_proj o_proj", "multiline": True}),
+                "dynamic_method": (["None", "sv_ratio", "sv_fro", "safe"], {"default": "None"}),
+                "dynamic_param": ("FLOAT", {"default": 0.9, "step": 0.05}),
+                "precision": (["float32", "fp16", "bf16"], {"default": "float32"}),
+                "device": (["cuda", "cpu"], {"default": "cuda"}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_path",)
+    FUNCTION = "extract"
+    CATEGORY = "ACE-Step/Tools"
+
+    def _resolve_model_path(self, path):
+        if os.path.isfile(path): return path
+        for name in["model.safetensors", "model_state_dict.pt", "model.bin"]:
+            p = os.path.join(path, name)
+            if os.path.exists(p): return p
+        raise FileNotFoundError(f"Не найден файл модели (model.safetensors) в {path}")
+
+    def extract(self, base_model_path, finetuned_model_path, output_path, rank, alpha, target_modules, dynamic_method, dynamic_param, precision, device):
+        print(f"\n" + "="*60)
+        print(f"🧬 LoRA Extractor Started")
+        print(f"="*60)
+
+        base_file = self._resolve_model_path(base_model_path.strip('"'))
+        ft_file = self._resolve_model_path(finetuned_model_path.strip('"'))
+        out_path = output_path.strip('"')
+
+        print(f"Base: {base_file}")
+        print(f"Finetuned: {ft_file}")
+        
+        base_sd = load_file(base_file) if base_file.endswith('.safetensors') else torch.load(base_file, map_location="cpu", weights_only=True)
+        ft_sd = load_file(ft_file) if ft_file.endswith('.safetensors') else torch.load(ft_file, map_location="cpu", weights_only=True)
+
+        targets = target_modules.replace(',', ' ').split()
+        new_state_dict = {}
+        rank_pattern = {}
+        
+        save_dtype = torch.float32
+        if precision == "fp16": save_dtype = torch.float16
+        elif precision == "bf16": save_dtype = torch.bfloat16
+
+        scale_factor = rank / alpha if alpha > 0 else 1.0
+
+        # Отбираем только целевые слои, которые есть в обеих моделях и совпадают по форме (только Linear 2D)
+        valid_keys =[k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
+
+        from comfy.utils import ProgressBar
+        pbar = ProgressBar(len(valid_keys))
+
+        print(f"🚀 Extracting {len(valid_keys)} layers...")
+
+        for key in valid_keys:
+            pbar.update(1)
+            
+            W_base = base_sd[key].to(device).float()
+            W_ft = ft_sd[key].to(device).float()
+            delta_W = W_ft - W_base
+
+            # Если веса не изменились - пропускаем
+            if torch.allclose(delta_W, torch.zeros_like(delta_W), atol=1e-6):
+                continue
+
+            # M = ΔW * (r / alpha)
+            M = delta_W * scale_factor
+
+            try:
+                U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+            except Exception as e:
+                print(f"Error during SVD for {key}: {e}. Falling back to CPU.")
+                M_cpu = M.cpu()
+                U, S, Vh = torch.linalg.svd(M_cpu, full_matrices=False)
+                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+
+            target_rank = min(rank, len(S))
+            if dynamic_method == "sv_ratio":
+                threshold = S[0] * dynamic_param
+                keep_indices = torch.nonzero(S >= threshold).flatten()
+                target_rank = keep_indices[-1].item() + 1 if len(keep_indices) > 0 else 1
+            elif dynamic_method == "sv_fro":
+                S_sq = S.pow(2)
+                sum_S_sq = torch.sum(S_sq)
+                cumulative_S_sq = torch.cumsum(S_sq, dim=0)
+                threshold = dynamic_param * sum_S_sq
+                keep_indices = torch.nonzero(cumulative_S_sq >= threshold).flatten()
+                target_rank = keep_indices[0].item() + 1 if len(keep_indices) > 0 else len(S)
+
+            target_rank = min(target_rank, rank, len(S))
+
+            # Формируем имя слоя для паттерна рангов
+            layer_name = key.replace("decoder.", "").replace(".weight", "")
+            if dynamic_method in ["sv_fro", "sv_ratio"]:
+                rank_pattern[layer_name] = target_rank
+
+            U_r = U[:, :target_rank]
+            S_r = S[:target_rank]
+            Vh_r = Vh[:target_rank, :]
+            sqrt_S = torch.sqrt(S_r)
+
+            new_B = U_r @ torch.diag(sqrt_S)
+            new_A = torch.diag(sqrt_S) @ Vh_r
+
+            # Конвертируем ключи в формат PEFT, чтобы их понял генератор
+            # 'decoder.layers.0...' -> 'base_model.model.layers.0...lora_A.weight'
+            lora_base = key.replace("decoder.", "base_model.model.").replace(".weight", "")
+            lora_A_key = lora_base + ".lora_A.weight"
+            lora_B_key = lora_base + ".lora_B.weight"
+
+            new_state_dict[lora_A_key] = new_A.to(save_dtype).cpu()
+            new_state_dict[lora_B_key] = new_B.to(save_dtype).cpu()
+
+            del W_base, W_ft, delta_W, M, U, S, Vh, U_r, S_r, Vh_r, sqrt_S, new_A, new_B
+
+        os.makedirs(out_path, exist_ok=True)
+        
+        config = {
+            "r": rank,
+            "lora_alpha": alpha,
+            "lora_dropout": 0.0,
+            "target_modules": targets,
+            "bias": "none",
+            "task_type": "FEATURE_EXTRACTION"
+        }
+        
+        if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
+            config["rank_pattern"] = rank_pattern
+            config["alpha_pattern"] = rank_pattern 
+            config["r"] = max(rank_pattern.values()) if rank_pattern else rank
+            config["lora_alpha"] = config["r"]
+            avg_rank = sum(rank_pattern.values()) / len(rank_pattern) if rank_pattern else rank
+            print(f"📊 Extracted with dynamic rank. Avg Rank: {avg_rank:.2f}")
+
+        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f:
+            json.dump(config, f, indent=2)
+
+        save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
+
+        print(f"✅ Extraction complete! Saved to {out_path}")
+        mm.soft_empty_cache()
+        return (out_path,)
+    
+# ======================================================================
 # REGISTRATION
 # ======================================================================
 NODE_CLASS_MAPPINGS = {
@@ -2147,6 +2302,7 @@ NODE_CLASS_MAPPINGS = {
     "ACEStepLoRAResize": ACEStepLoRAResize,
     "ACEStepTrainer": ACEStepTrainer,
     "ACEStepFinetuneTrainer": ACEStepFinetuneTrainer,
+    "ACEStepLoRAExtractor": ACEStepLoRAExtractor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2163,4 +2319,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ACEStepLoRAResize": "📉 ACE-Step LoRA Resize",
     "ACEStepTrainer": "▶️ ACE-Step Trainer",
     "ACEStepFinetuneTrainer": "▶️ ACE-Step Full Finetune",
+    "ACEStepLoRAExtractor": "🧬 ACE-Step LoRA Extractor",
 }
