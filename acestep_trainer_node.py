@@ -1662,7 +1662,7 @@ class ACEStepFinetuneTrainer:
                 
         fig.clf()
 
-    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir):
+    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False):
         if not preview_config.get("gen_preview", False):
             return
             
@@ -1727,13 +1727,14 @@ class ACEStepFinetuneTrainer:
             
             dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
-            text_inputs = tokenizer(full_text_prompt, padding="max_length", max_length=256, truncation=True, return_tensors="pt")
-            text_hs = text_enc(text_inputs.input_ids.to(device)).last_hidden_state.to(dtype)
-            text_mask = text_inputs.attention_mask.to(device).to(dtype)
-            
-            lyric_inputs = tokenizer(full_lyrics_prompt, padding="max_length", max_length=2048, truncation=True, return_tensors="pt")
-            lyric_hs = text_enc.embed_tokens(lyric_inputs.input_ids.to(device)).to(dtype)
-            lyric_mask = lyric_inputs.attention_mask.to(device).to(dtype)
+            with torch.no_grad():
+                text_inputs = tokenizer(full_text_prompt, padding="max_length", max_length=256, truncation=True, return_tensors="pt")
+                text_hs = text_enc(text_inputs.input_ids.to(device)).last_hidden_state.to(dtype)
+                text_mask = text_inputs.attention_mask.to(device).to(dtype)
+                
+                lyric_inputs = tokenizer(full_lyrics_prompt, padding="max_length", max_length=2048, truncation=True, return_tensors="pt")
+                lyric_hs = text_enc.embed_tokens(lyric_inputs.input_ids.to(device)).to(dtype)
+                lyric_mask = lyric_inputs.attention_mask.to(device).to(dtype)
 
             unload_models(text_enc)
 
@@ -1761,26 +1762,27 @@ class ACEStepFinetuneTrainer:
             inf_steps = preview_config.get("inf_steps", 8 if is_turbo else 50)
             shift = preview_config.get("shift", 3.0 if is_turbo else 1.0)
 
-            with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=dtype):
-                outputs = model.generate_audio(
-                    text_hidden_states=text_hs,
-                    text_attention_mask=text_mask,
-                    lyric_hidden_states=lyric_hs,
-                    lyric_attention_mask=lyric_mask,
-                    refer_audio_acoustic_hidden_states_packed=refer_audio,
-                    refer_audio_order_mask=refer_mask,
-                    src_latents=src_latents,
-                    chunk_masks=chunk_masks,
-                    silence_latent=current_silence,
-                    attention_mask=attention_mask,
-                    is_covers=is_covers,
-                    infer_steps=inf_steps,
-                    diffusion_guidance_sale=7.5,
-                    shift=shift,
-                    use_cache=True,
-                    infer_method="ode",
-                    use_progress_bar=False
-                )
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=dtype):
+                    outputs = model.generate_audio(
+                        text_hidden_states=text_hs,
+                        text_attention_mask=text_mask,
+                        lyric_hidden_states=lyric_hs,
+                        lyric_attention_mask=lyric_mask,
+                        refer_audio_acoustic_hidden_states_packed=refer_audio,
+                        refer_audio_order_mask=refer_mask,
+                        src_latents=src_latents,
+                        chunk_masks=chunk_masks,
+                        silence_latent=current_silence,
+                        attention_mask=attention_mask,
+                        is_covers=is_covers,
+                        infer_steps=inf_steps,
+                        diffusion_guidance_sale=7.5,
+                        shift=shift,
+                        use_cache=True,
+                        infer_method="ode",
+                        use_progress_bar=False
+                    )
             generated_latents = outputs["target_latents"]
 
             if do_offload_dit:
@@ -1833,7 +1835,24 @@ class ACEStepFinetuneTrainer:
         finally:
             try: unload_models(vae)
             except: pass
+            
             model.to(device)
+            
+            if offload_enc or vram_cleanup:
+                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                for attr in to_kill:
+                    if hasattr(model, attr):
+                        m = getattr(model, attr)
+                        if m is not None: setattr(model, attr, m.to("cpu"))
+                    if hasattr(model, "encoder") and hasattr(model.encoder, attr):
+                        m = getattr(model.encoder, attr)
+                        if m is not None: setattr(model.encoder, attr, m.to("cpu"))
+                if hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                    model.encoder.text_projector.to("cpu")
+
+                if offload_enc and hasattr(model, "encoder") and model.encoder is not None:
+                    model.encoder.to("cpu")
+
             model.train()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -2200,7 +2219,7 @@ class ACEStepFinetuneTrainer:
                         print(f"💾 Checkpoint saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
-                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir)
+                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup)
 
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
