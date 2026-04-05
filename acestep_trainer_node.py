@@ -92,18 +92,19 @@ acestep.training.lokr_utils.safe_path = bypass_safe_path
 
 
 # ======================================================================
-# BLOCKSWAP MANAGER
+# BLOCKSWAP MANAGER (ВЫСОКОСКОРОСТНАЯ ВЕРСИЯ С PINNED MEMORY)
 # ======================================================================
 class BlockSwapManager:
     def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
         self.model = model
         self.device = device
         self.offload_device = torch.device(offload_device)
-        self.hook_handles =[]
+        self.hook_handles = []
+        self.pinned_cpu_state = {}
         self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _find_transformer_layers(self) -> nn.ModuleList:
-        search_targets =["layers", "h", "blocks", "transformer_blocks"]
+        search_targets = ["layers", "h", "blocks", "transformer_blocks"]
         root = self.model
         if hasattr(root, "base_model"):
             root = root.base_model
@@ -136,35 +137,109 @@ class BlockSwapManager:
 
         total_layers = len(layers)
         num_to_swap = int(total_layers * offload_ratio)
-        print(f"🔄 [BlockSwap] Optimization enabled. Offloading {num_to_swap}/{total_layers} layers to {self.offload_device}.")
+        if num_to_swap == 0:
+            return
 
-        for i, layer in enumerate(layers):
-            if i < num_to_swap:
-                layer.to(self.offload_device)
-            else:
-                layer.to(self.device)
+        print(f"🔄 [BlockSwap] FAST Optimization enabled. Offloading {num_to_swap}/{total_layers} layers to {self.offload_device} (Pinned Memory + Async).")
+
+        # Предварительно выделяем Pinned Memory (закрепленную память) для ускоренной передачи по PCI-E
+        for i in range(num_to_swap):
+            layer = layers[i]
+            layer_id = id(layer)
+            self.pinned_cpu_state[layer_id] = {}
+            
+            # Выгружаем слой в CPU на старте
+            layer.to("cpu")
+            
+            # Закрепляем параметры (weights)
+            for name, param in layer.named_parameters():
+                pinned_t = torch.empty_like(param.data, pin_memory=True)
+                pinned_t.copy_(param.data)
+                param.data = pinned_t
+                self.pinned_cpu_state[layer_id][name] = pinned_t
+                
+            # Закрепляем буферы
+            for name, buf in layer.named_buffers():
+                pinned_t = torch.empty_like(buf.data, pin_memory=True)
+                pinned_t.copy_(buf.data)
+                buf.data = pinned_t
+                self.pinned_cpu_state[layer_id][name] = pinned_t
+
+        def _load_to_gpu(module):
+            layer_id = id(module)
+            if layer_id not in self.pinned_cpu_state: return
+            
+            # Асинхронное чтение из Pinned Memory в VRAM
+            for name, param in module.named_parameters():
+                if param.device != self.device:
+                    param.data = param.data.to(self.device, non_blocking=True)
+                if param.grad is not None and param.grad.device != self.device:
+                    param.grad.data = param.grad.data.to(self.device, non_blocking=True)
+                    
+            for name, buf in module.named_buffers():
+                if buf.device != self.device:
+                    buf.data = buf.data.to(self.device, non_blocking=True)
+
+        def _offload_to_cpu(module, is_backward=False):
+            layer_id = id(module)
+            if layer_id not in self.pinned_cpu_state: return
+            
+            # Асинхронное чтение из VRAM в Pinned Memory
+            for name, param in module.named_parameters():
+                if param.device != self.offload_device:
+                    cpu_t = self.pinned_cpu_state[layer_id][name]
+                    cpu_t.copy_(param.data, non_blocking=True)
+                    param.data = cpu_t
+                    
+                if is_backward and param.grad is not None:
+                    grad_name = f"{name}_grad"
+                    if grad_name not in self.pinned_cpu_state[layer_id]:
+                        self.pinned_cpu_state[layer_id][grad_name] = torch.empty_like(
+                            param.grad.data, device="cpu", pin_memory=True
+                        )
+                    cpu_grad = self.pinned_cpu_state[layer_id][grad_name]
+                    cpu_grad.copy_(param.grad.data, non_blocking=True)
+                    param.grad.data = cpu_grad
+                    
+            for name, buf in module.named_buffers():
+                if buf.device != self.offload_device:
+                    cpu_t = self.pinned_cpu_state[layer_id][name]
+                    cpu_t.copy_(buf.data, non_blocking=True)
+                    buf.data = cpu_t
 
         def pre_forward_hook(module, args):
-            module.to(self.device, non_blocking=True)
+            _load_to_gpu(module)
+            if self.stream:
+                torch.cuda.current_stream().wait_stream(self.stream)
             return args
 
         def post_forward_hook(module, args, output):
-            module.to(self.offload_device, non_blocking=True)
+            if self.stream:
+                with torch.cuda.stream(self.stream):
+                    _offload_to_cpu(module, is_backward=False)
+            else:
+                _offload_to_cpu(module, is_backward=False)
             return output
 
         def pre_backward_hook(module, grad_output):
-            module.to(self.device, non_blocking=True)
+            _load_to_gpu(module)
+            if self.stream:
+                torch.cuda.current_stream().wait_stream(self.stream)
             return grad_output
 
         def post_backward_hook(module, grad_input, grad_output):
-            module.to(self.offload_device, non_blocking=True)
+            if self.stream:
+                with torch.cuda.stream(self.stream):
+                    _offload_to_cpu(module, is_backward=True)
+            else:
+                _offload_to_cpu(module, is_backward=True)
 
-        for i, layer in enumerate(layers):
-            if i < num_to_swap:
-                self.hook_handles.append(layer.register_forward_pre_hook(pre_forward_hook))
-                self.hook_handles.append(layer.register_forward_hook(post_forward_hook))
-                self.hook_handles.append(layer.register_full_backward_pre_hook(pre_backward_hook))
-                self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
+        for i in range(num_to_swap):
+            layer = layers[i]
+            self.hook_handles.append(layer.register_forward_pre_hook(pre_forward_hook))
+            self.hook_handles.append(layer.register_forward_hook(post_forward_hook))
+            self.hook_handles.append(layer.register_full_backward_pre_hook(pre_backward_hook))
+            self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
 
     def remove(self):
         for handle in self.hook_handles:
@@ -175,6 +250,8 @@ class BlockSwapManager:
         if layers:
             for layer in layers:
                 layer.to(self.device)
+                
+        self.pinned_cpu_state.clear()
         torch.cuda.empty_cache()
 
 
@@ -229,7 +306,7 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
         if os.path.exists(src_silence):
             shutil.copy2(src_silence, os.path.join(output_dir, "silence_latent.pt"))
             
-        code_files =["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
+        code_files = ["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
         if variant == "turbo": code_files.append("modeling_acestep_v15_turbo.py")
         elif variant == "base": code_files.append("modeling_acestep_v15_base.py")
         elif variant == "sft": code_files.append("modeling_acestep_v15_sft.py")
@@ -323,7 +400,7 @@ class FullFinetuneModuleV2(torch.nn.Module):
             unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
             loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
 
-            metadata = batch.get("metadata",[])
+            metadata = batch.get("metadata", [])
             weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
             for i in range(bsz):
                 meta = metadata[i] if i < len(metadata) else {}
@@ -384,7 +461,7 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
         loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
 
-        metadata = batch.get("metadata",[])
+        metadata = batch.get("metadata", [])
         weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
         for i in range(bsz):
             meta = metadata[i] if i < len(metadata) else {}
@@ -570,7 +647,7 @@ class ACEStepProdigyPlusConfig:
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Optimizers"
     def get_config(self, **kwargs):
-        opt_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k not in["scheduler", "learning_rate", "weight_decay", "warmup_steps", "max_grad_norm"]}
+        opt_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k not in ["scheduler", "learning_rate", "weight_decay", "warmup_steps", "max_grad_norm"]}
         if opt_kwargs.get("beta3", -1.0) < 0: opt_kwargs["beta3"] = None
         kwargs["optimizer"] = "prodigy_plus"
         kwargs["optimizer_kwargs"] = opt_kwargs
@@ -643,23 +720,23 @@ class ACEStepPreviewConfig:
             if not clean_source or not os.path.exists(clean_source):
                 indices_str = f"⚠️ Data source not found:\n{clean_source}\nPlease provide a valid directory or .json file in 'Dataset Config'."
             else:
-                basenames =[]
+                basenames = []
                 
                 if clean_source.lower().endswith('.json'):
                     try:
                         with open(clean_source, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                            samples_list =[]
+                            samples_list = []
                             if isinstance(data, dict) and "samples" in data and isinstance(data["samples"], list):
                                 samples_list = data["samples"]
                             elif isinstance(data, list):
                                 samples_list = data
                             elif isinstance(data, dict):
-                                samples_list =[v for v in data.values() if isinstance(v, dict)]
+                                samples_list = [v for v in data.values() if isinstance(v, dict)]
                             
                             for item in samples_list:
                                 if isinstance(item, dict):
-                                    path_key = next((k for k in["audio_path", "audio", "path", "file", "filename"] if k in item), None)
+                                    path_key = next((k for k in ["audio_path", "audio", "path", "file", "filename"] if k in item), None)
                                     if path_key and item[path_key]:
                                         basenames.append(os.path.basename(item[path_key]))
                     except Exception as e:
@@ -681,10 +758,10 @@ class ACEStepPreviewConfig:
                 if not basenames:
                     indices_str = f"⚠️ No valid audio files found in data source:\n{clean_source}"
                 else:
-                    pt_names =[os.path.splitext(b)[0] + ".pt" for b in basenames]
+                    pt_names = [os.path.splitext(b)[0] + ".pt" for b in basenames]
                     pt_names = sorted(list(set(pt_names)))
                     
-                    lines =[f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
+                    lines = [f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
                     for idx, pt in enumerate(pt_names):
                         lines.append(f"[{idx}] ➔ {pt}")
                     
@@ -802,7 +879,7 @@ class ACEStepEstimator:
                 )
                 
                 top_modules_raw = [item["module"] for item in results]
-                top_modules =[m.replace("decoder.", "") for m in top_modules_raw]
+                top_modules = [m.replace("decoder.", "") for m in top_modules_raw]
                 result_str = " ".join(top_modules)
                 
                 print(f"✅ Estimation Complete. Top {top_k} modules found.")
@@ -882,7 +959,7 @@ class ACEStepLoRAResize:
             out_path = in_path + "_resized"
         
         settings_log = f"⚙️  Settings: Method={dynamic_method}"
-        if dynamic_method in["sv_fro", "sv_ratio"]:
+        if dynamic_method in ["sv_fro", "sv_ratio"]:
             settings_log += f", Threshold/Ratio={dynamic_param}, MaxRank={new_rank}"
         else:
             settings_log += f", TargetRank={new_rank}"
@@ -959,7 +1036,7 @@ class ACEStepLoRAResize:
             target_rank = min(target_rank, old_r)
             
             layer_name = base_key.replace("base_model.model.", "").rstrip(".")
-            if dynamic_method in["sv_fro", "sv_ratio"]:
+            if dynamic_method in ["sv_fro", "sv_ratio"]:
                 rank_pattern[layer_name] = target_rank
 
             U_r = U[:, :target_rank]
@@ -976,7 +1053,7 @@ class ACEStepLoRAResize:
             del A, B, W, U, S, Vh, U_r, S_r, Vh_r, sqrt_S, new_A, new_B
 
         new_config = copy.deepcopy(config)
-        if dynamic_method in["sv_fro", "sv_ratio"] and rank_pattern:
+        if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
             new_config["alpha_pattern"] = rank_pattern 
             new_config["r"] = max(rank_pattern.values()) 
@@ -1072,7 +1149,7 @@ class ACEStepTrainer:
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
         if saved_epochs is None:
-            saved_epochs =[]
+            saved_epochs = []
             
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
@@ -1096,7 +1173,7 @@ class ACEStepTrainer:
         last_ema = emas[-1] if emas else 0.0
         last_lr = lrs[-1] if lrs else 0.0
         
-        title_lines =[
+        title_lines = [
             f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
             f"Time: {elapsed_str} (ETA: {eta_str})",
             f"Speed: {step_time_str} | {epoch_time_str}"
@@ -1104,7 +1181,7 @@ class ACEStepTrainer:
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
         
         lns = ln1 + ln2 + ln3
-        labs =[l.get_label() for l in lns]
+        labs = [l.get_label() for l in lns]
         ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
                   facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         
@@ -1289,7 +1366,7 @@ class ACEStepTrainer:
 
             if vram_cleanup:
                 print(f"🧹[System] Aggressive VRAM Cleanup...")
-                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
                 for attr in to_kill:
                     if hasattr(model, attr):
                         m = getattr(model, attr)
@@ -1361,12 +1438,12 @@ class ACEStepTrainer:
             start_time = time.time()
 
             epoch_history = []
-            loss_history =[]
+            loss_history = []
             ema_history = []
-            lr_history =[]
+            lr_history = []
             ema_loss = None
             ema_alpha = 0.1
-            saved_epochs =[]
+            saved_epochs = []
             
             elapsed_str = "00:00:00"
             eta_str = "00:00:00"
@@ -1469,8 +1546,9 @@ class ACEStepFinetuneTrainer:
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
+                "offload_enc": ("BOOLEAN", {"default": False}),
                 "vram_cleanup": ("BOOLEAN", {"default": True}),
-                "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving, slowest."}),
+                "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving, fastest possible implementation."}),
             },
             "optional": {
                 "preview_config": ("ACESTEP_PREVIEW",),
@@ -1527,7 +1605,7 @@ class ACEStepFinetuneTrainer:
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
         if saved_epochs is None:
-            saved_epochs =[]
+            saved_epochs = []
             
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
@@ -1551,7 +1629,7 @@ class ACEStepFinetuneTrainer:
         last_ema = emas[-1] if emas else 0.0
         last_lr = lrs[-1] if lrs else 0.0
         
-        title_lines =[
+        title_lines = [
             f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
             f"Time: {elapsed_str} (ETA: {eta_str})",
             f"Speed: {step_time_str} | {epoch_time_str}"
@@ -1599,7 +1677,7 @@ class ACEStepFinetuneTrainer:
             target_idx = preview_config.get("sample_idx", 0)
             
             pt_files = sorted(glob.glob(os.path.join(main_tensor_dir, "*.pt")))
-            pt_files =[f for f in pt_files if not f.endswith("manifest.json")]
+            pt_files = [f for f in pt_files if not f.endswith("manifest.json")]
             
             caption, lyrics, tag, pos = "Music", "[Instrumental]", "", "prepend"
             ds_bpm, ds_key, ds_ts = "N/A", "N/A", "N/A"
@@ -1758,7 +1836,7 @@ class ACEStepFinetuneTrainer:
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, vram_cleanup, block_swap_ratio, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1866,6 +1944,7 @@ class ACEStepFinetuneTrainer:
                 weight_decay=optimizer_config["weight_decay"],
                 max_grad_norm=optimizer_config["max_grad_norm"],
                 gradient_checkpointing=grad_ckpt,
+                offload_encoder=offload_enc,
                 seed=seed,
                 output_dir=output_dir,
                 optimizer_type=optimizer_config["optimizer"],
@@ -1883,9 +1962,9 @@ class ACEStepFinetuneTrainer:
             from acestep.training_v2.model_loader import load_decoder_for_training
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_variant, device=device, precision=precision)
 
-            if vram_cleanup:
-                print(f"🧹[System] Aggressive VRAM Cleanup...")
-                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+            if vram_cleanup or offload_enc:
+                print(f"🧹[System] Optimizing VRAM Usage (Cleanup/Offload)...")
+                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
                 for attr in to_kill:
                     if hasattr(model, attr):
                         m = getattr(model, attr)
@@ -1895,6 +1974,10 @@ class ACEStepFinetuneTrainer:
                         if m is not None: setattr(model.encoder, attr, m.to("cpu"))
                 if hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
                     model.encoder.text_projector.to("cpu")
+
+                if offload_enc and hasattr(model, "encoder") and model.encoder is not None:
+                    print(f"🧹[System] Full Encoder offload enabled. Moving to CPU.")
+                    model.encoder.to("cpu")
 
                 model.decoder.to("cpu")
                 gc.collect()
@@ -1925,7 +2008,7 @@ class ACEStepFinetuneTrainer:
             for param in module.decoder.parameters():
                 param.requires_grad = True
                 
-            trainable_params =[p for p in module.parameters() if p.requires_grad]
+            trainable_params = [p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
             import acestep.training.data_module as dm_module
@@ -1995,13 +2078,13 @@ class ACEStepFinetuneTrainer:
             pbar = ProgressBar(total_steps_approx)
             start_time = time.time()
 
-            epoch_history =[]
-            loss_history =[]
-            ema_history =[]
-            lr_history =[]
+            epoch_history = []
+            loss_history = []
+            ema_history = []
+            lr_history = []
             ema_loss = None
             ema_alpha = 0.1
-            saved_epochs =[]
+            saved_epochs = []
             
             elapsed_str = "00:00:00"
             eta_str = "00:00:00"
@@ -2158,7 +2241,7 @@ class ACEStepLoRAExtractor:
 
     def _resolve_model_path(self, path):
         if os.path.isfile(path): return path
-        for name in["model.safetensors", "model_state_dict.pt", "model.bin"]:
+        for name in ["model.safetensors", "model_state_dict.pt", "model.bin"]:
             p = os.path.join(path, name)
             if os.path.exists(p): return p
         raise FileNotFoundError(f"Не найден файл модели (model.safetensors) в {path}")
@@ -2189,7 +2272,7 @@ class ACEStepLoRAExtractor:
         scale_factor = rank / alpha if alpha > 0 else 1.0
 
         # Отбираем только целевые слои, которые есть в обеих моделях и совпадают по форме (только Linear 2D)
-        valid_keys =[k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
+        valid_keys = [k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
 
         from comfy.utils import ProgressBar
         pbar = ProgressBar(len(valid_keys))
