@@ -12,6 +12,7 @@ import copy
 import shutil
 import torch.nn.functional as F
 from io import BytesIO
+from contextlib import nullcontext
 
 # Для графиков
 import matplotlib
@@ -27,7 +28,9 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from server import PromptServer
 
-# Пытаемся импортировать библиотеку ACE-Step
+# ============================================================================
+# Импорт ACE-Step V2
+# ============================================================================
 try:
     from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
     from acestep.training_v2.trainer_fixed import FixedLoRATrainer
@@ -38,30 +41,16 @@ try:
     from acestep.training_v2.estimate import run_estimation
     from acestep.training_v2.fixed_lora_module import FixedLoRAModule
     from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
-    from contextlib import nullcontext
+    from acestep.training_v2.optim import build_optimizer, build_scheduler
 except ImportError as e:
-    print(f"⚠️[ACE-Step] Failed to import acestep v2 modules: {e}")
+    print(f"⚠️ [ACE-Step] Failed to import acestep v2 modules: {e}")
 
-try:
-    from acestep.training.configs import TrainingConfig
-    from acestep.training.full_finetune import FullFinetuneTrainer, PreprocessedFullFinetuneModule
-    FINETUNE_AVAILABLE = True
-except ImportError as e:
-    print(f"⚠️[ACE-Step] Failed to import finetune modules: {e}")
-    FINETUNE_AVAILABLE = False
-
-try:
-    from acestep.training_v2.gpu_utils import detect_gpu
-except ImportError:
-    detect_gpu = None
-
-# ============================================================================
 try:
     torch.set_float32_matmul_precision('medium')
 except:
     pass
-# ============================================================================
 
+# Патч для генерации превью
 try:
     if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
         FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
@@ -78,8 +67,8 @@ try:
         FixedLoRATrainer._generate_preview = custom_generate_preview
 except NameError:
     pass
-# ============================================================================
 
+# Path Safety Bypass
 def bypass_safe_path(user_path, base=None):
     if base is not None:
         root = os.path.normpath(os.path.abspath(base))
@@ -93,25 +82,239 @@ def bypass_safe_path(user_path, base=None):
 
 import acestep.training.path_safety
 acestep.training.path_safety.safe_path = bypass_safe_path
-
 import acestep.training.data_module
 acestep.training.data_module.safe_path = bypass_safe_path
-
 import acestep.training.lora_utils
 acestep.training.lora_utils.safe_path = bypass_safe_path
-
 import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
 
-import acestep.training.lora_checkpoint
-acestep.training.lora_checkpoint.safe_path = bypass_safe_path
+
+# ======================================================================
+# V2 FULL FINETUNE MODULE & UTILS (Self-Contained)
+# ======================================================================
+CURRENT_REG_WEIGHT = 1.0
+
+def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, variant="turbo"):
+    """Сохранение полной модели (мерджинг обученного декодера с оригинальными весами)."""
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        from safetensors.torch import load_file as st_load, save_file as st_save
+        original_path = os.path.join(source_model_dir, "model.safetensors")
+        if not os.path.exists(original_path):
+            raise FileNotFoundError(f"No model.safetensors found in {source_model_dir}")
+        
+        print(f"🔄 Слияние обученного декодера с оригинальной моделью из {source_model_dir}...")
+        original_state = st_load(original_path)
+        
+        cleaned_state = {}
+        for key, value in trained_decoder_state.items():
+            clean_key = key
+            for prefix in ("decoder.", "module.decoder.", "_forward_module."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+                    break
+            cleaned_state[clean_key] = value
+
+        merged_state = {}
+        merged_count = 0
+        for orig_key, orig_val in original_state.items():
+            match_key = orig_key
+            if match_key.startswith("decoder."):
+                match_key = match_key[len("decoder."):]
+            
+            if match_key in cleaned_state:
+                trained_tensor = cleaned_state[match_key]
+                if trained_tensor.shape == orig_val.shape:
+                    bf16_tensor = trained_tensor.to(dtype=torch.bfloat16) if trained_tensor.is_floating_point() else trained_tensor
+                    merged_state[orig_key] = bf16_tensor
+                    merged_count += 1
+                else:
+                    merged_state[orig_key] = orig_val
+            else:
+                merged_state[orig_key] = orig_val
+
+        print(f"✅ Успешно слито {merged_count} слоёв. Сохранение в {output_dir}...")
+        st_save(merged_state, os.path.join(output_dir, "model.safetensors"))
+        
+        # Копирование вспомогательных файлов
+        src_silence = os.path.join(source_model_dir, "silence_latent.pt")
+        if os.path.exists(src_silence):
+            shutil.copy2(src_silence, os.path.join(output_dir, "silence_latent.pt"))
+            
+        code_files =["config.json", "configuration_acestep_v15.py"]
+        if variant == "turbo": code_files.append("modeling_acestep_v15_turbo.py")
+        elif variant == "base": code_files.append("modeling_acestep_v15_base.py")
+        elif variant == "sft": code_files.append("modeling_acestep_v15_sft.py")
+        
+        for f in code_files:
+            src = os.path.join(source_model_dir, f)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(output_dir, f))
+                
+    except Exception as e:
+        print(f"❌ Ошибка при слиянии весов: {e}")
+        torch.save(trained_decoder_state, os.path.join(output_dir, "model_state_dict.pt"))
+
+class FullFinetuneModuleV2(torch.nn.Module):
+    """V2-совместимый модуль для Full Finetune (Continuous Timesteps + CFG Dropout)."""
+    def __init__(self, model, training_config, device, precision):
+        super().__init__()
+        self.training_config = training_config
+        self.device = device
+        self.device_type = "cuda" if "cuda" in str(device) else "cpu"
+        self.dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+        self.transfer_non_blocking = self.device_type in ("cuda", "xpu")
+        
+        self.timestep_mu = getattr(model.config, 'timestep_mu', -0.4)
+        self.timestep_sigma = getattr(model.config, 'timestep_sigma', 1.0)
+        self.data_proportion = getattr(model.config, 'data_proportion', 0.5)
+        self.cfg_ratio = getattr(training_config, "cfg_ratio", 0.15)
+        
+        if hasattr(model, "null_condition_emb"):
+            self._null_cond_emb = model.null_condition_emb
+        else:
+            self._null_cond_emb = None
+            
+        self.add_module("decoder", model.decoder)
+        self.force_input_grads_for_checkpointing = False
+
+        if getattr(training_config, "gradient_checkpointing", False):
+            try:
+                if hasattr(self.decoder, "gradient_checkpointing_enable"):
+                    self.decoder.gradient_checkpointing_enable()
+                elif hasattr(self.decoder, "gradient_checkpointing"):
+                    self.decoder.gradient_checkpointing = True
+            except: pass
+
+    def training_step(self, batch: dict) -> torch.Tensor:
+        global CURRENT_REG_WEIGHT
+        if self.device_type in ("cuda", "xpu", "mps"):
+            autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            nb = self.transfer_non_blocking
+            target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+
+            bsz = target_latents.shape[0]
+
+            # V2 CFG Dropout
+            if self._null_cond_emb is not None and self.cfg_ratio > 0.0:
+                encoder_hidden_states = apply_cfg_dropout(
+                    encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
+                )
+
+            x1 = torch.randn_like(target_latents)
+            x0 = target_latents
+
+            # V2 Continuous Timestep Sampling
+            t, r = sample_timesteps(
+                batch_size=bsz, device=self.device, dtype=self.dtype,
+                data_proportion=self.data_proportion, timestep_mu=self.timestep_mu,
+                timestep_sigma=self.timestep_sigma, use_meanflow=False
+            )
+            t_ = t.unsqueeze(-1).unsqueeze(-1)
+            xt = t_ * x1 + (1.0 - t_) * x0
+
+            if self.force_input_grads_for_checkpointing:
+                xt = xt.requires_grad_(True)
+
+            decoder_outputs = self.decoder(
+                hidden_states=xt, timestep=t, timestep_r=t,
+                attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
+            )
+
+            flow = x1 - x0
+
+            unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
+            loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+
+            metadata = batch.get("metadata",[])
+            weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
+            for i in range(bsz):
+                meta = metadata[i] if i < len(metadata) else {}
+                if meta.get("is_reg", False):
+                    weights[i] = CURRENT_REG_WEIGHT
+
+            diffusion_loss = (loss_per_sample * weights).mean()
+
+        return diffusion_loss.float()
+
+# ======================================================================
+# ЗАПЛАТКА ДЛЯ РЕГУЛЯРИЗАЦИИ В LORA (FixedLoRAModule)
+# ======================================================================
+def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
+    global CURRENT_REG_WEIGHT
+    if self.device_type in ("cuda", "xpu", "mps"):
+        autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+    else:
+        autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        nb = self.transfer_non_blocking
+        target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+        context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+
+        bsz = target_latents.shape[0]
+
+        if self._null_cond_emb is not None and self._cfg_ratio > 0.0:
+            encoder_hidden_states = apply_cfg_dropout(
+                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio
+            )
+
+        x1 = torch.randn_like(target_latents)
+        x0 = target_latents
+
+        t, r = sample_timesteps(
+            batch_size=bsz, device=self.device, dtype=self.dtype,
+            data_proportion=self._data_proportion, timestep_mu=self._timestep_mu,
+            timestep_sigma=self._timestep_sigma, use_meanflow=False
+        )
+        t_ = t.unsqueeze(-1).unsqueeze(-1)
+        xt = t_ * x1 + (1.0 - t_) * x0
+
+        if self.force_input_grads_for_checkpointing:
+            xt = xt.requires_grad_(True)
+
+        decoder_outputs = self.model.decoder(
+            hidden_states=xt, timestep=t, timestep_r=t,
+            attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
+        )
+
+        flow = x1 - x0
+
+        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
+        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+
+        metadata = batch.get("metadata",[])
+        weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
+        for i in range(bsz):
+            meta = metadata[i] if i < len(metadata) else {}
+            if meta.get("is_reg", False):
+                weights[i] = CURRENT_REG_WEIGHT
+
+        diffusion_loss = (loss_per_sample * weights).mean()
+        unweighted_loss = loss_per_sample.mean()
+
+    diffusion_loss = diffusion_loss.float()
+    self.training_losses.append(unweighted_loss.item())
+    return diffusion_loss
 
 try:
-    import acestep.training.full_finetune
-    acestep.training.full_finetune.safe_path = bypass_safe_path
-except ImportError:
-    pass
-# ============================================================================
+    FixedLoRAModule.training_step = custom_training_step_lora
+except NameError: pass 
+
 
 # ======================================================================
 # 1. DATASET CONFIG NODE
@@ -142,10 +345,7 @@ class ACEStepDatasetConfig:
     RETURN_TYPES = ("ACESTEP_DATASET",)
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
-
-    def get_config(self, **kwargs):
-        return (kwargs,)
-
+    def get_config(self, **kwargs): return (kwargs,)
 
 # ======================================================================
 # 2. MODEL & LORA CONFIG NODE
@@ -170,7 +370,6 @@ class ACEStepModelConfig:
     RETURN_TYPES = ("ACESTEP_MODEL",)
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
-
     def get_config(self, **kwargs):
         kwargs["adapter_type"] = "lora"
         return (kwargs,)
@@ -198,12 +397,11 @@ class ACEStepLoKRConfig:
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
-    RETURN_TYPES = ("ACESTEP_MODEL",) # Тот же тип, чтобы подключалось к тренеру
+    RETURN_TYPES = ("ACESTEP_MODEL",)
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
-
     def get_config(self, **kwargs):
-        kwargs["adapter_type"] = "lokr" # Указываем, что это LoKR
+        kwargs["adapter_type"] = "lokr"
         return (kwargs,)
     
 # ======================================================================
@@ -261,7 +459,6 @@ class ACEStepProdigyPlusConfig:
             "beta3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.99, "step": 0.01, "tooltip": "Set to -1.0 for Auto"}), 
             "prodigy_steps": ("INT", {"default": 0, "min": 0}),
             "schedulefree_c": ("FLOAT", {"default": 0.0, "min": 0.0}),
-            
             "weight_decay_by_lr": ("BOOLEAN", {"default": True}),
             "factored": ("BOOLEAN", {"default": True}),
             "use_stableadamw": ("BOOLEAN", {"default": True}),
@@ -360,13 +557,10 @@ class ACEStepPreviewConfig:
             else:
                 basenames =[]
                 
-                # Если передан JSON
                 if clean_source.lower().endswith('.json'):
                     try:
                         with open(clean_source, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                            
-                            # Умный поиск семплов в зависимости от структуры JSON
                             samples_list =[]
                             if isinstance(data, dict) and "samples" in data and isinstance(data["samples"], list):
                                 samples_list = data["samples"]
@@ -384,7 +578,6 @@ class ACEStepPreviewConfig:
                         indices_str = f"⚠️ Error reading JSON: {e}"
                         return (kwargs, indices_str)
                         
-                # Если передана директория с аудио
                 elif os.path.isdir(clean_source):
                     valid_exts = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus'}
                     try:
@@ -601,7 +794,7 @@ class ACEStepLoRAResize:
             out_path = in_path + "_resized"
         
         settings_log = f"⚙️  Settings: Method={dynamic_method}"
-        if dynamic_method in ["sv_fro", "sv_ratio"]:
+        if dynamic_method in["sv_fro", "sv_ratio"]:
             settings_log += f", Threshold/Ratio={dynamic_param}, MaxRank={new_rank}"
         else:
             settings_log += f", TargetRank={new_rank}"
@@ -719,159 +912,6 @@ class ACEStepLoRAResize:
         print(f"✅ Resize complete! Saved to {out_path}")
         mm.soft_empty_cache()
         return (out_path,)
-
-
-# ======================================================================
-# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ (LoRA)
-# ======================================================================
-CURRENT_REG_WEIGHT = 1.0
-
-def custom_training_step(self, batch: dict) -> torch.Tensor:
-    global CURRENT_REG_WEIGHT
-    
-    if self.device_type in ("cuda", "xpu", "mps"):
-        autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
-    else:
-        autocast_ctx = nullcontext()
-
-    with autocast_ctx:
-        nb = self.transfer_non_blocking
-        target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
-
-        bsz = target_latents.shape[0]
-
-        if self._null_cond_emb is not None and self._cfg_ratio > 0.0:
-            encoder_hidden_states = apply_cfg_dropout(
-                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio
-            )
-
-        x1 = torch.randn_like(target_latents)
-        x0 = target_latents
-
-        t, r = sample_timesteps(
-            batch_size=bsz, device=self.device, dtype=self.dtype,
-            data_proportion=self._data_proportion, timestep_mu=self._timestep_mu,
-            timestep_sigma=self._timestep_sigma, use_meanflow=False
-        )
-        t_ = t.unsqueeze(-1).unsqueeze(-1)
-        xt = t_ * x1 + (1.0 - t_) * x0
-
-        if self.force_input_grads_for_checkpointing:
-            xt = xt.requires_grad_(True)
-
-        decoder_outputs = self.model.decoder(
-            hidden_states=xt, timestep=t, timestep_r=t,
-            attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
-        )
-
-        flow = x1 - x0
-
-        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
-        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
-
-        metadata = batch.get("metadata",[])
-        weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
-
-        for i in range(bsz):
-            meta = metadata[i] if i < len(metadata) else {}
-            if meta.get("is_reg", False):
-                weights[i] = CURRENT_REG_WEIGHT
-
-        diffusion_loss = (loss_per_sample * weights).mean()
-        unweighted_loss = loss_per_sample.mean()
-
-    diffusion_loss = diffusion_loss.float()
-    self.training_losses.append(unweighted_loss.item())
-    return diffusion_loss
-
-try:
-    FixedLoRAModule.training_step = custom_training_step
-except NameError:
-    pass 
-
-# ======================================================================
-# ЗАПЛАТКА (MONKEY-PATCH) ДЛЯ ПОДДЕРЖКИ ВЕСА РЕГУЛЯРИЗАЦИИ (Full Finetuning)
-# ======================================================================
-def custom_finetune_training_step(self, batch: dict, record_loss: bool = True) -> torch.Tensor:
-    global CURRENT_REG_WEIGHT
-    
-    if self.device_type in ("cuda", "xpu", "mps"):
-        autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
-    else:
-        autocast_ctx = nullcontext()
-
-    with autocast_ctx:
-        nb = self.transfer_non_blocking
-        target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-        context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
-
-        bsz = target_latents.shape[0]
-
-        if getattr(self, "_null_cond_emb", None) is not None and getattr(self, "cfg_ratio", 0.0) > 0.0:
-            encoder_hidden_states = apply_cfg_dropout(
-                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
-            )
-
-        x1 = torch.randn_like(target_latents)
-        x0 = target_latents
-
-        # Используем continuous logit-normal семплирование
-        t, r = sample_timesteps(
-            batch_size=bsz, device=self.device, dtype=self.dtype,
-            data_proportion=getattr(self, "data_proportion", 0.5), 
-            timestep_mu=getattr(self, "timestep_mu", -0.4),
-            timestep_sigma=getattr(self, "timestep_sigma", 1.0), 
-            use_meanflow=False
-        )
-        t_ = t.unsqueeze(-1).unsqueeze(-1)
-        xt = t_ * x1 + (1.0 - t_) * x0
-
-        decoder_outputs = self.decoder(
-            hidden_states=xt,
-            timestep=t,
-            timestep_r=t,
-            attention_mask=attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            context_latents=context_latents,
-        )
-
-        flow = x1 - x0
-
-        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
-        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
-
-        metadata = batch.get("metadata",[])
-        weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
-
-        for i in range(bsz):
-            meta = metadata[i] if i < len(metadata) else {}
-            if meta.get("is_reg", False):
-                weights[i] = CURRENT_REG_WEIGHT
-
-        diffusion_loss = (loss_per_sample * weights).mean()
-        unweighted_loss = loss_per_sample.mean()
-
-    diffusion_loss = diffusion_loss.float()
-    
-    if record_loss:
-        self.training_losses.append(unweighted_loss.item())
-
-    return diffusion_loss
-
-if FINETUNE_AVAILABLE:
-    try:
-        PreprocessedFullFinetuneModule.training_step = custom_finetune_training_step
-    except NameError:
-        pass
 
 
 # ======================================================================
@@ -1059,7 +1099,7 @@ class ACEStepTrainer:
                 except Exception as e:
                     raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
             else:
-                print(f"📂 [Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
+                print(f"📂[Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
             reg_tensor_dir = None
             if reg_source and os.path.exists(reg_source):
@@ -1068,7 +1108,7 @@ class ACEStepTrainer:
                 reg_tensor_dir = os.path.join(tensor_root, reg_dataset_name + "_REG")
 
                 if not self._check_and_prepare_cache(reg_source, reg_tensor_dir):
-                    print(f"🔨 [Phase 1.5] Preprocessing Regularization Data...")
+                    print(f"🔨[Phase 1.5] Preprocessing Regularization Data...")
                     is_json = reg_source.lower().endswith('.json')
                     preprocess_audio_files(
                         audio_dir=None if is_json else reg_source,
@@ -1453,9 +1493,6 @@ class ACEStepFinetuneTrainer:
 
     @torch.inference_mode(False)
     def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, vram_cleanup, unique_id=None, prompt=None, extra_pnginfo=None):
-        if not FINETUNE_AVAILABLE:
-            raise RuntimeError("❌ Full fine-tuning modules are not available. Check your installation.")
-
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1489,17 +1526,25 @@ class ACEStepFinetuneTrainer:
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
             
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
-            gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
-            device = gpu_info.device if gpu_info else "cuda"
-            precision = gpu_info.precision if gpu_info else "bf16"
+            
+            gpu_info = None
+            try:
+                from acestep.training_v2.gpu_utils import detect_gpu
+                gpu_info = detect_gpu("auto", "auto")
+            except: pass
+            
+            device = gpu_info.device if gpu_info else ("cuda" if torch.cuda.is_available() else "cpu")
+            precision = gpu_info.precision if gpu_info else ("bf16" if "cuda" in device else "fp32")
+            torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
-            # === [PHASE 1] PREPROCESSING MAIN DATASET ===
+            # ===[PHASE 1] PREPROCESSING MAIN DATASET ===
             if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
+                    from acestep.training_v2.preprocess import preprocess_audio_files
                     preprocess_audio_files(
                         audio_dir=None if is_json else clean_source,
                         dataset_json=clean_source if is_json else None,
@@ -1538,14 +1583,16 @@ class ACEStepFinetuneTrainer:
                         progress_callback=lambda c,t,m: print(f"[PRE-REG] {m}")
                     )
                 else:
-                    print(f"📂 [Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
+                    print(f"📂[Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
 
             tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
             if dataset_len == 0:
                 raise ValueError("❌ No .pt files found! Cannot proceed.")
 
-            training_cfg = TrainingConfig(
+            # Create native TrainingConfigV2 to avoid init arg errors completely
+            from acestep.training_v2.configs import TrainingConfigV2
+            training_cfg = TrainingConfigV2(
                 learning_rate=optimizer_config["learning_rate"],
                 batch_size=dataset_config["batch_size"],
                 gradient_accumulation_steps=dataset_config["grad_accum"],
@@ -1561,11 +1608,14 @@ class ACEStepFinetuneTrainer:
                 scheduler_type=optimizer_config["scheduler"],
                 warmup_steps=optimizer_config["warmup_steps"],
                 num_workers=0 if os.name == 'nt' else 4,
-                log_every_n_steps=1,
+                cfg_ratio=cfg_ratio,
+                checkpoint_dir=checkpoint_dir,
+                model_variant=model_variant,
+                dataset_dir=main_tensor_dir
             )
-            training_cfg.cfg_ratio = cfg_ratio
 
             print(f"🧠[Phase 2] Loading {model_variant} model on {device} ({precision})...")
+            from acestep.training_v2.model_loader import load_decoder_for_training
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_variant, device=device, precision=precision)
 
             if vram_cleanup:
@@ -1599,12 +1649,16 @@ class ACEStepFinetuneTrainer:
                 source_model_dir = checkpoint_dir
 
             print("\n🔥 Starting Full Fine-Tuning Loop...")
-            trainer = FullFinetuneTrainer(
-                dit_handler=model,
-                training_config=training_cfg,
-                source_model_dir=source_model_dir,
-            )
+            
+            # Setup pure V2 Finetune Module
+            module = FullFinetuneModuleV2(model, training_cfg, device, precision)
+            for param in module.decoder.parameters():
+                param.requires_grad = True
+                
+            trainable_params = [p for p in module.parameters() if p.requires_grad]
+            print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
+            # Setup DataModule
             import acestep.training.data_module as dm_module
             original_setup = dm_module.PreprocessedDataModule.setup
 
@@ -1612,25 +1666,20 @@ class ACEStepFinetuneTrainer:
                 main_ds = dm_module.PreprocessedTensorDataset(main_tensor_dir)
                 if reg_tensor_dir and os.path.exists(reg_tensor_dir):
                     reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
-                    
                     class BalancedWrapper(torch.utils.data.Dataset):
                         def __init__(self, m_ds, r_ds):
                             self.m_ds = m_ds
                             self.r_ds = r_ds
                             self.target_len = max(len(m_ds), len(r_ds))
-                            
                         def __len__(self):
                             return self.target_len * 2
-                            
                         def __getitem__(self, idx):
-                            if idx % 2 == 0:
-                                return self.m_ds[(idx // 2) % len(self.m_ds)]
+                            if idx % 2 == 0: return self.m_ds[(idx // 2) % len(self.m_ds)]
                             else:
                                 item = dict(self.r_ds[(idx // 2) % len(self.r_ds)])
                                 item["metadata"] = dict(item.get("metadata", {}))
                                 item["metadata"]["is_reg"] = True
                                 return item
-                                
                     self_dm.train_dataset = BalancedWrapper(main_ds, reg_ds)
                     print(f"⚖️ In-Memory Dataset Balanced: Main ({len(main_ds)}) | Reg ({len(reg_ds)}) -> Total Epoch Size: {len(self_dm.train_dataset)}")
                 else:
@@ -1639,20 +1688,47 @@ class ACEStepFinetuneTrainer:
 
             dm_module.PreprocessedDataModule.setup = balanced_setup
 
+            data_module = dm_module.PreprocessedDataModule(
+                tensor_dir=main_tensor_dir,
+                batch_size=dataset_config["batch_size"],
+                num_workers=0 if os.name == 'nt' else 4
+            )
+            data_module.setup('fit')
+            train_loader = data_module.train_dataloader()
+
+            # Optimizer & Scheduler
+            from acestep.training_v2.optim import build_optimizer, build_scheduler
+            optimizer = build_optimizer(
+                params=trainable_params,
+                optimizer_type=training_cfg.optimizer_type,
+                lr=training_cfg.learning_rate,
+                weight_decay=training_cfg.weight_decay,
+                device_type=module.device_type,
+                optimizer_kwargs=training_cfg.optimizer_kwargs
+            )
+
             actual_dataset_len = dataset_len
             if reg_tensor_dir and os.path.exists(reg_tensor_dir):
                 actual_dataset_len = max(dataset_len, len(glob.glob(os.path.join(reg_tensor_dir, "*.pt")))) * 2
 
             eff_batch = max(1, dataset_config["batch_size"] * dataset_config["grad_accum"])
-            steps_per_epoch = max(1, actual_dataset_len // eff_batch)
+            steps_per_epoch = max(1, len(train_loader) // dataset_config["grad_accum"])
             total_steps_approx = steps_per_epoch * dataset_config["epochs"]
 
+            scheduler = build_scheduler(
+                optimizer=optimizer,
+                scheduler_type=training_cfg.scheduler_type,
+                total_steps=total_steps_approx,
+                warmup_steps=training_cfg.warmup_steps,
+                lr=training_cfg.learning_rate,
+                optimizer_type=training_cfg.optimizer_type
+            )
+
             pbar = ProgressBar(total_steps_approx)
-            training_state = {"should_stop": False}
             start_time = time.time()
 
             epoch_history =[]
-            loss_history = []
+            loss_history =[]
             ema_history = []
             lr_history =[]
             ema_loss = None
@@ -1669,68 +1745,97 @@ class ACEStepFinetuneTrainer:
                 h, m = divmod(m, 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
 
+            # Self-contained training loop
+            global_step = 0
+            accum_step = 0
+            accum_loss = 0.0
+            optimizer.zero_grad(set_to_none=True)
+            module.train()
+
             try:
-                for update in trainer.train_from_preprocessed(tensor_dir=main_tensor_dir, training_state=training_state):
+                for epoch in range(training_cfg.max_epochs):
+                    epoch_loss = 0.0
+                    num_updates = 0
+                    
+                    for batch in train_loader:
+                        if mm.processing_interrupted():
+                            print("\n🛑 Training Interrupted by User via ComfyUI!")
+                            break
+
+                        loss = module.training_step(batch)
+                        loss = loss / training_cfg.gradient_accumulation_steps
+                        
+                        loss.backward()
+                        accum_loss += loss.item()
+                        accum_step += 1
+
+                        if accum_step >= training_cfg.gradient_accumulation_steps:
+                            torch.nn.utils.clip_grad_norm_(trainable_params, training_cfg.max_grad_norm)
+                            optimizer.step()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            
+                            global_step += 1
+                            avg_loss = accum_loss / accum_step
+                            
+                            pbar.update(1)
+                            current_lr = scheduler.get_last_lr()[0]
+                            
+                            if ema_loss is None: ema_loss = avg_loss
+                            else: ema_loss = ema_alpha * avg_loss + (1 - ema_alpha) * ema_loss
+
+                            current_epoch = global_step / steps_per_epoch
+                            epoch_history.append(current_epoch)
+                            loss_history.append(avg_loss)
+                            ema_history.append(ema_loss)
+                            lr_history.append(current_lr)
+
+                            elapsed = time.time() - start_time
+                            if global_step > 0:
+                                time_per_step = elapsed / global_step
+                                remaining_steps = total_steps_approx - global_step
+                                eta_secs = remaining_steps * time_per_step
+                                step_time_str = f"{int(time_per_step * 1000)}ms/it" if time_per_step < 1.0 else f"{time_per_step:.2f}s/it"
+                                time_per_epoch = time_per_step * steps_per_epoch
+                                ep_m, ep_s = divmod(int(time_per_epoch), 60)
+                                ep_h, ep_m = divmod(ep_m, 60)
+                                if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
+                                elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
+                                else: epoch_time_str = f"{ep_s}s/ep"
+                            else:
+                                eta_secs = 0
+                                step_time_str = "0s/it"
+                                epoch_time_str = "0s/ep"
+                                
+                            elapsed_str = fmt_time(elapsed)
+                            eta_str = fmt_time(eta_secs)
+
+                            if global_step % 5 == 0 and unique_id is not None:
+                                try:
+                                    node_id_str = unique_id[0] if isinstance(unique_id, list) else str(unique_id)
+                                    self.process_loss_graph(
+                                        epoch_history, loss_history, ema_history, lr_history,
+                                        elapsed_str, eta_str, step_time_str, epoch_time_str,
+                                        saved_epochs, node_id=node_id_str
+                                    )
+                                except Exception: pass
+
+                            epoch_loss += avg_loss
+                            num_updates += 1
+                            accum_loss = 0.0
+                            accum_step = 0
+
                     if mm.processing_interrupted():
-                        print("\n🛑 Training Interrupted by User via ComfyUI!")
-                        training_state["should_stop"] = True
                         break
 
-                    step, loss, msg = update
-
-                    if "Step" in msg and "Loss:" in msg:
-                        pbar.update(1)
-                        
-                        current_lr = training_cfg.learning_rate
-                        
-                        if ema_loss is None: ema_loss = loss
-                        else: ema_loss = ema_alpha * loss + (1 - ema_alpha) * ema_loss
-
-                        current_epoch = step / steps_per_epoch
-                        epoch_history.append(current_epoch)
-                        loss_history.append(loss)
-                        ema_history.append(ema_loss)
-                        lr_history.append(current_lr)
-
-                        elapsed = time.time() - start_time
-                        if step > 0:
-                            time_per_step = elapsed / step
-                            remaining_steps = total_steps_approx - step
-                            eta_secs = remaining_steps * time_per_step
-                            step_time_str = f"{int(time_per_step * 1000)}ms/it" if time_per_step < 1.0 else f"{time_per_step:.2f}s/it"
-                            time_per_epoch = time_per_step * steps_per_epoch
-                            ep_m, ep_s = divmod(int(time_per_epoch), 60)
-                            ep_h, ep_m = divmod(ep_m, 60)
-                            if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
-                            elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
-                            else: epoch_time_str = f"{ep_s}s/ep"
-                        else:
-                            eta_secs = 0
-                            step_time_str = "0s/it"
-                            epoch_time_str = "0s/ep"
-                            
-                        elapsed_str = fmt_time(elapsed)
-                        eta_str = fmt_time(eta_secs)
-
-                        if step % 5 == 0 and unique_id is not None:
-                            try:
-                                node_id_str = unique_id[0] if isinstance(unique_id, list) else str(unique_id)
-                                self.process_loss_graph(
-                                    epoch_history, loss_history, ema_history, lr_history,
-                                    elapsed_str, eta_str, step_time_str, epoch_time_str,
-                                    saved_epochs, node_id=node_id_str
-                                )
-                            except Exception: pass
-
-                    if msg:
-                        if not ("Step" in msg and "Loss:" in msg):
-                            print(f"[LOG] {msg}")
-                        msg_lower = msg.lower()
-                        if "save" in msg_lower or "saving" in msg_lower or "saved" in msg_lower:
-                            if epoch_history:
-                                last_ep = epoch_history[-1]
-                                if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
-                                    saved_epochs.append(last_ep)
+                    if (epoch + 1) % training_cfg.save_every_n_epochs == 0:
+                        ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
+                        _save_complete_model(module.decoder.state_dict(), ckpt_dir, source_model_dir, model_variant)
+                        if epoch_history:
+                            last_ep = epoch_history[-1]
+                            if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
+                                saved_epochs.append(last_ep)
+                        print(f"💾 Checkpoint saved at epoch {epoch+1}")
 
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
@@ -1742,6 +1847,9 @@ class ACEStepFinetuneTrainer:
                         elapsed_str, eta_str, step_time_str, epoch_time_str,
                         saved_epochs, node_id=None, output_dir=output_dir
                     )
+                    
+                print(f"💾 Saving final model weights...")
+                _save_complete_model(module.decoder.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
 
             elapsed = time.time() - start_time
             print(f"\n🎉 Finished in {fmt_time(elapsed)}")
