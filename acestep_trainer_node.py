@@ -10,6 +10,7 @@ import torch
 import base64
 import copy
 import shutil
+import torch.nn as nn
 import torch.nn.functional as F
 from io import BytesIO
 from contextlib import nullcontext
@@ -50,7 +51,7 @@ try:
 except:
     pass
 
-# Патч для генерации превью
+# Патч для генерации превью в базовых тренерах
 try:
     if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
         FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
@@ -91,7 +92,94 @@ acestep.training.lokr_utils.safe_path = bypass_safe_path
 
 
 # ======================================================================
-# V2 FULL FINETUNE MODULE & UTILS (Self-Contained)
+# BLOCKSWAP MANAGER
+# ======================================================================
+class BlockSwapManager:
+    def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
+        self.model = model
+        self.device = device
+        self.offload_device = torch.device(offload_device)
+        self.hook_handles =[]
+        self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def _find_transformer_layers(self) -> nn.ModuleList:
+        search_targets =["layers", "h", "blocks", "transformer_blocks"]
+        root = self.model
+        if hasattr(root, "base_model"):
+            root = root.base_model
+            if hasattr(root, "model"):
+                root = root.model
+        if hasattr(root, "decoder"):
+            root = root.decoder
+
+        queue = [root]
+        visited = set()
+        while queue:
+            current = queue.pop(0)
+            if id(current) in visited:
+                continue
+            visited.add(id(current))
+            for target in search_targets:
+                if hasattr(current, target):
+                    candidate = getattr(current, target)
+                    if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
+                        return candidate
+            for name, child in current.named_children():
+                queue.append(child)
+        return None
+
+    def apply(self, offload_ratio: float = 1.0):
+        layers = self._find_transformer_layers()
+        if not layers:
+            print("⚠️ [BlockSwap] Could not find transformer layers. Skipping.")
+            return
+
+        total_layers = len(layers)
+        num_to_swap = int(total_layers * offload_ratio)
+        print(f"🔄 [BlockSwap] Optimization enabled. Offloading {num_to_swap}/{total_layers} layers to {self.offload_device}.")
+
+        for i, layer in enumerate(layers):
+            if i < num_to_swap:
+                layer.to(self.offload_device)
+            else:
+                layer.to(self.device)
+
+        def pre_forward_hook(module, args):
+            module.to(self.device, non_blocking=True)
+            return args
+
+        def post_forward_hook(module, args, output):
+            module.to(self.offload_device, non_blocking=True)
+            return output
+
+        def pre_backward_hook(module, grad_output):
+            module.to(self.device, non_blocking=True)
+            return grad_output
+
+        def post_backward_hook(module, grad_input, grad_output):
+            module.to(self.offload_device, non_blocking=True)
+
+        for i, layer in enumerate(layers):
+            if i < num_to_swap:
+                self.hook_handles.append(layer.register_forward_pre_hook(pre_forward_hook))
+                self.hook_handles.append(layer.register_forward_hook(post_forward_hook))
+                self.hook_handles.append(layer.register_full_backward_pre_hook(pre_backward_hook))
+                self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
+
+    def remove(self):
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+        
+        layers = self._find_transformer_layers()
+        if layers:
+            for layer in layers:
+                layer.to(self.device)
+        torch.cuda.empty_cache()
+
+
+# ======================================================================
+# V2 FULL FINETUNE MODULE & UTILS
 # ======================================================================
 CURRENT_REG_WEIGHT = 1.0
 
@@ -137,7 +225,6 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
         print(f"✅ Успешно слито {merged_count} слоёв. Сохранение в {output_dir}...")
         st_save(merged_state, os.path.join(output_dir, "model.safetensors"))
         
-        # Копирование вспомогательных файлов
         src_silence = os.path.join(source_model_dir, "silence_latent.pt")
         if os.path.exists(src_silence):
             shutil.copy2(src_silence, os.path.join(output_dir, "silence_latent.pt"))
@@ -370,6 +457,7 @@ class ACEStepModelConfig:
     RETURN_TYPES = ("ACESTEP_MODEL",)
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
+
     def get_config(self, **kwargs):
         kwargs["adapter_type"] = "lora"
         return (kwargs,)
@@ -913,7 +1001,6 @@ class ACEStepLoRAResize:
         mm.soft_empty_cache()
         return (out_path,)
 
-
 # ======================================================================
 # 7. MAIN TRAINER NODE (LoRA/LoKR)
 # ======================================================================
@@ -1383,6 +1470,10 @@ class ACEStepFinetuneTrainer:
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
                 "vram_cleanup": ("BOOLEAN", {"default": True}),
+                "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving, slowest."}),
+            },
+            "optional": {
+                "preview_config": ("ACESTEP_PREVIEW",),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1491,8 +1582,183 @@ class ACEStepFinetuneTrainer:
                 
         fig.clf()
 
+    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir):
+        if not preview_config.get("gen_preview", False):
+            return
+            
+        print(f"[LOG] 🎵 Generating preview (Step: {step})...")
+        do_offload_dit = preview_config.get("offload_dit_prev", False)
+        
+        try:
+            import torchaudio
+            from acestep.training_v2.model_loader import load_vae, load_text_encoder, load_silence_latent, unload_models
+            from acestep.core.generation.handler.vae_decode import VaeDecodeMixin
+            from acestep.core.generation.handler.vae_decode_chunks import VaeDecodeChunksMixin
+            from acestep.core.generation.handler.memory_utils import MemoryUtilsMixin
+            
+            target_idx = preview_config.get("sample_idx", 0)
+            
+            pt_files = sorted(glob.glob(os.path.join(main_tensor_dir, "*.pt")))
+            pt_files =[f for f in pt_files if not f.endswith("manifest.json")]
+            
+            caption, lyrics, tag, pos = "Music", "[Instrumental]", "", "prepend"
+            ds_bpm, ds_key, ds_ts = "N/A", "N/A", "N/A"
+            
+            if pt_files:
+                chosen_file = pt_files[target_idx % len(pt_files)]
+                try:
+                    sample_data = torch.load(chosen_file, map_location="cpu", weights_only=False)
+                    meta = sample_data.get("metadata", {})
+                    caption = meta.get("caption", "Music")
+                    lyrics = meta.get("lyrics", "[Instrumental]")
+                    tag = meta.get("custom_tag", "")
+                    pos = meta.get("tag_position", "prepend")
+                    ds_bpm = meta.get("bpm", "N/A")
+                    ds_key = meta.get("keyscale", "N/A")
+                    ds_ts = meta.get("timesignature", "N/A")
+                except Exception as e:
+                    print(f"⚠️ Failed to load sample {chosen_file}: {e}")
+
+            final_caption = preview_config.get("prev_caption", "").strip() or caption
+            final_lyrics = preview_config.get("prev_lyrics", "").strip() or lyrics
+            
+            if not preview_config.get("prev_caption", "").strip() and tag:
+                if pos == "prepend": test_prompt_raw = f"{tag}, {final_caption}" if final_caption else tag
+                elif pos == "append": test_prompt_raw = f"{final_caption}, {tag}" if final_caption else tag
+                elif pos == "replace": test_prompt_raw = tag
+                else: test_prompt_raw = final_caption
+            else:
+                test_prompt_raw = final_caption
+
+            final_bpm = preview_config.get("prev_bpm", "").strip() or str(ds_bpm)
+            final_key = preview_config.get("prev_key", "").strip() or str(ds_key)
+            final_ts = preview_config.get("prev_ts", "").strip() or str(ds_ts)
+
+            meta_str = f"- bpm: {final_bpm}\n- timesignature: {final_ts}\n- keyscale: {final_key}\n- duration: 30 seconds\n"
+            full_text_prompt = f"# Instruction\nFill the audio semantic mask based on the given conditions:\n\n# Caption\n{test_prompt_raw}\n\n# Metas\n{meta_str}<|endoftext|>"
+            full_lyrics_prompt = f"# Languages\nunknown\n\n# Lyric\n{final_lyrics}<|endoftext|>"
+
+            if do_offload_dit:
+                model.to("cpu")
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+            tokenizer, text_enc = load_text_encoder(checkpoint_dir, device=device, precision=precision)
+            silence_lat = load_silence_latent(checkpoint_dir, device=device, precision=precision, variant=variant)
+            
+            dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+
+            text_inputs = tokenizer(full_text_prompt, padding="max_length", max_length=256, truncation=True, return_tensors="pt")
+            text_hs = text_enc(text_inputs.input_ids.to(device)).last_hidden_state.to(dtype)
+            text_mask = text_inputs.attention_mask.to(device).to(dtype)
+            
+            lyric_inputs = tokenizer(full_lyrics_prompt, padding="max_length", max_length=2048, truncation=True, return_tensors="pt")
+            lyric_hs = text_enc.embed_tokens(lyric_inputs.input_ids.to(device)).to(dtype)
+            lyric_mask = lyric_inputs.attention_mask.to(device).to(dtype)
+
+            unload_models(text_enc)
+
+            model.to(device)
+            model.eval()
+
+            batch_size, seq_len = 1, 512
+            refer_audio = torch.zeros(batch_size, 1, 64, device=device, dtype=dtype)
+            refer_mask = torch.zeros(batch_size, device=device, dtype=torch.long)
+            
+            if silence_lat.dim() == 2: silence_lat = silence_lat.unsqueeze(0)
+            if silence_lat.shape[1] < seq_len:
+                padding = torch.zeros(batch_size, seq_len - silence_lat.shape[1], silence_lat.shape[2], device=device, dtype=dtype)
+                current_silence = torch.cat([silence_lat, padding], dim=1)
+            else:
+                current_silence = silence_lat[:, :seq_len, :]
+            
+            current_silence = current_silence.expand(batch_size, -1, -1).to(device, dtype)
+            src_latents = current_silence.clone()
+            chunk_masks = torch.ones(batch_size, seq_len, 64, device=device, dtype=dtype)
+            is_covers = torch.zeros(batch_size, device=device, dtype=torch.bool)
+            attention_mask = torch.ones(batch_size, seq_len, device=device, dtype=dtype)
+
+            is_turbo = "turbo" in variant.lower()
+            inf_steps = preview_config.get("inf_steps", 8 if is_turbo else 50)
+            shift = preview_config.get("shift", 3.0 if is_turbo else 1.0)
+
+            with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=dtype):
+                outputs = model.generate_audio(
+                    text_hidden_states=text_hs,
+                    text_attention_mask=text_mask,
+                    lyric_hidden_states=lyric_hs,
+                    lyric_attention_mask=lyric_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio,
+                    refer_audio_order_mask=refer_mask,
+                    src_latents=src_latents,
+                    chunk_masks=chunk_masks,
+                    silence_latent=current_silence,
+                    attention_mask=attention_mask,
+                    is_covers=is_covers,
+                    infer_steps=inf_steps,
+                    diffusion_guidance_sale=7.5,
+                    shift=shift,
+                    use_cache=True,
+                    infer_method="ode",
+                    use_progress_bar=False
+                )
+            generated_latents = outputs["target_latents"]
+
+            if do_offload_dit:
+                model.to("cpu")
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+            vae = load_vae(checkpoint_dir, device=device, precision=precision)
+            
+            class VaeInferenceWrapper(VaeDecodeMixin, VaeDecodeChunksMixin, MemoryUtilsMixin):
+                def __init__(self, vae_model, device_name):
+                    self.vae = vae_model
+                    self.device = device_name
+                    self.use_mlx_vae = False
+                    self.disable_tqdm = True 
+                    self.offload_to_cpu = False 
+                def _recursive_to_device(self, module, device, dtype=None):
+                    module.to(device)
+                    if dtype: module.to(dtype)
+                def _get_auto_decode_chunk_size(self):
+                    return 256 
+                def _should_offload_wav_to_cpu(self):
+                    return False
+
+            vae_wrapper = VaeInferenceWrapper(vae, str(device))
+            latents_to_decode = generated_latents.to(device).to(vae.dtype).transpose(1, 2)
+            
+            with torch.no_grad():
+                audio = vae_wrapper.tiled_decode(latents_to_decode, chunk_size=256, overlap=32)
+            
+            preview_dir = os.path.join(output_dir, "previews")
+            os.makedirs(preview_dir, exist_ok=True)
+            save_path = os.path.join(preview_dir, f"sample_epoch_{step}_idx{target_idx}.mp3")
+            
+            audio_data = audio[0].detach().cpu().float()
+            max_val = audio_data.abs().max()
+            if max_val > 0: audio_data = audio_data / max_val * 0.95
+            
+            try:
+                torchaudio.save(save_path, audio_data, 48000, format="mp3")
+                print(f"💾 Saved preview to: {save_path}")
+            except Exception as e:
+                save_path_wav = save_path.replace(".mp3", ".wav")
+                torchaudio.save(save_path_wav, audio_data, 48000)
+                print(f"💾 Saved preview to: {save_path_wav}")
+
+        except Exception as e:
+            print(f"❌ Preview generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            try: unload_models(vae)
+            except: pass
+            model.to(device)
+            model.train()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, vram_cleanup, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, vram_cleanup, block_swap_ratio, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1541,7 +1807,7 @@ class ACEStepFinetuneTrainer:
             if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
                 if not clean_source:
                     raise ValueError(f"❌ Tensors not found and no Data Source provided!")
-                print(f"🔨 [Phase 1] Preprocessing Main Dataset...")
+                print(f"🔨[Phase 1] Preprocessing Main Dataset...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
                     from acestep.training_v2.preprocess import preprocess_audio_files
@@ -1590,7 +1856,6 @@ class ACEStepFinetuneTrainer:
             if dataset_len == 0:
                 raise ValueError("❌ No .pt files found! Cannot proceed.")
 
-            # Create native TrainingConfigV2 to avoid init arg errors completely
             from acestep.training_v2.configs import TrainingConfigV2
             training_cfg = TrainingConfigV2(
                 learning_rate=optimizer_config["learning_rate"],
@@ -1650,15 +1915,19 @@ class ACEStepFinetuneTrainer:
 
             print("\n🔥 Starting Full Fine-Tuning Loop...")
             
-            # Setup pure V2 Finetune Module
+            # Внедрение BlockSwap
+            block_swap = None
+            if block_swap_ratio > 0.0:
+                block_swap = BlockSwapManager(model.decoder, device=device, offload_device="cpu")
+                block_swap.apply(offload_ratio=block_swap_ratio)
+
             module = FullFinetuneModuleV2(model, training_cfg, device, precision)
             for param in module.decoder.parameters():
                 param.requires_grad = True
                 
-            trainable_params = [p for p in module.parameters() if p.requires_grad]
+            trainable_params =[p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
-            # Setup DataModule
             import acestep.training.data_module as dm_module
             original_setup = dm_module.PreprocessedDataModule.setup
 
@@ -1696,7 +1965,6 @@ class ACEStepFinetuneTrainer:
             data_module.setup('fit')
             train_loader = data_module.train_dataloader()
 
-            # Optimizer & Scheduler
             from acestep.training_v2.optim import build_optimizer, build_scheduler
             optimizer = build_optimizer(
                 params=trainable_params,
@@ -1729,7 +1997,7 @@ class ACEStepFinetuneTrainer:
 
             epoch_history =[]
             loss_history =[]
-            ema_history = []
+            ema_history =[]
             lr_history =[]
             ema_loss = None
             ema_alpha = 0.1
@@ -1745,7 +2013,6 @@ class ACEStepFinetuneTrainer:
                 h, m = divmod(m, 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
 
-            # Self-contained training loop
             global_step = 0
             accum_step = 0
             accum_loss = 0.0
@@ -1837,9 +2104,15 @@ class ACEStepFinetuneTrainer:
                                 saved_epochs.append(last_ep)
                         print(f"💾 Checkpoint saved at epoch {epoch+1}")
 
+                        if preview_config and preview_config.get("gen_preview", False):
+                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir)
+
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
                 
+                if block_swap is not None:
+                    block_swap.remove()
+
                 if loss_history:
                     print(f"📊 Saving final training graph to: {output_dir}/loss_graph.png")
                     self.process_loss_graph(
