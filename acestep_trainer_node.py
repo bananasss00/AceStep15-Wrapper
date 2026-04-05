@@ -2131,7 +2131,16 @@ class ACEStepFinetuneTrainer:
                             avg_loss = accum_loss / accum_step
                             
                             pbar.update(1)
-                            current_lr = scheduler.get_last_lr()[0]
+                            try:
+                                from acestep.training_v2.fixed_lora_module import _get_effective_lr
+                                current_lr = _get_effective_lr(optimizer, scheduler)
+                            except ImportError:
+                                current_lr = scheduler.get_last_lr()[0]
+                                pg = optimizer.param_groups[0]
+                                if "d" in pg:
+                                    d_val = pg["d"]
+                                    if hasattr(d_val, "item"): d_val = d_val.item()
+                                    current_lr *= d_val
                             
                             if ema_loss is None: ema_loss = avg_loss
                             else: ema_loss = ema_alpha * avg_loss + (1 - ema_alpha) * ema_loss
