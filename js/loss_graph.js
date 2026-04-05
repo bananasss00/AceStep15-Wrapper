@@ -5,7 +5,7 @@ app.registerExtension({
     name: "ACEStep.LossGraph",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         // Заметьте, мы теперь цепляемся к новой главной ноде ACEStepTrainer!
-        if (nodeData.name === "ACEStepTrainer") {
+        if (nodeData.name === "ACEStepTrainer" || nodeData.name === "ACEStepFinetuneTrainer") {
             
             const originalComputeSize = nodeType.prototype.computeSize;
             nodeType.prototype.computeSize = function(out) {

@@ -2085,7 +2085,8 @@ class ACEStepFinetuneTrainer:
                                         elapsed_str, eta_str, step_time_str, epoch_time_str,
                                         saved_epochs, node_id=node_id_str
                                     )
-                                except Exception: pass
+                                except Exception as e:
+                                    print(f"⚠️ Ошибка отрисовки графика: {e}")
 
                             epoch_loss += avg_loss
                             num_updates += 1
