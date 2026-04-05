@@ -785,18 +785,29 @@ class FixedLoRATrainer:
             return
 
         # -- Final save -----------------------------------------------------
-        final_path = str(output_dir / "final")
-        self._save_final(final_path)
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
-
         adapter_label = "LoKR" if self.adapter_type == "lokr" else "LoRA"
         tb.flush()
         tb.close()
-        yield TrainingUpdate(
-            step=global_step, loss=final_loss,
-            msg=(
-                f"[OK] Training complete! {adapter_label} saved to {final_path}\n"
-                f"     For inference, set your LoRA path to: {final_path}"
-            ),
-            kind="complete",
-        )
+
+        if getattr(cfg, "save_final_model", True):
+            final_path = str(output_dir / "final")
+            self._save_final(final_path)
+            yield TrainingUpdate(
+                step=global_step, loss=final_loss,
+                msg=(
+                    f"[OK] Training complete! {adapter_label} saved to {final_path}\n"
+                    f"     For inference, set your LoRA path to: {final_path}"
+                ),
+                kind="complete",
+            )
+        else:
+            yield TrainingUpdate(
+                    step=global_step, loss=final_loss,
+                    msg=(
+                        f"[OK] Training complete! Final save skipped.\n"
+                        f"     Use the latest checkpoint from 'checkpoints' folder."
+                    ),
+                    kind="complete",
+                )
+

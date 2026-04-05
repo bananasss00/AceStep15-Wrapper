@@ -500,6 +500,7 @@ class ACEStepDatasetConfig:
                 "save_every": ("INT", {"default": 10, "min": 0}),
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
+                "save_final": ("BOOLEAN", {"default": False, "tooltip": "Сохранить итоговую модель/лору в папку final в конце обучения"}),
             },
             "optional": {
                 "reg_data_source": ("STRING", {"default": "", "tooltip": "Path to regularization audio/json"}),
@@ -1360,6 +1361,7 @@ class ACEStepTrainer:
                 preview_keyscale=prev_cfg.get("prev_key", "").strip() or None,
                 preview_timesig=prev_cfg.get("prev_ts", "").strip() or None,
             )
+            train_cfg.save_final_model = dataset_config.get("save_final", False)
 
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
@@ -2205,8 +2207,11 @@ class ACEStepFinetuneTrainer:
                         saved_epochs, node_id=None, output_dir=output_dir
                     )
                     
-                print(f"💾 Saving final model weights...")
-                _save_complete_model(module.decoder.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
+                if dataset_config.get("save_final", True):
+                    print(f"💾 Saving final model weights...")
+                    _save_complete_model(module.decoder.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
+                else:
+                    print(f"⏭️ Skipping final save as requested.")
 
             elapsed = time.time() - start_time
             print(f"\n🎉 Finished in {fmt_time(elapsed)}")
