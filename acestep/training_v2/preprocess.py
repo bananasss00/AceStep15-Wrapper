@@ -272,17 +272,22 @@ def _pass2_heavy(
                 final_path = out_path / base_name
                 meta = data["metadata"]
                 
+                t_hs = data.get("text_hidden_states", torch.zeros(1))
+                t_mask = data.get("text_attention_mask", torch.zeros(1))
+                l_hs = data.get("lyric_hidden_states", torch.zeros(1))
+                l_mask = data.get("lyric_attention_mask", torch.zeros(1))
+
                 torch.save({
                     "target_latents": data["target_latents"],
                     "attention_mask": data["attention_mask"],
                     "encoder_hidden_states": encoder_hs.squeeze(0).cpu(),
                     "encoder_attention_mask": encoder_mask.squeeze(0).cpu(),
                     "context_latents": context_latents.squeeze(0).cpu(),
-                    # СОХРАНЯЕМ В ФИНАЛЬНЫЙ PT ФАЙЛ СЫРЫЕ ТЕКСТОВЫЕ ЭМБЕДДИНГИ ДЛЯ FULL E2E FINETUNING
-                    "text_hidden_states": data.get("text_hidden_states", torch.zeros(1)).cpu(),
-                    "text_attention_mask": data.get("text_attention_mask", torch.zeros(1)).cpu(),
-                    "lyric_hidden_states": data.get("lyric_hidden_states", torch.zeros(1)).cpu(),
-                    "lyric_attention_mask": data.get("lyric_attention_mask", torch.zeros(1)).cpu(),
+                    # СОХРАНЯЕМ В ФИНАЛЬНЫЙ PT ФАЙЛ СЫРЫЕ ТЕКСТОВЫЕ ЭМБЕДДИНГИ ДЛЯ FULL E2E FINETUNING (УДАЛЯЯ БАТЧ)
+                    "text_hidden_states": t_hs.squeeze(0).cpu() if t_hs.dim() == 3 else t_hs.cpu(),
+                    "text_attention_mask": t_mask.squeeze(0).cpu() if t_mask.dim() == 2 else t_mask.cpu(),
+                    "lyric_hidden_states": l_hs.squeeze(0).cpu() if l_hs.dim() == 3 else l_hs.cpu(),
+                    "lyric_attention_mask": l_mask.squeeze(0).cpu() if l_mask.dim() == 2 else l_mask.cpu(),
                     "metadata": meta,
                 }, final_path)
 

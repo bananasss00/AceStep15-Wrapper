@@ -74,17 +74,29 @@ class PreprocessedTensorDataset(Dataset):
         tensor_path = self.valid_paths[idx]
         data = torch.load(tensor_path, map_location='cpu', weights_only=True)
         
+        # ДИНАМИЧЕСКИЙ ФИКС ЛИШНИХ ИЗМЕРЕНИЙ ДЛЯ СТАРЫХ ДАТАСЕТОВ
+        t_hs = data.get("text_hidden_states", torch.zeros(1))
+        if t_hs.dim() == 3: t_hs = t_hs.squeeze(0)
+            
+        t_mask = data.get("text_attention_mask", torch.zeros(1))
+        if t_mask.dim() == 2: t_mask = t_mask.squeeze(0)
+            
+        l_hs = data.get("lyric_hidden_states", torch.zeros(1))
+        if l_hs.dim() == 3: l_hs = l_hs.squeeze(0)
+            
+        l_mask = data.get("lyric_attention_mask", torch.zeros(1))
+        if l_mask.dim() == 2: l_mask = l_mask.squeeze(0)
+
         return {
             "target_latents": data["target_latents"],
             "attention_mask": data["attention_mask"],
             "encoder_hidden_states": data["encoder_hidden_states"],
             "encoder_attention_mask": data["encoder_attention_mask"],
             "context_latents": data["context_latents"],
-            # Добавлено для полного обучения энкодеров:
-            "text_hidden_states": data.get("text_hidden_states", torch.zeros(1)),
-            "text_attention_mask": data.get("text_attention_mask", torch.zeros(1)),
-            "lyric_hidden_states": data.get("lyric_hidden_states", torch.zeros(1)),
-            "lyric_attention_mask": data.get("lyric_attention_mask", torch.zeros(1)),
+            "text_hidden_states": t_hs,
+            "text_attention_mask": t_mask,
+            "lyric_hidden_states": l_hs,
+            "lyric_attention_mask": l_mask,
             "metadata": data.get("metadata", {}),
         }
 
@@ -137,7 +149,7 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "metadata": [s["metadata"] for s in batch],
     }
 
-    # Логика паддинга для E2E обучения энкодеров
+    # ПАДДИНГ ТЕКСТОВ И ЛИРИКИ ДЛЯ ОБУЧЕНИЯ ЭНКОДЕРОВ
     if "text_hidden_states" in batch[0] and batch[0]["text_hidden_states"].dim() > 1:
         max_text_len = max(s["text_hidden_states"].shape[0] for s in batch)
         max_lyric_len = max(s["lyric_hidden_states"].shape[0] for s in batch)
@@ -175,7 +187,6 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     return result
 
-
 class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else object):
     def __init__(
         self,
@@ -188,8 +199,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         pin_memory_device: str = "",
         val_split: float = 0.0,
     ):
-        if LIGHTNING_AVAILABLE:
-            super().__init__()
+        if LIGHTNING_AVAILABLE: super().__init__()
         
         self.tensor_dir = tensor_dir
         self.batch_size = batch_size
