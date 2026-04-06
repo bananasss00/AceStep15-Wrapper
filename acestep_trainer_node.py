@@ -21,7 +21,6 @@ matplotlib.use("Agg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-# Для SVD Resize
 from safetensors.torch import load_file, save_file
 
 import folder_paths
@@ -29,9 +28,6 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 from server import PromptServer
 
-# ============================================================================
-# Импорт ACE-Step V2
-# ============================================================================
 try:
     from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
     from acestep.training_v2.trainer_fixed import FixedLoRATrainer
@@ -51,7 +47,6 @@ try:
 except:
     pass
 
-# Патч для генерации превью в базовых тренерах
 try:
     if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
         FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
@@ -69,7 +64,6 @@ try:
 except NameError:
     pass
 
-# Path Safety Bypass
 def bypass_safe_path(user_path, base=None):
     if base is not None:
         root = os.path.normpath(os.path.abspath(base))
@@ -92,7 +86,7 @@ acestep.training.lokr_utils.safe_path = bypass_safe_path
 
 
 # ======================================================================
-# BLOCKSWAP MANAGER (ВЫСОКОСКОРОСТНАЯ ВЕРСИЯ С PINNED MEMORY)
+# BLOCKSWAP MANAGER
 # ======================================================================
 class BlockSwapManager:
     def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
@@ -142,23 +136,18 @@ class BlockSwapManager:
 
         print(f"🔄 [BlockSwap] FAST Optimization enabled. Offloading {num_to_swap}/{total_layers} layers to {self.offload_device} (Pinned Memory + Async).")
 
-        # Предварительно выделяем Pinned Memory (закрепленную память) для ускоренной передачи по PCI-E
         for i in range(num_to_swap):
             layer = layers[i]
             layer_id = id(layer)
             self.pinned_cpu_state[layer_id] = {}
             
-            # Выгружаем слой в CPU на старте
             layer.to("cpu")
-            
-            # Закрепляем параметры (weights)
             for name, param in layer.named_parameters():
                 pinned_t = torch.empty_like(param.data, pin_memory=True)
                 pinned_t.copy_(param.data)
                 param.data = pinned_t
                 self.pinned_cpu_state[layer_id][name] = pinned_t
                 
-            # Закрепляем буферы
             for name, buf in layer.named_buffers():
                 pinned_t = torch.empty_like(buf.data, pin_memory=True)
                 pinned_t.copy_(buf.data)
@@ -168,14 +157,11 @@ class BlockSwapManager:
         def _load_to_gpu(module):
             layer_id = id(module)
             if layer_id not in self.pinned_cpu_state: return
-            
-            # Асинхронное чтение из Pinned Memory в VRAM
             for name, param in module.named_parameters():
                 if param.device != self.device:
                     param.data = param.data.to(self.device, non_blocking=True)
                 if param.grad is not None and param.grad.device != self.device:
                     param.grad.data = param.grad.data.to(self.device, non_blocking=True)
-                    
             for name, buf in module.named_buffers():
                 if buf.device != self.device:
                     buf.data = buf.data.to(self.device, non_blocking=True)
@@ -183,14 +169,11 @@ class BlockSwapManager:
         def _offload_to_cpu(module, is_backward=False):
             layer_id = id(module)
             if layer_id not in self.pinned_cpu_state: return
-            
-            # Асинхронное чтение из VRAM в Pinned Memory
             for name, param in module.named_parameters():
                 if param.device != self.offload_device:
                     cpu_t = self.pinned_cpu_state[layer_id][name]
                     cpu_t.copy_(param.data, non_blocking=True)
                     param.data = cpu_t
-                    
                 if is_backward and param.grad is not None:
                     grad_name = f"{name}_grad"
                     if grad_name not in self.pinned_cpu_state[layer_id]:
@@ -200,7 +183,6 @@ class BlockSwapManager:
                     cpu_grad = self.pinned_cpu_state[layer_id][grad_name]
                     cpu_grad.copy_(param.grad.data, non_blocking=True)
                     param.grad.data = cpu_grad
-                    
             for name, buf in module.named_buffers():
                 if buf.device != self.offload_device:
                     cpu_t = self.pinned_cpu_state[layer_id][name]
@@ -209,30 +191,24 @@ class BlockSwapManager:
 
         def pre_forward_hook(module, args):
             _load_to_gpu(module)
-            if self.stream:
-                torch.cuda.current_stream().wait_stream(self.stream)
+            if self.stream: torch.cuda.current_stream().wait_stream(self.stream)
             return args
 
         def post_forward_hook(module, args, output):
             if self.stream:
-                with torch.cuda.stream(self.stream):
-                    _offload_to_cpu(module, is_backward=False)
-            else:
-                _offload_to_cpu(module, is_backward=False)
+                with torch.cuda.stream(self.stream): _offload_to_cpu(module, is_backward=False)
+            else: _offload_to_cpu(module, is_backward=False)
             return output
 
         def pre_backward_hook(module, grad_output):
             _load_to_gpu(module)
-            if self.stream:
-                torch.cuda.current_stream().wait_stream(self.stream)
+            if self.stream: torch.cuda.current_stream().wait_stream(self.stream)
             return grad_output
 
         def post_backward_hook(module, grad_input, grad_output):
             if self.stream:
-                with torch.cuda.stream(self.stream):
-                    _offload_to_cpu(module, is_backward=True)
-            else:
-                _offload_to_cpu(module, is_backward=True)
+                with torch.cuda.stream(self.stream): _offload_to_cpu(module, is_backward=True)
+            else: _offload_to_cpu(module, is_backward=True)
 
         for i in range(num_to_swap):
             layer = layers[i]
@@ -242,15 +218,11 @@ class BlockSwapManager:
             self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
 
     def remove(self):
-        for handle in self.hook_handles:
-            handle.remove()
+        for handle in self.hook_handles: handle.remove()
         self.hook_handles.clear()
-        
         layers = self._find_transformer_layers()
         if layers:
-            for layer in layers:
-                layer.to(self.device)
-                
+            for layer in layers: layer.to(self.device)
         self.pinned_cpu_state.clear()
         torch.cuda.empty_cache()
 
@@ -260,8 +232,7 @@ class BlockSwapManager:
 # ======================================================================
 CURRENT_REG_WEIGHT = 1.0
 
-def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, variant="turbo"):
-    """Сохранение полной модели (мерджинг обученного декодера с оригинальными весами)."""
+def _save_complete_model(trained_model_state, output_dir, source_model_dir, variant="turbo"):
     os.makedirs(output_dir, exist_ok=True)
     try:
         from safetensors.torch import load_file as st_load, save_file as st_save
@@ -269,27 +240,22 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
         if not os.path.exists(original_path):
             raise FileNotFoundError(f"No model.safetensors found in {source_model_dir}")
         
-        print(f"🔄 Слияние обученного декодера с оригинальной моделью из {source_model_dir}...")
+        print(f"🔄 Слияние обученной модели с оригинальными весами из {source_model_dir}...")
         original_state = st_load(original_path)
         
         cleaned_state = {}
-        for key, value in trained_decoder_state.items():
+        for key, value in trained_model_state.items():
             clean_key = key
-            for prefix in ("decoder.", "module.decoder.", "_forward_module."):
+            for prefix in ("model.", "_forward_module.", "module."):
                 if clean_key.startswith(prefix):
                     clean_key = clean_key[len(prefix):]
-                    break
             cleaned_state[clean_key] = value
 
         merged_state = {}
         merged_count = 0
         for orig_key, orig_val in original_state.items():
-            match_key = orig_key
-            if match_key.startswith("decoder."):
-                match_key = match_key[len("decoder."):]
-            
-            if match_key in cleaned_state:
-                trained_tensor = cleaned_state[match_key]
+            if orig_key in cleaned_state:
+                trained_tensor = cleaned_state[orig_key]
                 if trained_tensor.shape == orig_val.shape:
                     bf16_tensor = trained_tensor.to(dtype=torch.bfloat16) if trained_tensor.is_floating_point() else trained_tensor
                     merged_state[orig_key] = bf16_tensor
@@ -299,7 +265,7 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
             else:
                 merged_state[orig_key] = orig_val
 
-        print(f"✅ Успешно слито {merged_count} слоёв. Сохранение в {output_dir}...")
+        print(f"✅ Успешно обновлено {merged_count} слоёв. Сохранение в {output_dir}...")
         st_save(merged_state, os.path.join(output_dir, "model.safetensors"))
         
         src_silence = os.path.join(source_model_dir, "silence_latent.pt")
@@ -318,11 +284,11 @@ def _save_complete_model(trained_decoder_state, output_dir, source_model_dir, va
                 
     except Exception as e:
         print(f"❌ Ошибка при слиянии весов: {e}")
-        torch.save(trained_decoder_state, os.path.join(output_dir, "model_state_dict.pt"))
+        torch.save(trained_model_state, os.path.join(output_dir, "model_state_dict.pt"))
+
 
 class FullFinetuneModuleV2(torch.nn.Module):
-    """V2-совместимый модуль для Full Finetune (Continuous Timesteps + CFG Dropout)."""
-    def __init__(self, model, training_config, device, precision):
+    def __init__(self, model, training_config, device, precision, train_encoders=False, train_null_emb=True):
         super().__init__()
         self.training_config = training_config
         self.device = device
@@ -334,21 +300,35 @@ class FullFinetuneModuleV2(torch.nn.Module):
         self.timestep_sigma = getattr(model.config, 'timestep_sigma', 1.0)
         self.data_proportion = getattr(model.config, 'data_proportion', 0.5)
         self.cfg_ratio = getattr(training_config, "cfg_ratio", 0.15)
+        self.train_encoders = train_encoders
         
         if hasattr(model, "null_condition_emb"):
             self._null_cond_emb = model.null_condition_emb
         else:
             self._null_cond_emb = None
             
-        self.add_module("decoder", model.decoder)
+        self.model = model 
         self.force_input_grads_for_checkpointing = False
+
+        for param in self.model.decoder.parameters():
+            param.requires_grad = True
+            
+        if self.train_encoders and hasattr(self.model, "encoder") and self.model.encoder is not None:
+            for param in self.model.encoder.parameters():
+                param.requires_grad = True
+                
+        if train_null_emb and self._null_cond_emb is not None:
+            self._null_cond_emb.requires_grad = True
 
         if getattr(training_config, "gradient_checkpointing", False):
             try:
-                if hasattr(self.decoder, "gradient_checkpointing_enable"):
-                    self.decoder.gradient_checkpointing_enable()
-                elif hasattr(self.decoder, "gradient_checkpointing"):
-                    self.decoder.gradient_checkpointing = True
+                if hasattr(self.model.decoder, "gradient_checkpointing_enable"):
+                    self.model.decoder.gradient_checkpointing_enable()
+                elif hasattr(self.model.decoder, "gradient_checkpointing"):
+                    self.model.decoder.gradient_checkpointing = True
+                    
+                if self.train_encoders and hasattr(self.model.encoder, "gradient_checkpointing_enable"):
+                    self.model.encoder.gradient_checkpointing_enable()
             except: pass
 
     def training_step(self, batch: dict) -> torch.Tensor:
@@ -362,13 +342,32 @@ class FullFinetuneModuleV2(torch.nn.Module):
             nb = self.transfer_non_blocking
             target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
             attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-            encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
-            encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
             context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
-
             bsz = target_latents.shape[0]
 
-            # V2 CFG Dropout
+            if self.train_encoders and "text_hidden_states" in batch and batch["text_hidden_states"].dim() > 1:
+                ths = batch["text_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                tmask = batch["text_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                lhs = batch["lyric_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                lmask = batch["lyric_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                
+                ra_hid = torch.zeros(bsz, 1, 64, device=self.device, dtype=self.dtype)
+                ra_mask = torch.zeros(bsz, device=self.device, dtype=torch.long)
+                
+                encoder_hidden_states, encoder_attention_mask = self.model.encoder(
+                    text_hidden_states=ths,
+                    text_attention_mask=tmask,
+                    lyric_hidden_states=lhs,
+                    lyric_attention_mask=lmask,
+                    refer_audio_acoustic_hidden_states_packed=ra_hid,
+                    refer_audio_order_mask=ra_mask
+                )
+            else:
+                encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+                if self.train_encoders:
+                    print("⚠️ WARNING: Preprocessed dataset missing text/lyric tensors! Encoders skipped. Reprocess the dataset.")
+
             if self._null_cond_emb is not None and self.cfg_ratio > 0.0:
                 encoder_hidden_states = apply_cfg_dropout(
                     encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
@@ -377,7 +376,6 @@ class FullFinetuneModuleV2(torch.nn.Module):
             x1 = torch.randn_like(target_latents)
             x0 = target_latents
 
-            # V2 Continuous Timestep Sampling
             t, r = sample_timesteps(
                 batch_size=bsz, device=self.device, dtype=self.dtype,
                 data_proportion=self.data_proportion, timestep_mu=self.timestep_mu,
@@ -389,14 +387,13 @@ class FullFinetuneModuleV2(torch.nn.Module):
             if self.force_input_grads_for_checkpointing:
                 xt = xt.requires_grad_(True)
 
-            decoder_outputs = self.decoder(
+            decoder_outputs = self.model.decoder(
                 hidden_states=xt, timestep=t, timestep_r=t,
                 attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
             )
 
             flow = x1 - x0
-
             unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
             loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
 
@@ -404,22 +401,17 @@ class FullFinetuneModuleV2(torch.nn.Module):
             weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
             for i in range(bsz):
                 meta = metadata[i] if i < len(metadata) else {}
-                if meta.get("is_reg", False):
-                    weights[i] = CURRENT_REG_WEIGHT
+                if meta.get("is_reg", False): weights[i] = CURRENT_REG_WEIGHT
 
             diffusion_loss = (loss_per_sample * weights).mean()
 
         return diffusion_loss.float()
 
-# ======================================================================
-# ЗАПЛАТКА ДЛЯ РЕГУЛЯРИЗАЦИИ В LORA (FixedLoRAModule)
-# ======================================================================
 def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
     global CURRENT_REG_WEIGHT
     if self.device_type in ("cuda", "xpu", "mps"):
         autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
-    else:
-        autocast_ctx = nullcontext()
+    else: autocast_ctx = nullcontext()
 
     with autocast_ctx:
         nb = self.transfer_non_blocking
@@ -432,9 +424,7 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         bsz = target_latents.shape[0]
 
         if self._null_cond_emb is not None and self._cfg_ratio > 0.0:
-            encoder_hidden_states = apply_cfg_dropout(
-                encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio
-            )
+            encoder_hidden_states = apply_cfg_dropout(encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio)
 
         x1 = torch.randn_like(target_latents)
         x0 = target_latents
@@ -447,17 +437,14 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         t_ = t.unsqueeze(-1).unsqueeze(-1)
         xt = t_ * x1 + (1.0 - t_) * x0
 
-        if self.force_input_grads_for_checkpointing:
-            xt = xt.requires_grad_(True)
+        if self.force_input_grads_for_checkpointing: xt = xt.requires_grad_(True)
 
         decoder_outputs = self.model.decoder(
             hidden_states=xt, timestep=t, timestep_r=t,
             attention_mask=attention_mask, encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
         )
-
         flow = x1 - x0
-
         unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
         loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
 
@@ -465,23 +452,20 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
         for i in range(bsz):
             meta = metadata[i] if i < len(metadata) else {}
-            if meta.get("is_reg", False):
-                weights[i] = CURRENT_REG_WEIGHT
+            if meta.get("is_reg", False): weights[i] = CURRENT_REG_WEIGHT
 
         diffusion_loss = (loss_per_sample * weights).mean()
         unweighted_loss = loss_per_sample.mean()
 
-    diffusion_loss = diffusion_loss.float()
     self.training_losses.append(unweighted_loss.item())
-    return diffusion_loss
+    return diffusion_loss.float()
 
-try:
-    FixedLoRAModule.training_step = custom_training_step_lora
+try: FixedLoRAModule.training_step = custom_training_step_lora
 except NameError: pass 
 
 
 # ======================================================================
-# 1. DATASET CONFIG NODE
+# NODES (Config, Estimator, Lora, Trainer, etc.)
 # ======================================================================
 class ACEStepDatasetConfig:
     @classmethod
@@ -500,11 +484,11 @@ class ACEStepDatasetConfig:
                 "save_every": ("INT", {"default": 10, "min": 0}),
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
-                "save_final": ("BOOLEAN", {"default": False, "tooltip": "Сохранить итоговую модель/лору в папку final в конце обучения"}),
+                "save_final": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "reg_data_source": ("STRING", {"default": "", "tooltip": "Path to regularization audio/json"}),
-                "reg_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Loss weight for reg samples"}),
+                "reg_data_source": ("STRING", {"default": ""}),
+                "reg_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
             }
         }
     RETURN_TYPES = ("ACESTEP_DATASET",)
@@ -512,9 +496,6 @@ class ACEStepDatasetConfig:
     CATEGORY = "ACE-Step/Configs"
     def get_config(self, **kwargs): return (kwargs,)
 
-# ======================================================================
-# 2. MODEL & LORA CONFIG NODE
-# ======================================================================
 class ACEStepModelConfig:
     @classmethod
     def INPUT_TYPES(cls):
@@ -535,14 +516,10 @@ class ACEStepModelConfig:
     RETURN_TYPES = ("ACESTEP_MODEL",)
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Configs"
-
     def get_config(self, **kwargs):
         kwargs["adapter_type"] = "lora"
         return (kwargs,)
 
-# ======================================================================
-# 2.5 MODEL & LOKR CONFIG NODE
-# ======================================================================
 class ACEStepLoKRConfig:
     @classmethod
     def INPUT_TYPES(cls):
@@ -551,11 +528,11 @@ class ACEStepLoKRConfig:
                 "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
                 "linear_dim": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "linear_alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
-                "factor": ("INT", {"default": -1, "min": -1, "max": 256, "tooltip": "-1 means auto factor"}),
+                "factor": ("INT", {"default": -1, "min": -1, "max": 256}),
                 "decompose_both": ("BOOLEAN", {"default": False}),
                 "use_tucker": ("BOOLEAN", {"default": False}),
                 "use_scalar": ("BOOLEAN", {"default": False}),
-                "weight_decompose": ("BOOLEAN", {"default": False, "tooltip": "DoRA-style weight decomposition"}),
+                "weight_decompose": ("BOOLEAN", {"default": False}),
                 "target_modules": ("STRING", {"default": "q_proj k_proj v_proj o_proj", "multiline": True}),
                 "attn_type": (["both", "self", "cross"], {"default": "both"}),
                 "inf_steps": ("INT", {"default": 8, "min": 1}),
@@ -569,10 +546,7 @@ class ACEStepLoKRConfig:
     def get_config(self, **kwargs):
         kwargs["adapter_type"] = "lokr"
         return (kwargs,)
-    
-# ======================================================================
-# 3. OPTIMIZER CONFIG NODES
-# ======================================================================
+
 def get_base_opt_params(default_lr=1e-4):
     return {
         "scheduler": (["cosine", "cosine_restarts", "linear", "constant"], {"default": "cosine"}),
@@ -622,7 +596,7 @@ class ACEStepProdigyPlusConfig:
         inputs.update({
             "d_coef": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01}),
             "d0": ("FLOAT", {"default": 1e-6, "min": 1e-8, "step": 1e-7, "precision": 8}),
-            "beta3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.99, "step": 0.01, "tooltip": "Set to -1.0 for Auto"}), 
+            "beta3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 0.99, "step": 0.01}), 
             "prodigy_steps": ("INT", {"default": 0, "min": 0}),
             "schedulefree_c": ("FLOAT", {"default": 0.0, "min": 0.0}),
             "weight_decay_by_lr": ("BOOLEAN", {"default": True}),
@@ -684,10 +658,6 @@ class ACEStepAdafactorConfig:
         kwargs["optimizer_kwargs"] = opt_kwargs
         return (kwargs,)
 
-
-# ======================================================================
-# 4. PREVIEW CONFIG NODE
-# ======================================================================
 class ACEStepPreviewConfig:
     @classmethod
     def INPUT_TYPES(cls):
@@ -714,27 +684,17 @@ class ACEStepPreviewConfig:
     def get_config(self, **kwargs):
         dataset_config = kwargs.pop("dataset_config", None)
         indices_str = "⚠️ Please connect 'Dataset Config' to see the predicted list of files and indices."
-        
         if dataset_config is not None:
             clean_source = dataset_config.get("data_source", "").strip('"')
-            
             if not clean_source or not os.path.exists(clean_source):
-                indices_str = f"⚠️ Data source not found:\n{clean_source}\nPlease provide a valid directory or .json file in 'Dataset Config'."
+                indices_str = f"⚠️ Data source not found:\n{clean_source}"
             else:
                 basenames = []
-                
                 if clean_source.lower().endswith('.json'):
                     try:
                         with open(clean_source, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                            samples_list = []
-                            if isinstance(data, dict) and "samples" in data and isinstance(data["samples"], list):
-                                samples_list = data["samples"]
-                            elif isinstance(data, list):
-                                samples_list = data
-                            elif isinstance(data, dict):
-                                samples_list = [v for v in data.values() if isinstance(v, dict)]
-                            
+                            samples_list = data.get("samples", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                             for item in samples_list:
                                 if isinstance(item, dict):
                                     path_key = next((k for k in ["audio_path", "audio", "path", "file", "filename"] if k in item), None)
@@ -743,37 +703,26 @@ class ACEStepPreviewConfig:
                     except Exception as e:
                         indices_str = f"⚠️ Error reading JSON: {e}"
                         return (kwargs, indices_str)
-                        
                 elif os.path.isdir(clean_source):
                     valid_exts = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus'}
                     try:
                         for f in os.listdir(clean_source):
                             if os.path.isfile(os.path.join(clean_source, f)):
                                 ext = os.path.splitext(f)[1].lower()
-                                if ext in valid_exts:
-                                    basenames.append(f)
+                                if ext in valid_exts: basenames.append(f)
                     except Exception as e:
                         indices_str = f"⚠️ Error reading directory: {e}"
                         return (kwargs, indices_str)
-
                 if not basenames:
-                    indices_str = f"⚠️ No valid audio files found in data source:\n{clean_source}"
+                    indices_str = f"⚠️ No valid audio files found"
                 else:
-                    pt_names = [os.path.splitext(b)[0] + ".pt" for b in basenames]
-                    pt_names = sorted(list(set(pt_names)))
-                    
+                    pt_names = sorted(list(set([os.path.splitext(b)[0] + ".pt" for b in basenames])))
                     lines = [f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
-                    for idx, pt in enumerate(pt_names):
-                        lines.append(f"[{idx}] ➔ {pt}")
-                    
+                    for idx, pt in enumerate(pt_names): lines.append(f"[{idx}] ➔ {pt}")
                     indices_str = "\n".join(lines)
-
         return (kwargs, indices_str)
 
 
-# ======================================================================
-# 5. ESTIMATOR NODE
-# ======================================================================
 class ACEStepEstimator:
     @classmethod
     def INPUT_TYPES(cls):
@@ -792,19 +741,13 @@ class ACEStepEstimator:
     CATEGORY = "ACE-Step/Training"
 
     def _check_and_prepare_cache(self, source_path, tensor_dir):
-        if not os.path.exists(tensor_dir):
-            return False
-
+        if not os.path.exists(tensor_dir): return False
         pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
-        if not pt_files:
-            return False
-
-        if not source_path or not os.path.exists(source_path):
-            return True
+        if not pt_files: return False
+        if not source_path or not os.path.exists(source_path): return True
 
         oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
         source_mtime = 0
-
         if os.path.isfile(source_path):
             source_mtime = os.path.getmtime(source_path)
         elif os.path.isdir(source_path):
@@ -812,20 +755,17 @@ class ACEStepEstimator:
             for root, _, files in os.walk(source_path):
                 for file in files:
                     if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
-                        fpath = os.path.join(root, file)
-                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+                        source_mtime = max(source_mtime, os.path.getmtime(os.path.join(root, file)))
 
         if source_mtime > oldest_tensor_time:
-            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            print(f"⚠️ [Cache] Source data was modified. Invalidating old tensors...")
             for f in pt_files:
                 try: os.remove(f)
                 except: pass
-            manifest_path = os.path.join(tensor_dir, "manifest.json")
-            if os.path.exists(manifest_path):
-                try: os.remove(manifest_path)
+            if os.path.exists(os.path.join(tensor_dir, "manifest.json")):
+                try: os.remove(os.path.join(tensor_dir, "manifest.json"))
                 except: pass
             return False
-
         return True
 
     def estimate(self, dataset_config, model_config, est_batches, top_k, granularity):
@@ -847,8 +787,7 @@ class ACEStepEstimator:
             gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
 
             if not self._check_and_prepare_cache(clean_source, final_tensor_dir):
-                if not clean_source:
-                    raise ValueError(f"❌ Tensors not found and no Data Source provided!")
+                if not clean_source: raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨 Preprocessing required for estimation...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
@@ -879,8 +818,7 @@ class ACEStepEstimator:
                     cfg_ratio=model_config["cfg_ratio"]
                 )
                 
-                top_modules_raw = [item["module"] for item in results]
-                top_modules = [m.replace("decoder.", "") for m in top_modules_raw]
+                top_modules = [item["module"].replace("decoder.", "") for item in results]
                 result_str = " ".join(top_modules)
                 
                 print(f"✅ Estimation Complete. Top {top_k} modules found.")
@@ -888,16 +826,9 @@ class ACEStepEstimator:
                 
                 mm.soft_empty_cache()
                 return (result_str,)
-                
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 raise RuntimeError(f"❌ Estimation failed: {e}")
 
-
-# ======================================================================
-# 6. LORA RESIZE NODE
-# ======================================================================
 class ACEStepLoRAResize:
     @classmethod
     def INPUT_TYPES(cls):
@@ -919,30 +850,21 @@ class ACEStepLoRAResize:
 
     def perform_svd(self, weights: torch.Tensor, device: str):
         w_float = weights.to(device).float()
-        try:
-            U, S, Vh = torch.linalg.svd(w_float, full_matrices=False)
+        try: U, S, Vh = torch.linalg.svd(w_float, full_matrices=False)
         except Exception as e:
             print(f"Error during SVD: {e}. Falling back to CPU.")
-            w_float = w_float.cpu()
-            U, S, Vh = torch.linalg.svd(w_float, full_matrices=False)
+            U, S, Vh = torch.linalg.svd(w_float.cpu(), full_matrices=False)
         return U, S, Vh
 
     def calculate_new_rank(self, S: torch.Tensor, method: str, param: float, fixed_rank: int) -> int:
-        if method == "None" or method == "safe":
-            return min(fixed_rank, len(S))
+        if method == "None" or method == "safe": return min(fixed_rank, len(S))
         elif method == "sv_ratio":
-            threshold = S[0] * param
-            keep_indices = torch.nonzero(S >= threshold).flatten()
-            if len(keep_indices) == 0: return 1
-            return keep_indices[-1].item() + 1
+            keep_indices = torch.nonzero(S >= S[0] * param).flatten()
+            return keep_indices[-1].item() + 1 if len(keep_indices) > 0 else 1
         elif method == "sv_fro":
             S_sq = S.pow(2)
-            sum_S_sq = torch.sum(S_sq)
-            cumulative_S_sq = torch.cumsum(S_sq, dim=0)
-            threshold = param * sum_S_sq
-            keep_indices = torch.nonzero(cumulative_S_sq >= threshold).flatten()
-            if len(keep_indices) == 0: return len(S) 
-            return keep_indices[0].item() + 1
+            keep_indices = torch.nonzero(torch.cumsum(S_sq, dim=0) >= param * torch.sum(S_sq)).flatten()
+            return keep_indices[0].item() + 1 if len(keep_indices) > 0 else len(S)
         return fixed_rank
 
     def resize(self, input_path, output_path, new_rank, dynamic_method, dynamic_param, precision, device):
@@ -953,47 +875,24 @@ class ACEStepLoRAResize:
         in_path = input_path.strip('"')
         out_path = output_path.strip('"')
 
-        if not os.path.exists(in_path):
-            raise FileNotFoundError(f"Input path not found: {in_path}")
-        
-        if not out_path:
-            out_path = in_path + "_resized"
-        
-        settings_log = f"⚙️  Settings: Method={dynamic_method}"
-        if dynamic_method in ["sv_fro", "sv_ratio"]:
-            settings_log += f", Threshold/Ratio={dynamic_param}, MaxRank={new_rank}"
-        else:
-            settings_log += f", TargetRank={new_rank}"
-        
-        print(settings_log)
-        print(f"🖥️  Device: {device}, Precision: {precision}")
-        print(f"📂 Input: {in_path}")
-        print(f"📂 Output: {out_path}")
+        if not os.path.exists(in_path): raise FileNotFoundError(f"Input path not found: {in_path}")
+        if not out_path: out_path = in_path + "_resized"
         
         os.makedirs(out_path, exist_ok=True)
-        
         config_path = os.path.join(in_path, "adapter_config.json")
         model_path = os.path.join(in_path, "adapter_model.safetensors")
         
+        use_safetensors = True
         if not os.path.exists(model_path):
              model_path = os.path.join(in_path, "adapter_model.bin")
              use_safetensors = False
-             if not os.path.exists(model_path):
-                 raise FileNotFoundError("Could not find adapter_model.safetensors or .bin")
-        else:
-            use_safetensors = True
+             if not os.path.exists(model_path): raise FileNotFoundError("Could not find adapter_model")
 
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-
-        if use_safetensors:
-            state_dict = load_file(model_path)
-        else:
-            state_dict = torch.load(model_path, map_location="cpu")
+        with open(config_path, 'r') as f: config = json.load(f)
+        state_dict = load_file(model_path) if use_safetensors else torch.load(model_path, map_location="cpu")
 
         old_r = config.get("r", 8)
-        old_alpha = config.get("lora_alpha", 8)
-        scaling_factor = old_alpha / old_r if old_r > 0 else 1.0
+        scaling_factor = config.get("lora_alpha", 8) / old_r if old_r > 0 else 1.0
         
         save_dtype = torch.float32
         if precision == "fp16": save_dtype = torch.float16
@@ -1012,76 +911,48 @@ class ACEStepLoRAResize:
 
         new_state_dict = {}
         rank_pattern = {}
-        
-        # ProgressBar
-        total_steps = len(pairs)
-        pbar = ProgressBar(total_steps)
-        
-        print(f"🚀 Processing {total_steps} layers...")
+        pbar = ProgressBar(len(pairs))
+        print(f"🚀 Processing {len(pairs)} layers...")
         
         for base_key, mats in pairs.items():
             pbar.update(1)
-            
             if 'A' not in mats or 'B' not in mats:
-                for k, v in mats.items():
-                    new_state_dict[f"{base_key}lora_{k}.weight"] = v.to(save_dtype)
+                for k, v in mats.items(): new_state_dict[f"{base_key}lora_{k}.weight"] = v.to(save_dtype)
                 continue
 
-            A = mats['A'].to(device)
-            B = mats['B'].to(device)
-            
-            W = (B @ A) * scaling_factor
+            W = (mats['B'].to(device) @ mats['A'].to(device)) * scaling_factor
             U, S, Vh = self.perform_svd(W, device)
             
-            target_rank = self.calculate_new_rank(S, dynamic_method, dynamic_param, new_rank)
-            target_rank = min(target_rank, old_r)
-            
-            layer_name = base_key.replace("base_model.model.", "").rstrip(".")
-            if dynamic_method in ["sv_fro", "sv_ratio"]:
-                rank_pattern[layer_name] = target_rank
+            target_rank = min(self.calculate_new_rank(S, dynamic_method, dynamic_param, new_rank), old_r)
+            if dynamic_method in ["sv_fro", "sv_ratio"]: rank_pattern[base_key.replace("base_model.model.", "").rstrip(".")] = target_rank
 
-            U_r = U[:, :target_rank]
-            S_r = S[:target_rank]
-            Vh_r = Vh[:target_rank, :]
+            U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
             
-            new_B = U_r @ torch.diag(sqrt_S)
-            new_A = torch.diag(sqrt_S) @ Vh_r
+            new_state_dict[f"{base_key}lora_A.weight"] = (torch.diag(sqrt_S) @ Vh_r).to(save_dtype).cpu()
+            new_state_dict[f"{base_key}lora_B.weight"] = (U_r @ torch.diag(sqrt_S)).to(save_dtype).cpu()
             
-            new_state_dict[f"{base_key}lora_A.weight"] = new_A.to(save_dtype).cpu()
-            new_state_dict[f"{base_key}lora_B.weight"] = new_B.to(save_dtype).cpu()
-            
-            del A, B, W, U, S, Vh, U_r, S_r, Vh_r, sqrt_S, new_A, new_B
-
         new_config = copy.deepcopy(config)
         if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
             new_config["alpha_pattern"] = rank_pattern 
             new_config["r"] = max(rank_pattern.values()) 
             new_config["lora_alpha"] = new_config["r"]
-            avg_rank = sum(rank_pattern.values()) / len(rank_pattern)
-            print(f"📊 Resized with dynamic rank. Avg Rank: {avg_rank:.2f}")
         else:
             new_config["r"] = new_rank
             new_config["lora_alpha"] = new_rank
             new_config.pop("rank_pattern", None)
             new_config.pop("alpha_pattern", None)
 
-        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f:
-            json.dump(new_config, f, indent=2)
-            
-        if use_safetensors:
-            save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
-        else:
-            torch.save(new_state_dict, os.path.join(out_path, "adapter_model.bin"))
+        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f: json.dump(new_config, f, indent=2)
+        if use_safetensors: save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
+        else: torch.save(new_state_dict, os.path.join(out_path, "adapter_model.bin"))
 
         print(f"✅ Resize complete! Saved to {out_path}")
         mm.soft_empty_cache()
         return (out_path,)
 
-# ======================================================================
-# 7. MAIN TRAINER NODE (LoRA/LoKR)
-# ======================================================================
+
 class ACEStepTrainer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1104,26 +975,19 @@ class ACEStepTrainer:
                 "extra_pnginfo": "EXTRA_PNGINFO"
             }
         }
-
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_dir",)
     FUNCTION = "train_model"
     CATEGORY = "ACE-Step/Training"
 
     def _check_and_prepare_cache(self, source_path, tensor_dir):
-        if not os.path.exists(tensor_dir):
-            return False
-
+        if not os.path.exists(tensor_dir): return False
         pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
-        if not pt_files:
-            return False
-
-        if not source_path or not os.path.exists(source_path):
-            return True
+        if not pt_files: return False
+        if not source_path or not os.path.exists(source_path): return True
 
         oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
         source_mtime = 0
-
         if os.path.isfile(source_path):
             source_mtime = os.path.getmtime(source_path)
         elif os.path.isdir(source_path):
@@ -1131,36 +995,27 @@ class ACEStepTrainer:
             for root, _, files in os.walk(source_path):
                 for file in files:
                     if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
-                        fpath = os.path.join(root, file)
-                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+                        source_mtime = max(source_mtime, os.path.getmtime(os.path.join(root, file)))
 
         if source_mtime > oldest_tensor_time:
-            print(f"⚠️[Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
             for f in pt_files:
                 try: os.remove(f)
                 except: pass
-            
-            manifest_path = os.path.join(tensor_dir, "manifest.json")
-            if os.path.exists(manifest_path):
-                try: os.remove(manifest_path)
+            if os.path.exists(os.path.join(tensor_dir, "manifest.json")):
+                try: os.remove(os.path.join(tensor_dir, "manifest.json"))
                 except: pass
             return False
-
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
-        if saved_epochs is None:
-            saved_epochs = []
-            
+        if saved_epochs is None: saved_epochs = []
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
         ax.grid(True, linestyle='--', color='#444444', alpha=0.3)
         ax.tick_params(colors='#e0e0e0', labelsize=8)
         for spine in ax.spines.values(): spine.set_color('#444444')
-        
-        for se in saved_epochs:
-            ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
+        for se in saved_epochs: ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
             
         ln1 = ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
         ln2 = ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
@@ -1180,29 +1035,20 @@ class ACEStepTrainer:
             f"Speed: {step_time_str} | {epoch_time_str}"
         ]
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
-        
         lns = ln1 + ln2 + ln3
         labs = [l.get_label() for l in lns]
-        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
-                  facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
-        
+        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
         
         canvas = FigureCanvasAgg(fig)
-        
         if node_id is not None:
             buf = BytesIO()
             canvas.print_png(buf)
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             PromptServer.instance.send_sync("acestep_loss_update", {"node": node_id, "image": f"data:image/png;base64,{b64}"})
-            
         if output_dir is not None:
-            try:
-                path = os.path.join(output_dir, "loss_graph.png")
-                canvas.print_png(path)
-            except Exception as e:
-                print(f"⚠️ Failed to save graph to disk: {e}")
-                
+            try: canvas.print_png(os.path.join(output_dir, "loss_graph.png"))
+            except Exception as e: print(f"⚠️ Failed to save graph to disk: {e}")
         fig.clf()
 
     @torch.inference_mode(False)
@@ -1216,23 +1062,18 @@ class ACEStepTrainer:
             tensor_root = dataset_config["tensor_root"].strip('"')
             checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
             output_dir = dataset_config["output_dir"].strip('"')
-            
             reg_source = dataset_config.get("reg_data_source", "").strip('"')
             reg_weight = dataset_config.get("reg_weight", 1.0)
             
             global CURRENT_REG_WEIGHT
             CURRENT_REG_WEIGHT = reg_weight
 
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-
+            os.makedirs(output_dir, exist_ok=True)
             if extra_pnginfo and "workflow" in extra_pnginfo:
-                print(f"💾 Saving workflow to {output_dir}/workflow.json")
                 try:
                     with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
                         json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except Exception as e:
-                    print(f"⚠️ Failed to save workflow: {e}")
+                except: pass
 
             dataset_name = "default_dataset"
             if clean_source:
@@ -1245,24 +1086,20 @@ class ACEStepTrainer:
             precision = gpu_info.precision if gpu_info else "bf16"
 
             if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
-                if not clean_source:
-                    raise ValueError(f"❌ Tensors not found and no Data Source provided!")
+                if not clean_source: raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨[Phase 1] Preprocessing Main Dataset...")
-                try:
-                    is_json = clean_source.lower().endswith('.json')
-                    preprocess_audio_files(
-                        audio_dir=None if is_json else clean_source,
-                        dataset_json=clean_source if is_json else None,
-                        output_dir=main_tensor_dir,
-                        checkpoint_dir=checkpoint_dir,
-                        variant=model_config["model_variant"],
-                        max_duration=dataset_config["max_duration"],
-                        device=device,
-                        precision=precision,
-                        progress_callback=lambda c,t,m: print(f"[PRE-MAIN] {m}")
-                    )
-                except Exception as e:
-                    raise RuntimeError(f"❌ Main Preprocessing failed: {e}")
+                is_json = clean_source.lower().endswith('.json')
+                preprocess_audio_files(
+                    audio_dir=None if is_json else clean_source,
+                    dataset_json=clean_source if is_json else None,
+                    output_dir=main_tensor_dir,
+                    checkpoint_dir=checkpoint_dir,
+                    variant=model_config["model_variant"],
+                    max_duration=dataset_config["max_duration"],
+                    device=device,
+                    precision=precision,
+                    progress_callback=lambda c,t,m: print(f"[PRE-MAIN] {m}")
+                )
             else:
                 print(f"📂[Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
@@ -1289,77 +1126,46 @@ class ACEStepTrainer:
                 else:
                     print(f"📂[Phase 1.5] Valid cache found. Using existing REG tensors in: {reg_tensor_dir}")
 
-            tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
-            dataset_len = len(tensor_files)
-            if dataset_len == 0:
-                raise ValueError("❌ No .pt files found! Cannot proceed.")
+            dataset_len = len(glob.glob(os.path.join(main_tensor_dir, "*.pt")))
+            if dataset_len == 0: raise ValueError("❌ No .pt files found! Cannot proceed.")
 
             resolved_modules = resolve_target_modules(model_config["target_modules"].split(), model_config["attn_type"])
             adapter_type = model_config.get("adapter_type", "lora")
 
             if adapter_type == "lokr":
                 adapter_cfg = LoKRConfigV2(
-                    linear_dim=model_config["linear_dim"],
-                    linear_alpha=model_config["linear_alpha"],
-                    factor=model_config["factor"],
-                    decompose_both=model_config["decompose_both"],
-                    use_tucker=model_config["use_tucker"],
-                    use_scalar=model_config["use_scalar"],
-                    weight_decompose=model_config["weight_decompose"],
-                    target_modules=resolved_modules,
+                    linear_dim=model_config["linear_dim"], linear_alpha=model_config["linear_alpha"],
+                    factor=model_config["factor"], decompose_both=model_config["decompose_both"],
+                    use_tucker=model_config["use_tucker"], use_scalar=model_config["use_scalar"],
+                    weight_decompose=model_config["weight_decompose"], target_modules=resolved_modules,
                     attention_type=model_config["attn_type"]
                 )
             else:
                 adapter_cfg = LoRAConfigV2(
-                    r=model_config["rank"], 
-                    alpha=model_config["alpha"], 
-                    dropout=model_config["dropout"], 
-                    target_modules=resolved_modules, 
-                    bias=model_config["bias"], 
-                    attention_type=model_config["attn_type"]
+                    r=model_config["rank"], alpha=model_config["alpha"], dropout=model_config["dropout"], 
+                    target_modules=resolved_modules, bias=model_config["bias"], attention_type=model_config["attn_type"]
                 )
 
             prev_cfg = preview_config if preview_config is not None else {}
             
             train_cfg = TrainingConfigV2(
-                adapter_type=adapter_type,
-                learning_rate=optimizer_config["learning_rate"], 
-                batch_size=dataset_config["batch_size"], 
-                gradient_accumulation_steps=dataset_config["grad_accum"],
-                max_epochs=dataset_config["epochs"], 
-                save_every_n_epochs=dataset_config["save_every"], 
-                output_dir=output_dir, 
-                seed=seed,
-                resume_from=dataset_config["resume_from"] if dataset_config["resume_from"] else None, 
-                optimizer_type=optimizer_config["optimizer"], 
-                scheduler_type=optimizer_config["scheduler"],
-                gradient_checkpointing=grad_ckpt, 
-                offload_encoder=offload_enc, 
-                cfg_ratio=model_config["cfg_ratio"],
-                device=device, 
-                precision=precision, 
-                dataset_dir=main_tensor_dir,
-                checkpoint_dir=checkpoint_dir, 
-                model_variant=model_config["model_variant"], 
-                num_workers=0 if os.name == 'nt' else 4,
-                log_every=1, 
-                log_heavy_every=10000, 
-                weight_decay=optimizer_config["weight_decay"], 
-                max_grad_norm=optimizer_config["max_grad_norm"],
-                warmup_steps=optimizer_config["warmup_steps"], 
-                save_start_epoch=dataset_config["save_start"], 
-                save_loss_threshold=dataset_config["save_loss_limit"],
-                optimizer_kwargs=optimizer_config["optimizer_kwargs"], 
-                shift=model_config["shift"], 
-                num_inference_steps=model_config["inf_steps"],
-                generate_preview=prev_cfg.get("gen_preview", False), 
-                offload_dit_for_preview=prev_cfg.get("offload_dit_prev", False), 
-                preview_sample_index=prev_cfg.get("sample_idx", 0),
-                preview_caption=prev_cfg.get("prev_caption", "").strip() or None, 
-                preview_lyrics=prev_cfg.get("prev_lyrics", "").strip() or None,
-                preview_bpm=prev_cfg.get("prev_bpm", "").strip() or None, 
-                preview_keyscale=prev_cfg.get("prev_key", "").strip() or None,
-                preview_timesig=prev_cfg.get("prev_ts", "").strip() or None,
+                adapter_type=adapter_type, learning_rate=optimizer_config["learning_rate"], 
+                batch_size=dataset_config["batch_size"], gradient_accumulation_steps=dataset_config["grad_accum"],
+                max_epochs=dataset_config["epochs"], save_every_n_epochs=dataset_config["save_every"], 
+                output_dir=output_dir, seed=seed, resume_from=dataset_config["resume_from"] if dataset_config["resume_from"] else None, 
+                optimizer_type=optimizer_config["optimizer"], scheduler_type=optimizer_config["scheduler"],
+                gradient_checkpointing=grad_ckpt, offload_encoder=offload_enc, cfg_ratio=model_config["cfg_ratio"],
+                device=device, precision=precision, dataset_dir=main_tensor_dir,
+                checkpoint_dir=checkpoint_dir, model_variant=model_config["model_variant"], 
+                num_workers=0 if os.name == 'nt' else 4, log_every=1, log_heavy_every=10000, 
+                weight_decay=optimizer_config["weight_decay"], max_grad_norm=optimizer_config["max_grad_norm"],
+                warmup_steps=optimizer_config["warmup_steps"], save_start_epoch=dataset_config["save_start"], 
+                save_loss_threshold=dataset_config["save_loss_limit"], optimizer_kwargs=optimizer_config["optimizer_kwargs"], 
+                shift=model_config["shift"], num_inference_steps=model_config["inf_steps"],
+                generate_preview=prev_cfg.get("gen_preview", False), offload_dit_for_preview=prev_cfg.get("offload_dit_prev", False), 
+                preview_sample_index=prev_cfg.get("sample_idx", 0), preview_caption=prev_cfg.get("prev_caption", "").strip() or None, 
+                preview_lyrics=prev_cfg.get("prev_lyrics", "").strip() or None, preview_bpm=prev_cfg.get("prev_bpm", "").strip() or None, 
+                preview_keyscale=prev_cfg.get("prev_key", "").strip() or None, preview_timesig=prev_cfg.get("prev_ts", "").strip() or None,
             )
             train_cfg.save_final_model = dataset_config.get("save_final", False)
 
@@ -1400,29 +1206,22 @@ class ACEStepTrainer:
                 main_ds = dm_module.PreprocessedTensorDataset(main_tensor_dir)
                 if reg_tensor_dir and os.path.exists(reg_tensor_dir):
                     reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
-                    
                     class BalancedWrapper(torch.utils.data.Dataset):
                         def __init__(self, m_ds, r_ds):
                             self.m_ds = m_ds
                             self.r_ds = r_ds
                             self.target_len = max(len(m_ds), len(r_ds))
-                            
-                        def __len__(self):
-                            return self.target_len * 2
-                            
+                        def __len__(self): return self.target_len * 2
                         def __getitem__(self, idx):
-                            if idx % 2 == 0:
-                                return self.m_ds[(idx // 2) % len(self.m_ds)]
+                            if idx % 2 == 0: return self.m_ds[(idx // 2) % len(self.m_ds)]
                             else:
                                 item = dict(self.r_ds[(idx // 2) % len(self.r_ds)])
                                 item["metadata"] = dict(item.get("metadata", {}))
                                 item["metadata"]["is_reg"] = True
                                 return item
-                                
                     self_dm.train_dataset = BalancedWrapper(main_ds, reg_ds)
                     print(f"⚖️ In-Memory Dataset Balanced: Main ({len(main_ds)}) | Reg ({len(reg_ds)}) -> Total Epoch Size: {len(self_dm.train_dataset)}")
-                else:
-                    self_dm.train_dataset = main_ds
+                else: self_dm.train_dataset = main_ds
                 self_dm.val_dataset = None
 
             dm_module.PreprocessedDataModule.setup = balanced_setup
@@ -1439,18 +1238,9 @@ class ACEStepTrainer:
             training_state = {"should_stop": False}
             start_time = time.time()
 
-            epoch_history = []
-            loss_history = []
-            ema_history = []
-            lr_history = []
-            ema_loss = None
-            ema_alpha = 0.1
-            saved_epochs = []
-            
-            elapsed_str = "00:00:00"
-            eta_str = "00:00:00"
-            step_time_str = "0s/it"
-            epoch_time_str = "0s/ep"
+            epoch_history, loss_history, ema_history, lr_history = [], [], [], []
+            ema_loss, ema_alpha, saved_epochs = None, 0.1, []
+            elapsed_str, eta_str, step_time_str, epoch_time_str = "00:00:00", "00:00:00", "0s/it", "0s/ep"
 
             def fmt_time(secs):
                 m, s = divmod(int(max(0, secs)), 60)
@@ -1487,13 +1277,9 @@ class ACEStepTrainer:
                             time_per_epoch = time_per_step * steps_per_epoch
                             ep_m, ep_s = divmod(int(time_per_epoch), 60)
                             ep_h, ep_m = divmod(ep_m, 60)
-                            if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
-                            elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
-                            else: epoch_time_str = f"{ep_s}s/ep"
+                            epoch_time_str = f"{ep_h}h {ep_m}m/ep" if ep_h > 0 else (f"{ep_m}m {ep_s}s/ep" if ep_m > 0 else f"{ep_s}s/ep")
                         else:
                             eta_secs = 0
-                            step_time_str = "0s/it"
-                            epoch_time_str = "0s/ep"
                             
                         elapsed_str = fmt_time(elapsed)
                         eta_str = fmt_time(eta_secs)
@@ -1517,10 +1303,8 @@ class ACEStepTrainer:
                                 last_ep = epoch_history[-1]
                                 if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                     saved_epochs.append(last_ep)
-
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
-                
                 if loss_history:
                     print(f"📊 Saving final training graph to: {output_dir}/loss_graph.png")
                     self.process_loss_graph(
@@ -1534,9 +1318,6 @@ class ACEStepTrainer:
             mm.soft_empty_cache()
             return (output_dir,)
 
-# ======================================================================
-# 8. FULL FINETUNE TRAINER NODE
-# ======================================================================
 class ACEStepFinetuneTrainer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1550,7 +1331,9 @@ class ACEStepFinetuneTrainer:
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
                 "offload_enc": ("BOOLEAN", {"default": False}),
                 "vram_cleanup": ("BOOLEAN", {"default": True}),
-                "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving, fastest possible implementation."}),
+                "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving."}),
+                "train_encoders": ("BOOLEAN", {"default": False, "tooltip": "Train Condition/Lyric/Timbre Encoders"}),
+                "train_null_emb": ("BOOLEAN", {"default": True, "tooltip": "Train null_condition_emb (CFG)"}),
             },
             "optional": {
                 "preview_config": ("ACESTEP_PREVIEW",),
@@ -1568,19 +1351,13 @@ class ACEStepFinetuneTrainer:
     CATEGORY = "ACE-Step/Training"
 
     def _check_and_prepare_cache(self, source_path, tensor_dir):
-        if not os.path.exists(tensor_dir):
-            return False
-
+        if not os.path.exists(tensor_dir): return False
         pt_files = glob.glob(os.path.join(tensor_dir, "*.pt"))
-        if not pt_files:
-            return False
-
-        if not source_path or not os.path.exists(source_path):
-            return True
+        if not pt_files: return False
+        if not source_path or not os.path.exists(source_path): return True
 
         oldest_tensor_time = min(os.path.getmtime(f) for f in pt_files)
         source_mtime = 0
-
         if os.path.isfile(source_path):
             source_mtime = os.path.getmtime(source_path)
         elif os.path.isdir(source_path):
@@ -1588,27 +1365,21 @@ class ACEStepFinetuneTrainer:
             for root, _, files in os.walk(source_path):
                 for file in files:
                     if file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aiff', '.opus')):
-                        fpath = os.path.join(root, file)
-                        source_mtime = max(source_mtime, os.path.getmtime(fpath))
+                        source_mtime = max(source_mtime, os.path.getmtime(os.path.join(root, file)))
 
         if source_mtime > oldest_tensor_time:
-            print(f"⚠️ [Cache] Source data '{os.path.basename(source_path)}' was modified. Invalidating old tensors...")
+            print(f"⚠️ [Cache] Source data was modified. Invalidating old tensors...")
             for f in pt_files:
                 try: os.remove(f)
                 except: pass
-            
-            manifest_path = os.path.join(tensor_dir, "manifest.json")
-            if os.path.exists(manifest_path):
-                try: os.remove(manifest_path)
+            if os.path.exists(os.path.join(tensor_dir, "manifest.json")):
+                try: os.remove(os.path.join(tensor_dir, "manifest.json"))
                 except: pass
             return False
-
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
-        if saved_epochs is None:
-            saved_epochs = []
-            
+        if saved_epochs is None: saved_epochs = []
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
@@ -1616,8 +1387,7 @@ class ACEStepFinetuneTrainer:
         ax.tick_params(colors='#e0e0e0', labelsize=8)
         for spine in ax.spines.values(): spine.set_color('#444444')
         
-        for se in saved_epochs:
-            ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
+        for se in saved_epochs: ax.axvline(x=se, color='#aaaaaa', linestyle=':', linewidth=1.2, alpha=0.7)
             
         ln1 = ax.plot(epochs, losses, color='#ff5252', linewidth=1.0, alpha=0.4, label='Step Loss')
         ln2 = ax.plot(epochs, emas, color='#4caf50', linewidth=2.0, label='EMA Loss')
@@ -1637,34 +1407,24 @@ class ACEStepFinetuneTrainer:
             f"Speed: {step_time_str} | {epoch_time_str}"
         ]
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
-        
         lns = ln1 + ln2 + ln3
         labs = [l.get_label() for l in lns]
-        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, 
-                  facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
-        
+        ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
         
         canvas = FigureCanvasAgg(fig)
-        
         if node_id is not None:
             buf = BytesIO()
             canvas.print_png(buf)
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             PromptServer.instance.send_sync("acestep_loss_update", {"node": node_id, "image": f"data:image/png;base64,{b64}"})
-            
         if output_dir is not None:
-            try:
-                path = os.path.join(output_dir, "loss_graph.png")
-                canvas.print_png(path)
-            except Exception as e:
-                print(f"⚠️ Failed to save graph to disk: {e}")
-                
+            try: canvas.print_png(os.path.join(output_dir, "loss_graph.png"))
+            except Exception as e: print(f"⚠️ Failed to save graph to disk: {e}")
         fig.clf()
 
-    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False):
-        if not preview_config.get("gen_preview", False):
-            return
+    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False, train_encoders=False):
+        if not preview_config.get("gen_preview", False): return
             
         print(f"[LOG] 🎵 Generating preview (Step: {step})...")
         do_offload_dit = preview_config.get("offload_dit_prev", False)
@@ -1677,7 +1437,6 @@ class ACEStepFinetuneTrainer:
             from acestep.core.generation.handler.memory_utils import MemoryUtilsMixin
             
             target_idx = preview_config.get("sample_idx", 0)
-            
             pt_files = sorted(glob.glob(os.path.join(main_tensor_dir, "*.pt")))
             pt_files = [f for f in pt_files if not f.endswith("manifest.json")]
             
@@ -1724,7 +1483,6 @@ class ACEStepFinetuneTrainer:
 
             tokenizer, text_enc = load_text_encoder(checkpoint_dir, device=device, precision=precision)
             silence_lat = load_silence_latent(checkpoint_dir, device=device, precision=precision, variant=variant)
-            
             dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
             with torch.no_grad():
@@ -1737,7 +1495,6 @@ class ACEStepFinetuneTrainer:
                 lyric_mask = lyric_inputs.attention_mask.to(device).to(dtype)
 
             unload_models(text_enc)
-
             model.to(device)
             model.eval()
 
@@ -1765,23 +1522,14 @@ class ACEStepFinetuneTrainer:
             with torch.no_grad():
                 with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu", dtype=dtype):
                     outputs = model.generate_audio(
-                        text_hidden_states=text_hs,
-                        text_attention_mask=text_mask,
-                        lyric_hidden_states=lyric_hs,
-                        lyric_attention_mask=lyric_mask,
+                        text_hidden_states=text_hs, text_attention_mask=text_mask,
+                        lyric_hidden_states=lyric_hs, lyric_attention_mask=lyric_mask,
                         refer_audio_acoustic_hidden_states_packed=refer_audio,
-                        refer_audio_order_mask=refer_mask,
-                        src_latents=src_latents,
-                        chunk_masks=chunk_masks,
-                        silence_latent=current_silence,
-                        attention_mask=attention_mask,
-                        is_covers=is_covers,
-                        infer_steps=inf_steps,
-                        diffusion_guidance_sale=7.5,
-                        shift=shift,
-                        use_cache=True,
-                        infer_method="ode",
-                        use_progress_bar=False
+                        refer_audio_order_mask=refer_mask, src_latents=src_latents,
+                        chunk_masks=chunk_masks, silence_latent=current_silence,
+                        attention_mask=attention_mask, is_covers=is_covers,
+                        infer_steps=inf_steps, diffusion_guidance_sale=7.5,
+                        shift=shift, use_cache=True, infer_method="ode", use_progress_bar=False
                     )
             generated_latents = outputs["target_latents"]
 
@@ -1790,7 +1538,6 @@ class ACEStepFinetuneTrainer:
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
             vae = load_vae(checkpoint_dir, device=device, precision=precision)
-            
             class VaeInferenceWrapper(VaeDecodeMixin, VaeDecodeChunksMixin, MemoryUtilsMixin):
                 def __init__(self, vae_model, device_name):
                     self.vae = vae_model
@@ -1801,10 +1548,8 @@ class ACEStepFinetuneTrainer:
                 def _recursive_to_device(self, module, device, dtype=None):
                     module.to(device)
                     if dtype: module.to(dtype)
-                def _get_auto_decode_chunk_size(self):
-                    return 256 
-                def _should_offload_wav_to_cpu(self):
-                    return False
+                def _get_auto_decode_chunk_size(self): return 256 
+                def _should_offload_wav_to_cpu(self): return False
 
             vae_wrapper = VaeInferenceWrapper(vae, str(device))
             latents_to_decode = generated_latents.to(device).to(vae.dtype).transpose(1, 2)
@@ -1837,9 +1582,11 @@ class ACEStepFinetuneTrainer:
             except: pass
             
             model.to(device)
-            
             if offload_enc or vram_cleanup:
-                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer"]
+                if not train_encoders:
+                    to_kill.extend(["music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"])
+                
                 for attr in to_kill:
                     if hasattr(model, attr):
                         m = getattr(model, attr)
@@ -1847,17 +1594,17 @@ class ACEStepFinetuneTrainer:
                     if hasattr(model, "encoder") and hasattr(model.encoder, attr):
                         m = getattr(model.encoder, attr)
                         if m is not None: setattr(model.encoder, attr, m.to("cpu"))
-                if hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                if not train_encoders and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
                     model.encoder.text_projector.to("cpu")
 
-                if offload_enc and hasattr(model, "encoder") and model.encoder is not None:
+                if offload_enc and not train_encoders and hasattr(model, "encoder") and model.encoder is not None:
                     model.encoder.to("cpu")
 
             model.train()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, train_encoders, train_null_emb, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1869,21 +1616,21 @@ class ACEStepFinetuneTrainer:
             tensor_root = dataset_config["tensor_root"].strip('"')
             checkpoint_dir = dataset_config["checkpoint_dir"].strip('"')
             output_dir = dataset_config["output_dir"].strip('"')
-            
             reg_source = dataset_config.get("reg_data_source", "").strip('"')
             reg_weight = dataset_config.get("reg_weight", 1.0)
             CURRENT_REG_WEIGHT = reg_weight
 
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
+            if train_encoders:
+                offload_enc = False
+                print("⚠️ Note: train_encoders is True. Condition/Lyric Encoders will NOT be offloaded.")
 
+            os.makedirs(output_dir, exist_ok=True)
             if extra_pnginfo and "workflow" in extra_pnginfo:
                 print(f"💾 Saving workflow to {output_dir}/workflow.json")
                 try:
                     with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
                         json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except Exception as e:
-                    print(f"⚠️ Failed to save workflow: {e}")
+                except: pass
 
             dataset_name = "default_dataset"
             if clean_source:
@@ -1900,12 +1647,10 @@ class ACEStepFinetuneTrainer:
             
             device = gpu_info.device if gpu_info else ("cuda" if torch.cuda.is_available() else "cpu")
             precision = gpu_info.precision if gpu_info else ("bf16" if "cuda" in device else "fp32")
-            torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
-            # ===[PHASE 1] PREPROCESSING MAIN DATASET ===
+            # ===[PHASE 1] PREPROCESSING ===
             if not self._check_and_prepare_cache(clean_source, main_tensor_dir):
-                if not clean_source:
-                    raise ValueError(f"❌ Tensors not found and no Data Source provided!")
+                if not clean_source: raise ValueError(f"❌ Tensors not found and no Data Source provided!")
                 print(f"🔨[Phase 1] Preprocessing Main Dataset...")
                 try:
                     is_json = clean_source.lower().endswith('.json')
@@ -1926,7 +1671,6 @@ class ACEStepFinetuneTrainer:
             else:
                 print(f"📂[Phase 1] Valid cache found. Using existing main tensors in: {main_tensor_dir}")
 
-            # ===[PHASE 1.5] PREPROCESSING REG DATASET ===
             reg_tensor_dir = None
             if reg_source and os.path.exists(reg_source):
                 reg_dataset_name = os.path.splitext(os.path.basename(os.path.normpath(reg_source)))[0]
@@ -1952,8 +1696,7 @@ class ACEStepFinetuneTrainer:
 
             tensor_files = glob.glob(os.path.join(main_tensor_dir, "*.pt"))
             dataset_len = len(tensor_files)
-            if dataset_len == 0:
-                raise ValueError("❌ No .pt files found! Cannot proceed.")
+            if dataset_len == 0: raise ValueError("❌ No .pt files found! Cannot proceed.")
 
             from acestep.training_v2.configs import TrainingConfigV2
             training_cfg = TrainingConfigV2(
@@ -1985,7 +1728,10 @@ class ACEStepFinetuneTrainer:
 
             if vram_cleanup or offload_enc:
                 print(f"🧹[System] Optimizing VRAM Usage (Cleanup/Offload)...")
-                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer"]
+                if not train_encoders:
+                    to_kill.extend(["music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"])
+                
                 for attr in to_kill:
                     if hasattr(model, attr):
                         m = getattr(model, attr)
@@ -1993,10 +1739,10 @@ class ACEStepFinetuneTrainer:
                     if hasattr(model, "encoder") and hasattr(model.encoder, attr):
                         m = getattr(model.encoder, attr)
                         if m is not None: setattr(model.encoder, attr, m.to("cpu"))
-                if hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                if not train_encoders and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
                     model.encoder.text_projector.to("cpu")
 
-                if offload_enc and hasattr(model, "encoder") and model.encoder is not None:
+                if offload_enc and not train_encoders and hasattr(model, "encoder") and model.encoder is not None:
                     print(f"🧹[System] Full Encoder offload enabled. Moving to CPU.")
                     model.encoder.to("cpu")
 
@@ -2012,23 +1758,17 @@ class ACEStepFinetuneTrainer:
 
             variant_dir = f"acestep-v15-{model_variant}"
             source_model_dir = os.path.join(checkpoint_dir, variant_dir)
-            if not os.path.isdir(source_model_dir):
-                source_model_dir = os.path.join(checkpoint_dir, model_variant)
-            if not os.path.isdir(source_model_dir):
-                source_model_dir = checkpoint_dir
+            if not os.path.isdir(source_model_dir): source_model_dir = os.path.join(checkpoint_dir, model_variant)
+            if not os.path.isdir(source_model_dir): source_model_dir = checkpoint_dir
 
             print("\n🔥 Starting Full Fine-Tuning Loop...")
             
-            # Внедрение BlockSwap
             block_swap = None
             if block_swap_ratio > 0.0:
                 block_swap = BlockSwapManager(model.decoder, device=device, offload_device="cpu")
                 block_swap.apply(offload_ratio=block_swap_ratio)
 
-            module = FullFinetuneModuleV2(model, training_cfg, device, precision)
-            for param in module.decoder.parameters():
-                param.requires_grad = True
-                
+            module = FullFinetuneModuleV2(model, training_cfg, device, precision, train_encoders, train_null_emb)
             trainable_params = [p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
@@ -2041,11 +1781,8 @@ class ACEStepFinetuneTrainer:
                     reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
                     class BalancedWrapper(torch.utils.data.Dataset):
                         def __init__(self, m_ds, r_ds):
-                            self.m_ds = m_ds
-                            self.r_ds = r_ds
-                            self.target_len = max(len(m_ds), len(r_ds))
-                        def __len__(self):
-                            return self.target_len * 2
+                            self.m_ds = m_ds; self.r_ds = r_ds; self.target_len = max(len(m_ds), len(r_ds))
+                        def __len__(self): return self.target_len * 2
                         def __getitem__(self, idx):
                             if idx % 2 == 0: return self.m_ds[(idx // 2) % len(self.m_ds)]
                             else:
@@ -2055,8 +1792,7 @@ class ACEStepFinetuneTrainer:
                                 return item
                     self_dm.train_dataset = BalancedWrapper(main_ds, reg_ds)
                     print(f"⚖️ In-Memory Dataset Balanced: Main ({len(main_ds)}) | Reg ({len(reg_ds)}) -> Total Epoch Size: {len(self_dm.train_dataset)}")
-                else:
-                    self_dm.train_dataset = main_ds
+                else: self_dm.train_dataset = main_ds
                 self_dm.val_dataset = None
 
             dm_module.PreprocessedDataModule.setup = balanced_setup
@@ -2071,12 +1807,9 @@ class ACEStepFinetuneTrainer:
 
             from acestep.training_v2.optim import build_optimizer, build_scheduler
             optimizer = build_optimizer(
-                params=trainable_params,
-                optimizer_type=training_cfg.optimizer_type,
-                lr=training_cfg.learning_rate,
-                weight_decay=training_cfg.weight_decay,
-                device_type=module.device_type,
-                optimizer_kwargs=training_cfg.optimizer_kwargs
+                params=trainable_params, optimizer_type=training_cfg.optimizer_type,
+                lr=training_cfg.learning_rate, weight_decay=training_cfg.weight_decay,
+                device_type=module.device_type, optimizer_kwargs=training_cfg.optimizer_kwargs
             )
 
             actual_dataset_len = dataset_len
@@ -2088,29 +1821,17 @@ class ACEStepFinetuneTrainer:
             total_steps_approx = steps_per_epoch * dataset_config["epochs"]
 
             scheduler = build_scheduler(
-                optimizer=optimizer,
-                scheduler_type=training_cfg.scheduler_type,
-                total_steps=total_steps_approx,
-                warmup_steps=training_cfg.warmup_steps,
-                lr=training_cfg.learning_rate,
-                optimizer_type=training_cfg.optimizer_type
+                optimizer=optimizer, scheduler_type=training_cfg.scheduler_type,
+                total_steps=total_steps_approx, warmup_steps=training_cfg.warmup_steps,
+                lr=training_cfg.learning_rate, optimizer_type=training_cfg.optimizer_type
             )
 
             pbar = ProgressBar(total_steps_approx)
             start_time = time.time()
 
-            epoch_history = []
-            loss_history = []
-            ema_history = []
-            lr_history = []
-            ema_loss = None
-            ema_alpha = 0.1
-            saved_epochs = []
-            
-            elapsed_str = "00:00:00"
-            eta_str = "00:00:00"
-            step_time_str = "0s/it"
-            epoch_time_str = "0s/ep"
+            epoch_history, loss_history, ema_history, lr_history = [], [], [], []
+            ema_loss, ema_alpha, saved_epochs = None, 0.1, []
+            elapsed_str, eta_str, step_time_str, epoch_time_str = "00:00:00", "00:00:00", "0s/it", "0s/ep"
 
             def fmt_time(secs):
                 m, s = divmod(int(max(0, secs)), 60)
@@ -2179,13 +1900,9 @@ class ACEStepFinetuneTrainer:
                                 time_per_epoch = time_per_step * steps_per_epoch
                                 ep_m, ep_s = divmod(int(time_per_epoch), 60)
                                 ep_h, ep_m = divmod(ep_m, 60)
-                                if ep_h > 0: epoch_time_str = f"{ep_h}h {ep_m}m/ep"
-                                elif ep_m > 0: epoch_time_str = f"{ep_m}m {ep_s}s/ep"
-                                else: epoch_time_str = f"{ep_s}s/ep"
+                                epoch_time_str = f"{ep_h}h {ep_m}m/ep" if ep_h > 0 else (f"{ep_m}m {ep_s}s/ep" if ep_m > 0 else f"{ep_s}s/ep")
                             else:
                                 eta_secs = 0
-                                step_time_str = "0s/it"
-                                epoch_time_str = "0s/ep"
                                 
                             elapsed_str = fmt_time(elapsed)
                             eta_str = fmt_time(eta_secs)
@@ -2198,20 +1915,18 @@ class ACEStepFinetuneTrainer:
                                         elapsed_str, eta_str, step_time_str, epoch_time_str,
                                         saved_epochs, node_id=node_id_str
                                     )
-                                except Exception as e:
-                                    print(f"⚠️ Ошибка отрисовки графика: {e}")
+                                except: pass
 
                             epoch_loss += avg_loss
                             num_updates += 1
                             accum_loss = 0.0
                             accum_step = 0
 
-                    if mm.processing_interrupted():
-                        break
+                    if mm.processing_interrupted(): break
 
                     if (epoch + 1) % training_cfg.save_every_n_epochs == 0:
                         ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
-                        _save_complete_model(module.decoder.state_dict(), ckpt_dir, source_model_dir, model_variant)
+                        _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant)
                         if epoch_history:
                             last_ep = epoch_history[-1]
                             if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
@@ -2219,13 +1934,11 @@ class ACEStepFinetuneTrainer:
                         print(f"💾 Checkpoint saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
-                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup)
+                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, train_encoders)
 
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
-                
-                if block_swap is not None:
-                    block_swap.remove()
+                if block_swap is not None: block_swap.remove()
 
                 if loss_history:
                     print(f"📊 Saving final training graph to: {output_dir}/loss_graph.png")
@@ -2237,18 +1950,14 @@ class ACEStepFinetuneTrainer:
                     
                 if dataset_config.get("save_final", True):
                     print(f"💾 Saving final model weights...")
-                    _save_complete_model(module.decoder.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
-                else:
-                    print(f"⏭️ Skipping final save as requested.")
+                    _save_complete_model(module.model.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
+                else: print(f"⏭️ Skipping final save as requested.")
 
             elapsed = time.time() - start_time
             print(f"\n🎉 Finished in {fmt_time(elapsed)}")
             mm.soft_empty_cache()
             return (output_dir,)
 
-# ======================================================================
-# 9. LORA EXTRACTOR NODE
-# ======================================================================
 class ACEStepLoRAExtractor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2266,7 +1975,6 @@ class ACEStepLoRAExtractor:
                 "device": (["cuda", "cpu"], {"default": "cuda"}),
             }
         }
-    
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "extract"
@@ -2283,14 +1991,10 @@ class ACEStepLoRAExtractor:
         print(f"\n" + "="*60)
         print(f"🧬 LoRA Extractor Started")
         print(f"="*60)
-
         base_file = self._resolve_model_path(base_model_path.strip('"'))
         ft_file = self._resolve_model_path(finetuned_model_path.strip('"'))
         out_path = output_path.strip('"')
 
-        print(f"Base: {base_file}")
-        print(f"Finetuned: {ft_file}")
-        
         base_sd = load_file(base_file) if base_file.endswith('.safetensors') else torch.load(base_file, map_location="cpu", weights_only=True)
         ft_sd = load_file(ft_file) if ft_file.endswith('.safetensors') else torch.load(ft_file, map_location="cpu", weights_only=True)
 
@@ -2303,85 +2007,52 @@ class ACEStepLoRAExtractor:
         elif precision == "bf16": save_dtype = torch.bfloat16
 
         scale_factor = rank / alpha if alpha > 0 else 1.0
-
-        # Отбираем только целевые слои, которые есть в обеих моделях и совпадают по форме (только Linear 2D)
         valid_keys = [k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
 
-        from comfy.utils import ProgressBar
         pbar = ProgressBar(len(valid_keys))
-
         print(f"🚀 Extracting {len(valid_keys)} layers...")
 
         for key in valid_keys:
             pbar.update(1)
-            
             W_base = base_sd[key].to(device).float()
             W_ft = ft_sd[key].to(device).float()
             delta_W = W_ft - W_base
 
-            # Если веса не изменились - пропускаем
-            if torch.allclose(delta_W, torch.zeros_like(delta_W), atol=1e-6):
-                continue
-
-            # M = ΔW * (r / alpha)
+            if torch.allclose(delta_W, torch.zeros_like(delta_W), atol=1e-6): continue
             M = delta_W * scale_factor
 
-            try:
-                U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-            except Exception as e:
-                print(f"Error during SVD for {key}: {e}. Falling back to CPU.")
-                M_cpu = M.cpu()
-                U, S, Vh = torch.linalg.svd(M_cpu, full_matrices=False)
+            try: U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+            except Exception:
+                U, S, Vh = torch.linalg.svd(M.cpu(), full_matrices=False)
                 U, S, Vh = U.to(device), S.to(device), Vh.to(device)
 
             target_rank = min(rank, len(S))
             if dynamic_method == "sv_ratio":
-                threshold = S[0] * dynamic_param
-                keep_indices = torch.nonzero(S >= threshold).flatten()
+                keep_indices = torch.nonzero(S >= S[0] * dynamic_param).flatten()
                 target_rank = keep_indices[-1].item() + 1 if len(keep_indices) > 0 else 1
             elif dynamic_method == "sv_fro":
                 S_sq = S.pow(2)
-                sum_S_sq = torch.sum(S_sq)
-                cumulative_S_sq = torch.cumsum(S_sq, dim=0)
-                threshold = dynamic_param * sum_S_sq
-                keep_indices = torch.nonzero(cumulative_S_sq >= threshold).flatten()
+                keep_indices = torch.nonzero(torch.cumsum(S_sq, dim=0) >= dynamic_param * torch.sum(S_sq)).flatten()
                 target_rank = keep_indices[0].item() + 1 if len(keep_indices) > 0 else len(S)
 
             target_rank = min(target_rank, rank, len(S))
-
-            # Формируем имя слоя для паттерна рангов
             layer_name = key.replace("decoder.", "").replace(".weight", "")
-            if dynamic_method in ["sv_fro", "sv_ratio"]:
-                rank_pattern[layer_name] = target_rank
+            if dynamic_method in ["sv_fro", "sv_ratio"]: rank_pattern[layer_name] = target_rank
 
-            U_r = U[:, :target_rank]
-            S_r = S[:target_rank]
-            Vh_r = Vh[:target_rank, :]
+            U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
 
             new_B = U_r @ torch.diag(sqrt_S)
             new_A = torch.diag(sqrt_S) @ Vh_r
 
-            # Конвертируем ключи в формат PEFT, чтобы их понял генератор
-            # 'decoder.layers.0...' -> 'base_model.model.layers.0...lora_A.weight'
             lora_base = key.replace("decoder.", "base_model.model.").replace(".weight", "")
-            lora_A_key = lora_base + ".lora_A.weight"
-            lora_B_key = lora_base + ".lora_B.weight"
-
-            new_state_dict[lora_A_key] = new_A.to(save_dtype).cpu()
-            new_state_dict[lora_B_key] = new_B.to(save_dtype).cpu()
-
-            del W_base, W_ft, delta_W, M, U, S, Vh, U_r, S_r, Vh_r, sqrt_S, new_A, new_B
+            new_state_dict[lora_base + ".lora_A.weight"] = new_A.to(save_dtype).cpu()
+            new_state_dict[lora_base + ".lora_B.weight"] = new_B.to(save_dtype).cpu()
 
         os.makedirs(out_path, exist_ok=True)
-        
         config = {
-            "r": rank,
-            "lora_alpha": alpha,
-            "lora_dropout": 0.0,
-            "target_modules": targets,
-            "bias": "none",
-            "task_type": "FEATURE_EXTRACTION"
+            "r": rank, "lora_alpha": alpha, "lora_dropout": 0.0,
+            "target_modules": targets, "bias": "none", "task_type": "FEATURE_EXTRACTION"
         }
         
         if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
@@ -2389,21 +2060,15 @@ class ACEStepLoRAExtractor:
             config["alpha_pattern"] = rank_pattern 
             config["r"] = max(rank_pattern.values()) if rank_pattern else rank
             config["lora_alpha"] = config["r"]
-            avg_rank = sum(rank_pattern.values()) / len(rank_pattern) if rank_pattern else rank
-            print(f"📊 Extracted with dynamic rank. Avg Rank: {avg_rank:.2f}")
 
-        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f:
-            json.dump(config, f, indent=2)
-
+        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f: json.dump(config, f, indent=2)
         save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
 
         print(f"✅ Extraction complete! Saved to {out_path}")
         mm.soft_empty_cache()
         return (out_path,)
     
-# ======================================================================
-# REGISTRATION
-# ======================================================================
+
 NODE_CLASS_MAPPINGS = {
     "ACEStepDatasetConfig": ACEStepDatasetConfig,
     "ACEStepModelConfig": ACEStepModelConfig,
