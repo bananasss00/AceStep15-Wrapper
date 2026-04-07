@@ -69,7 +69,6 @@ def bypass_safe_path(user_path, base=None):
         root = os.path.normpath(os.path.abspath(base))
     else:
         root = os.path.normpath(os.path.abspath(os.getcwd()))
-        
     if os.path.isabs(user_path):
         return os.path.normpath(user_path)
     else:
@@ -111,8 +110,7 @@ class BlockSwapManager:
         visited = set()
         while queue:
             current = queue.pop(0)
-            if id(current) in visited:
-                continue
+            if id(current) in visited: continue
             visited.add(id(current))
             for target in search_targets:
                 if hasattr(current, target):
@@ -125,29 +123,23 @@ class BlockSwapManager:
 
     def apply(self, offload_ratio: float = 1.0):
         layers = self._find_transformer_layers()
-        if not layers:
-            print("⚠️ [BlockSwap] Could not find transformer layers. Skipping.")
-            return
-
+        if not layers: return
         total_layers = len(layers)
         num_to_swap = int(total_layers * offload_ratio)
-        if num_to_swap == 0:
-            return
+        if num_to_swap == 0: return
 
-        print(f"🔄 [BlockSwap] FAST Optimization enabled. Offloading {num_to_swap}/{total_layers} layers to {self.offload_device} (Pinned Memory + Async).")
+        print(f"🔄 [BlockSwap] Offloading {num_to_swap}/{total_layers} layers to {self.offload_device}.")
 
         for i in range(num_to_swap):
             layer = layers[i]
             layer_id = id(layer)
             self.pinned_cpu_state[layer_id] = {}
-            
             layer.to("cpu")
             for name, param in layer.named_parameters():
                 pinned_t = torch.empty_like(param.data, pin_memory=True)
                 pinned_t.copy_(param.data)
                 param.data = pinned_t
                 self.pinned_cpu_state[layer_id][name] = pinned_t
-                
             for name, buf in layer.named_buffers():
                 pinned_t = torch.empty_like(buf.data, pin_memory=True)
                 pinned_t.copy_(buf.data)
@@ -177,9 +169,7 @@ class BlockSwapManager:
                 if is_backward and param.grad is not None:
                     grad_name = f"{name}_grad"
                     if grad_name not in self.pinned_cpu_state[layer_id]:
-                        self.pinned_cpu_state[layer_id][grad_name] = torch.empty_like(
-                            param.grad.data, device="cpu", pin_memory=True
-                        )
+                        self.pinned_cpu_state[layer_id][grad_name] = torch.empty_like(param.grad.data, device="cpu", pin_memory=True)
                     cpu_grad = self.pinned_cpu_state[layer_id][grad_name]
                     cpu_grad.copy_(param.grad.data, non_blocking=True)
                     param.grad.data = cpu_grad
@@ -288,7 +278,7 @@ def _save_complete_model(trained_model_state, output_dir, source_model_dir, vari
 
 
 class FullFinetuneModuleV2(torch.nn.Module):
-    def __init__(self, model, training_config, device, precision, train_encoders=False, train_null_emb=True):
+    def __init__(self, model, training_config, device, precision, encoder_train_mode="none", train_null_emb=True):
         super().__init__()
         self.training_config = training_config
         self.device = device
@@ -300,7 +290,7 @@ class FullFinetuneModuleV2(torch.nn.Module):
         self.timestep_sigma = getattr(model.config, 'timestep_sigma', 1.0)
         self.data_proportion = getattr(model.config, 'data_proportion', 0.5)
         self.cfg_ratio = getattr(training_config, "cfg_ratio", 0.15)
-        self.train_encoders = train_encoders
+        self.encoder_train_mode = encoder_train_mode
         
         if hasattr(model, "null_condition_emb"):
             self._null_cond_emb = model.null_condition_emb
@@ -310,13 +300,24 @@ class FullFinetuneModuleV2(torch.nn.Module):
         self.model = model 
         self.force_input_grads_for_checkpointing = False
 
+        # Разморозка DiT Декодера (Основная часть)
         for param in self.model.decoder.parameters():
             param.requires_grad = True
             
-        if self.train_encoders and hasattr(self.model, "encoder") and self.model.encoder is not None:
-            for param in self.model.encoder.parameters():
-                param.requires_grad = True
-                
+        # Умная разморозка Энкодеров
+        if self.encoder_train_mode != "none" and hasattr(self.model, "encoder") and self.model.encoder is not None:
+            if self.encoder_train_mode == "all":
+                # ВНИМАНИЕ: Жрет огромное количество памяти.
+                for param in self.model.encoder.parameters():
+                    param.requires_grad = True
+            elif self.encoder_train_mode == "projectors_only":
+                # Размораживаем ТОЛЬКО проекционные слои (minimal VRAM footprint)
+                for param in self.model.encoder.parameters():
+                    param.requires_grad = False
+                for name, param in self.model.encoder.named_parameters():
+                    if "projector" in name or "projection" in name:
+                        param.requires_grad = True
+                        
         if train_null_emb and self._null_cond_emb is not None:
             self._null_cond_emb.requires_grad = True
 
@@ -327,7 +328,7 @@ class FullFinetuneModuleV2(torch.nn.Module):
                 elif hasattr(self.model.decoder, "gradient_checkpointing"):
                     self.model.decoder.gradient_checkpointing = True
                     
-                if self.train_encoders and hasattr(self.model.encoder, "gradient_checkpointing_enable"):
+                if self.encoder_train_mode != "none" and hasattr(self.model.encoder, "gradient_checkpointing_enable"):
                     self.model.encoder.gradient_checkpointing_enable()
             except: pass
 
@@ -345,7 +346,8 @@ class FullFinetuneModuleV2(torch.nn.Module):
             context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
             bsz = target_latents.shape[0]
 
-            if self.train_encoders and "text_hidden_states" in batch and batch["text_hidden_states"].dim() > 1:
+            # Если мы обучаем энкодер (или его проекторы), нам нужно прогнать сырые тексты через него
+            if self.encoder_train_mode != "none" and "text_hidden_states" in batch and batch["text_hidden_states"].dim() > 1:
                 ths = batch["text_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
                 tmask = batch["text_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
                 lhs = batch["lyric_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
@@ -363,10 +365,12 @@ class FullFinetuneModuleV2(torch.nn.Module):
                     refer_audio_order_mask=ra_mask
                 )
             else:
+                # Если энкодер заморожен, используем закэшированные в датасете препроцессированные состояния
                 encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
                 encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-                if self.train_encoders:
-                    print("⚠️ WARNING: Preprocessed dataset missing text/lyric tensors! Encoders skipped. Reprocess the dataset.")
+                
+                if self.encoder_train_mode != "none":
+                    print("⚠️ WARNING: Preprocessed dataset missing raw text/lyric tensors! Encoders skipped. Reprocess the dataset.")
 
             if self._null_cond_emb is not None and self.cfg_ratio > 0.0:
                 encoder_hidden_states = apply_cfg_dropout(
@@ -1208,9 +1212,7 @@ class ACEStepTrainer:
                     reg_ds = dm_module.PreprocessedTensorDataset(reg_tensor_dir)
                     class BalancedWrapper(torch.utils.data.Dataset):
                         def __init__(self, m_ds, r_ds):
-                            self.m_ds = m_ds
-                            self.r_ds = r_ds
-                            self.target_len = max(len(m_ds), len(r_ds))
+                            self.m_ds = m_ds; self.r_ds = r_ds; self.target_len = max(len(m_ds), len(r_ds))
                         def __len__(self): return self.target_len * 2
                         def __getitem__(self, idx):
                             if idx % 2 == 0: return self.m_ds[(idx // 2) % len(self.m_ds)]
@@ -1318,6 +1320,7 @@ class ACEStepTrainer:
             mm.soft_empty_cache()
             return (output_dir,)
 
+
 class ACEStepFinetuneTrainer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1332,7 +1335,7 @@ class ACEStepFinetuneTrainer:
                 "offload_enc": ("BOOLEAN", {"default": False}),
                 "vram_cleanup": ("BOOLEAN", {"default": True}),
                 "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving."}),
-                "train_encoders": ("BOOLEAN", {"default": False, "tooltip": "Train Condition/Lyric/Timbre Encoders"}),
+                "encoder_train_mode": (["none", "projectors_only", "all"], {"default": "none", "tooltip": "none=frozen, projectors_only=low VRAM impact, all=OOM on 16GB unless adamw8bit"}),
                 "train_null_emb": ("BOOLEAN", {"default": True, "tooltip": "Train null_condition_emb (CFG)"}),
             },
             "optional": {
@@ -1423,7 +1426,7 @@ class ACEStepFinetuneTrainer:
             except Exception as e: print(f"⚠️ Failed to save graph to disk: {e}")
         fig.clf()
 
-    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False, train_encoders=False):
+    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False, encoder_train_mode="none"):
         if not preview_config.get("gen_preview", False): return
             
         print(f"[LOG] 🎵 Generating preview (Step: {step})...")
@@ -1584,7 +1587,7 @@ class ACEStepFinetuneTrainer:
             model.to(device)
             if offload_enc or vram_cleanup:
                 to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer"]
-                if not train_encoders:
+                if encoder_train_mode == "none":
                     to_kill.extend(["music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"])
                 
                 for attr in to_kill:
@@ -1594,17 +1597,18 @@ class ACEStepFinetuneTrainer:
                     if hasattr(model, "encoder") and hasattr(model.encoder, attr):
                         m = getattr(model.encoder, attr)
                         if m is not None: setattr(model.encoder, attr, m.to("cpu"))
-                if not train_encoders and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                        
+                if encoder_train_mode == "none" and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
                     model.encoder.text_projector.to("cpu")
 
-                if offload_enc and not train_encoders and hasattr(model, "encoder") and model.encoder is not None:
+                if offload_enc and encoder_train_mode == "none" and hasattr(model, "encoder") and model.encoder is not None:
                     model.encoder.to("cpu")
 
             model.train()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, train_encoders, train_null_emb, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, encoder_train_mode, train_null_emb, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1620,9 +1624,12 @@ class ACEStepFinetuneTrainer:
             reg_weight = dataset_config.get("reg_weight", 1.0)
             CURRENT_REG_WEIGHT = reg_weight
 
-            if train_encoders:
+            if encoder_train_mode != "none":
                 offload_enc = False
-                print("⚠️ Note: train_encoders is True. Condition/Lyric Encoders will NOT be offloaded.")
+                print(f"⚠️ Note: encoder_train_mode is '{encoder_train_mode}'. Encoders will NOT be offloaded.")
+                if encoder_train_mode == "all" and optimizer_config["optimizer"] == "adamw":
+                    print("⚠️ DANGER: You are training ALL encoder layers with standard AdamW!")
+                    print("⚠️ Expect OOM on 16GB GPU. Use AdamW8bit or Adafactor, or set to 'projectors_only'.")
 
             os.makedirs(output_dir, exist_ok=True)
             if extra_pnginfo and "workflow" in extra_pnginfo:
@@ -1729,7 +1736,7 @@ class ACEStepFinetuneTrainer:
             if vram_cleanup or offload_enc:
                 print(f"🧹[System] Optimizing VRAM Usage (Cleanup/Offload)...")
                 to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer"]
-                if not train_encoders:
+                if encoder_train_mode == "none":
                     to_kill.extend(["music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"])
                 
                 for attr in to_kill:
@@ -1739,10 +1746,11 @@ class ACEStepFinetuneTrainer:
                     if hasattr(model, "encoder") and hasattr(model.encoder, attr):
                         m = getattr(model.encoder, attr)
                         if m is not None: setattr(model.encoder, attr, m.to("cpu"))
-                if not train_encoders and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
+                        
+                if encoder_train_mode == "none" and hasattr(model, "encoder") and hasattr(model.encoder, "text_projector"):
                     model.encoder.text_projector.to("cpu")
 
-                if offload_enc and not train_encoders and hasattr(model, "encoder") and model.encoder is not None:
+                if offload_enc and encoder_train_mode == "none" and hasattr(model, "encoder") and model.encoder is not None:
                     print(f"🧹[System] Full Encoder offload enabled. Moving to CPU.")
                     model.encoder.to("cpu")
 
@@ -1768,7 +1776,7 @@ class ACEStepFinetuneTrainer:
                 block_swap = BlockSwapManager(model.decoder, device=device, offload_device="cpu")
                 block_swap.apply(offload_ratio=block_swap_ratio)
 
-            module = FullFinetuneModuleV2(model, training_cfg, device, precision, train_encoders, train_null_emb)
+            module = FullFinetuneModuleV2(model, training_cfg, device, precision, encoder_train_mode, train_null_emb)
             trainable_params = [p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
@@ -1934,7 +1942,7 @@ class ACEStepFinetuneTrainer:
                         print(f"💾 Checkpoint saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
-                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, train_encoders)
+                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
 
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
