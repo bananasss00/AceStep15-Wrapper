@@ -1712,6 +1712,8 @@ class ACEStepFinetuneTrainer:
                 gradient_accumulation_steps=dataset_config["grad_accum"],
                 max_epochs=dataset_config["epochs"],
                 save_every_n_epochs=dataset_config["save_every"],
+                save_start_epoch=dataset_config["save_start"],          # <-- ДОБАВЛЕНО
+                save_loss_threshold=dataset_config["save_loss_limit"],  # <-- ДОБАВЛЕНО
                 weight_decay=optimizer_config["weight_decay"],
                 max_grad_norm=optimizer_config["max_grad_norm"],
                 gradient_checkpointing=grad_ckpt,
@@ -1932,7 +1934,20 @@ class ACEStepFinetuneTrainer:
 
                     if mm.processing_interrupted(): break
 
-                    if (epoch + 1) % training_cfg.save_every_n_epochs == 0:
+                    # ==== ЛОГИКА SAVE LOSS THRESHOLD И СТАРТОВОЙ ЭПОХИ ====
+                    should_save = (epoch + 1) % training_cfg.save_every_n_epochs == 0
+                    
+                    if should_save and (epoch + 1) < training_cfg.save_start_epoch:
+                        should_save = False
+                        
+                    if should_save and training_cfg.save_loss_threshold > 0.0:
+                        avg_epoch_loss = epoch_loss / max(num_updates, 1)
+                        loss_to_check = ema_loss if ema_loss is not None else avg_epoch_loss
+                        if loss_to_check >= training_cfg.save_loss_threshold:
+                            should_save = False
+                            print(f"⏭️ Checkpoint skipped at epoch {epoch+1}: EMA Loss ({loss_to_check:.4f}) >= Limit ({training_cfg.save_loss_threshold:.4f})")
+
+                    if should_save:
                         ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
                         _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant)
                         if epoch_history:
