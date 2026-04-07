@@ -936,7 +936,10 @@ class ACEStepLoRAResize:
             new_state_dict[f"{base_key}lora_A.weight"] = (torch.diag(sqrt_S) @ Vh_r).to(save_dtype).cpu()
             new_state_dict[f"{base_key}lora_B.weight"] = (U_r @ torch.diag(sqrt_S)).to(save_dtype).cpu()
             
+        import copy
         new_config = copy.deepcopy(config)
+        new_config["peft_type"] = "LORA" # ФИКС: Гарантируем наличие этого ключа для PEFT
+        
         if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
             new_config["alpha_pattern"] = rank_pattern 
@@ -2032,6 +2035,7 @@ class ACEStepLoRAExtractor:
         scale_factor = rank / alpha if alpha > 0 else 1.0
         valid_keys = [k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
 
+        from comfy.utils import ProgressBar
         pbar = ProgressBar(len(valid_keys))
         print(f"🚀 Extracting {len(valid_keys)} layers...")
 
@@ -2073,9 +2077,18 @@ class ACEStepLoRAExtractor:
             new_state_dict[lora_base + ".lora_B.weight"] = new_B.to(save_dtype).cpu()
 
         os.makedirs(out_path, exist_ok=True)
+        
+        # ФИКС: Обязательно указываем peft_type
         config = {
-            "r": rank, "lora_alpha": alpha, "lora_dropout": 0.0,
-            "target_modules": targets, "bias": "none", "task_type": "FEATURE_EXTRACTION"
+            "peft_type": "LORA",
+            "r": rank, 
+            "lora_alpha": alpha, 
+            "lora_dropout": 0.0,
+            "target_modules": targets, 
+            "bias": "none", 
+            "task_type": "FEATURE_EXTRACTION",
+            "rank_pattern": {},
+            "alpha_pattern": {}
         }
         
         if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
@@ -2083,8 +2096,12 @@ class ACEStepLoRAExtractor:
             config["alpha_pattern"] = rank_pattern 
             config["r"] = max(rank_pattern.values()) if rank_pattern else rank
             config["lora_alpha"] = config["r"]
+            avg_rank = sum(rank_pattern.values()) / len(rank_pattern) if rank_pattern else rank
+            print(f"📊 Extracted with dynamic rank. Avg Rank: {avg_rank:.2f}")
 
-        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f: json.dump(config, f, indent=2)
+        with open(os.path.join(out_path, "adapter_config.json"), 'w') as f: 
+            json.dump(config, f, indent=2)
+            
         save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
 
         print(f"✅ Extraction complete! Saved to {out_path}")
