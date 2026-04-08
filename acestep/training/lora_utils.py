@@ -162,6 +162,7 @@ def inject_lora_into_dit(
         target_modules=lora_config.target_modules,
         bias=lora_config.bias,
         task_type=TaskType.FEATURE_EXTRACTION,  # For diffusion models
+        use_dora=getattr(lora_config, "use_dora", True)
     )
     
     # Apply LoRA to the decoder

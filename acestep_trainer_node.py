@@ -146,144 +146,145 @@ def stochastic_rounding(value, dtype, seed=0):
         
     return value.to(dtype=dtype)
 
-def apply_quantization_base_model(model, compute_dtype, quant_type="fp8", seed=42):
+class DequantizeNF4Linear(torch.autograd.Function):
     """
-    Scans the model for nn.Linear. If the layer is frozen (requires_grad=False),
-    quantizes its weights to FP8/FP4 with stochastic rounding and patches 
-    the forward method to JIT-upcast to compute_dtype for compatibility.
+    Кастомный Autograd для распаковки NF4 на лету. 
+    Математически точное применение скейлов к правильным размерностям.
+    """
+    @staticmethod
+    def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut):
+        # Быстрая распаковка 4 бита -> 8 бит
+        w_flat = weight_packed.view(torch.uint8)
+        high = (w_flat >> 4).long()
+        low = (w_flat & 0x0F).long()
+        
+        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=x.device)
+        unpacked[0::2] = high
+        unpacked[1::2] = low
+        
+        # Восстанавливаем геометрию: [Out, Blocks, 64]
+        padded_in_features = unpacked.shape[0] // orig_shape[0]
+        blocks_per_row = padded_in_features // group_size
+        
+        # Де-квантование через LUT
+        w_dequant = lut[unpacked].view(orig_shape[0], blocks_per_row, group_size)
+        
+        # Умножаем на скейлы (scales имеет форму [Out, Blocks, 1]) и склеиваем в 2D
+        w_dequant = (w_dequant * scales).view(orig_shape[0], padded_in_features)
+        
+        # Обрезаем паддинг, если он был
+        if padded_in_features > orig_shape[1]:
+            w_dequant = w_dequant[:, :orig_shape[1]]
+            
+        w_dequant = w_dequant.to(x.dtype)
+        
+        ctx.save_for_backward(x, w_dequant)
+        ctx.use_bias = bias is not None
+        
+        return F.linear(x, w_dequant, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, w_dequant = ctx.saved_tensors
+        grad_input = grad_weight = grad_scales = grad_bias = None
+        
+        # Градиент только для входа (x), база остается замороженной
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.matmul(w_dequant)
+            
+        return grad_input, None, None, None, None, None, None
+
+
+def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=42):
+    """
+    OOM-Safe квантование в NF4 с обработкой по чанкам (экономит гигабайты VRAM).
     """
     if quant_type == "none":
         return
 
-    if quant_type == "fp8" and not hasattr(torch, "float8_e4m3fn"):
-        print("⚠️ [Quantization] Your PyTorch version does not support float8_e4m3fn. Skipping.")
-        return
-
-    print(f"🪄 [Quantization] Quantizing frozen layers to {quant_type.upper()} (Stochastic Rounding)...")
+    print(f"🪄 [Future Quantization] Quantizing frozen layers to NF4 (Block-64, OOM-Safe)...")
     converted_count = 0
-    
-    # Detect native FP4 (PyTorch 2.9+) or float.py's packed UINT8 FP4
-    has_native_fp4 = hasattr(torch, "float4_e2m1fn")
-    try:
-        import comfy.float as float_utils
-        has_float_py_fp4 = hasattr(float_utils, "stochastic_round_quantize_nvfp4_block")
-    except ImportError:
-        has_float_py_fp4 = False
+    group_size = 64
 
-    if quant_type == "fp4" and not has_native_fp4 and not has_float_py_fp4:
-        print("⚠️ [Quantization] Native FP4 not found and float.py missing. Falling back to FP8.")
-        quant_type = "fp8"
+    # Идеальные квантили нормального распределения (NF4)
+    NF4_LUT = torch.tensor([
+        -1.0, -0.6961928, -0.52507305, -0.39491749,
+        -0.28444138, -0.18477343, -0.091050036, 0.0,
+        0.07958029, 0.1609302, 0.2461123, 0.33791524,
+        0.44070983, 0.562617, 0.72295684, 1.0
+    ], dtype=compute_dtype)
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and not module.weight.requires_grad:
+            orig_shape = module.weight.shape
+            device = module.weight.device
             
-            # ================== FP8 ==================
-            if quant_type == "fp8":
-                fp8_weight = stochastic_rounding(module.weight.data, torch.float8_e4m3fn, seed=seed)
-                module.weight = nn.Parameter(fp8_weight, requires_grad=False)
+            # Паддинг для кратности 64
+            pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
+            w_padded = module.weight.data.float() # Работаем в fp32 для точности
+            if pad_len > 0:
+                w_padded = F.pad(w_padded, (0, pad_len))
                 
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(compute_dtype)
-                
-                def patch_forward_fp8(mod):
-                    def forward(x):
-                        w = mod.weight.to(x.dtype)
-                        return F.linear(x, w, mod.bias)
-                    return forward
-                
-                module.forward = patch_forward_fp8(module)
-                converted_count += 1
+            w_grouped = w_padded.view(orig_shape[0], -1, group_size)
+            blocks_per_row = w_grouped.shape[1]
             
-            # ================== FP4 ==================
-            elif quant_type == "fp4":
-                if has_native_fp4:
-                    # Native PyTorch 2.9+ FP4
-                    fp4_weight = stochastic_rounding(module.weight.data, torch.float4_e2m1fn, seed=seed)
-                    module.weight = nn.Parameter(fp4_weight, requires_grad=False)
-                    
-                    if module.bias is not None:
-                        module.bias.data = module.bias.data.to(compute_dtype)
-                    
-                    def patch_forward_native_fp4(mod):
-                        def forward(x):
-                            w = mod.weight.to(x.dtype)
-                            return F.linear(x, w, mod.bias)
-                        return forward
-                    
-                    module.forward = patch_forward_native_fp4(module)
-                    converted_count += 1
-                    
-                elif has_float_py_fp4:
-                    # Packed UINT8 FP4 from float.py (CUDA/Fast Unpacking via LUT)
-                    import comfy.float as float_utils
-                    
-                    orig_shape = module.weight.shape
-                    block_size = 16
-                    pad_len = (block_size - (orig_shape[1] % block_size)) % block_size
-                    
-                    w_padded = module.weight.data
-                    if pad_len > 0:
-                        w_padded = F.pad(w_padded, (0, pad_len))
-                        
-                    generator = torch.Generator(device=w_padded.device)
-                    generator.manual_seed(seed)
-                    
-                    F4_MAX = 6.0
-                    F8_MAX = 448.0
-                    per_tensor_scale = (torch.amax(torch.abs(w_padded)) / F4_MAX / F8_MAX).clamp(min=1e-12)
-                    
-                    # Generate packed data via float.py
-                    fp4_packed, block_scales_fp8 = float_utils.stochastic_round_quantize_nvfp4_block(
-                        w_padded, per_tensor_scale, generator
+            # Предварительное выделение памяти, чтобы избежать фрагментации
+            scales = torch.empty((orig_shape[0], blocks_per_row, 1), dtype=compute_dtype, device=device)
+            quantized_indices = torch.empty((orig_shape[0], blocks_per_row, group_size), dtype=torch.uint8, device=device)
+            
+            # === ФИКС OOM: ОБРАБОТКА ПО ЧАНКАМ ===
+            # Разбиваем 4096+ строк на блоки по 128 строк. Максимальный жор VRAM ~35 Мегабайт!
+            CHUNK_SIZE = 128
+            lut_device = NF4_LUT.to(device).view(1, 1, 1, 16)
+            
+            for i in range(0, orig_shape[0], CHUNK_SIZE):
+                end_i = min(i + CHUNK_SIZE, orig_shape[0])
+                w_chunk = w_grouped[i:end_i] # [Chunk, Blocks, 64]
+                
+                # Ищем максимум в каждом блоке по 64
+                chunk_scales = w_chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                scales[i:end_i] = chunk_scales.to(compute_dtype)
+                
+                w_norm = w_chunk / chunk_scales
+                
+                # Бродкастинг теперь безопасен (маленький размер)
+                distances = torch.abs(w_norm.unsqueeze(-1) - lut_device)
+                quantized_indices[i:end_i] = torch.argmin(distances, dim=-1).to(torch.uint8)
+            # =====================================
+
+            # Упаковка 2x4-бит -> 1x8-бит (экономим 50% веса)
+            flat_indices = quantized_indices.view(-1)
+            high = flat_indices[0::2] << 4
+            low = flat_indices[1::2]
+            packed_weights = (high | low).contiguous()
+            
+            # Назначаем параметры
+            module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
+            module.scales = nn.Parameter(scales, requires_grad=False) # Уже имеет форму [Out, Blocks, 1]
+            module.register_buffer("nf4_lut", NF4_LUT.to(device))
+            module.orig_shape = orig_shape
+            module.group_size = group_size
+            
+            if module.bias is not None:
+                module.bias.data = module.bias.data.to(compute_dtype)
+                
+            # Очищаем оригинальную толстую матрицу
+            del module.weight 
+            
+            # Патчим forward
+            def patch_forward(mod):
+                def forward(x):
+                    return DequantizeNF4Linear.apply(
+                        x, mod.weight_packed, mod.scales, mod.bias, 
+                        mod.orig_shape, mod.group_size, mod.nf4_lut
                     )
-                    
-                    # Store as buffers/parameters
-                    module.fp4_packed = nn.Parameter(fp4_packed, requires_grad=False)
-                    module.block_scales_fp8 = nn.Parameter(block_scales_fp8, requires_grad=False)
-                    module.per_tensor_scale = per_tensor_scale
-                    module.orig_shape = orig_shape
-                    module.pad_len = pad_len
-                    
-                    if module.bias is not None:
-                        module.bias.data = module.bias.data.to(compute_dtype)
-                        
-                    del module.weight # Free VRAM
-                    
-                    def patch_forward_packed_fp4(mod):
-                        # E2M1 LUT (Lookup Table) for lightning-fast unpacking on GPU
-                        LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 
-                                          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
-                        
-                        def forward(x):
-                            device = mod.fp4_packed.device
-                            lut = LUT.to(device=device, dtype=x.dtype)
-                            
-                            # Bitwise unpacking
-                            fp4_flat = mod.fp4_packed.view(-1)
-                            high = fp4_flat >> 4
-                            low = fp4_flat & 0x0F
-                            
-                            unpacked = torch.empty((fp4_flat.shape[0] * 2,), dtype=torch.long, device=device)
-                            unpacked[0::2] = high
-                            unpacked[1::2] = low
-                            
-                            # Apply LUT and re-shape
-                            w_norm = lut[unpacked].view(mod.orig_shape[0], -1, 16)
-                            
-                            # Apply scales
-                            scales = (mod.block_scales_fp8.to(x.dtype) * mod.per_tensor_scale.to(x.dtype)).unsqueeze(-1)
-                            w_dequant = (w_norm * scales).view(mod.orig_shape[0], -1)
-                            
-                            if mod.pad_len > 0:
-                                w_dequant = w_dequant[:, :-mod.pad_len]
-                                
-                            return F.linear(x, w_dequant, mod.bias)
-                        return forward
-                    
-                    module.forward = patch_forward_packed_fp4(module)
-                    converted_count += 1
-                    
-    print(f"✅ [Quantization] Successfully converted {converted_count} Linear layers to {quant_type.upper()}.")
+                return forward
+                
+            module.forward = patch_forward(module)
+            converted_count += 1
+            
+    print(f"✅ [Future Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
+    import gc; gc.collect(); torch.cuda.empty_cache()
 
 # ======================================================================
 # BLOCKSWAP MANAGER
@@ -730,6 +731,7 @@ class ACEStepModelConfig:
                 "inf_steps": ("INT", {"default": 8, "min": 1}),
                 "shift": ("FLOAT", {"default": 3.0, "min": 0.0, "step": 0.1}),
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "use_dora": ("BOOLEAN", {"default": True, "tooltip": "Критично для FP4. Отделяет обучение магнитуды вектора от направления."}),
             }
         }
     RETURN_TYPES = ("ACESTEP_MODEL",)
@@ -1366,7 +1368,8 @@ class ACEStepTrainer:
             else:
                 adapter_cfg = LoRAConfigV2(
                     r=model_config["rank"], alpha=model_config["alpha"], dropout=model_config["dropout"], 
-                    target_modules=resolved_modules, bias=model_config["bias"], attention_type=model_config["attn_type"]
+                    target_modules=resolved_modules, bias=model_config["bias"], attention_type=model_config["attn_type"],
+                    use_dora=model_config.get("use_dora", True)
                 )
 
             prev_cfg = preview_config if preview_config is not None else {}
@@ -2044,6 +2047,12 @@ class ACEStepFinetuneTrainer:
             train_loader = data_module.train_dataloader()
 
             from acestep.training_v2.optim import build_optimizer, build_scheduler
+
+            # Защита от квантизационного шума
+            if base_quantization in ["fp4", "fp8"]:
+                training_cfg.optimizer_kwargs["eps"] = 1e-6
+                training_cfg.max_grad_norm = 0.5 # Более жесткий клиппинг
+
             optimizer = build_optimizer(
                 params=trainable_params, optimizer_type=training_cfg.optimizer_type,
                 lr=training_cfg.learning_rate, weight_decay=training_cfg.weight_decay,
