@@ -423,7 +423,7 @@ class BlockSwapManager:
 # ======================================================================
 CURRENT_REG_WEIGHT = 1.0
 
-def _save_complete_model(trained_model_state, output_dir, source_model_dir, variant="turbo"):
+def _save_complete_model(trained_model_state, output_dir, source_model_dir, variant="turbo", extra_pnginfo=None, prompt_info=None):
     os.makedirs(output_dir, exist_ok=True)
     try:
         from safetensors.torch import load_file as st_load, save_file as st_save
@@ -456,8 +456,22 @@ def _save_complete_model(trained_model_state, output_dir, source_model_dir, vari
             else:
                 merged_state[orig_key] = orig_val
 
+        # Встраивание Workflow и Prompt от ComfyUI
+        metadata = {"format": "pt"}
+        if extra_pnginfo and "workflow" in extra_pnginfo:
+            metadata["workflow"] = json.dumps(extra_pnginfo["workflow"])
+            # Также сохраняем отдельным файлом в папку для наглядности
+            try:
+                with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
+                    json.dump(extra_pnginfo["workflow"], f, indent=2)
+            except Exception as e:
+                print(f"⚠️ Failed to save workflow.json: {e}")
+                
+        if prompt_info:
+            metadata["prompt"] = json.dumps(prompt_info)
+
         print(f"✅ Успешно обновлено {merged_count} слоёв. Сохранение в {output_dir}...")
-        st_save(merged_state, os.path.join(output_dir, "model.safetensors"))
+        st_save(merged_state, os.path.join(output_dir, "model.safetensors"), metadata=metadata)
         
         src_silence = os.path.join(source_model_dir, "silence_latent.pt")
         if os.path.exists(src_silence):
@@ -1921,8 +1935,8 @@ class ACEStepFinetuneTrainer:
                 gradient_accumulation_steps=dataset_config["grad_accum"],
                 max_epochs=dataset_config["epochs"],
                 save_every_n_epochs=dataset_config["save_every"],
-                save_start_epoch=dataset_config["save_start"],          # <-- ДОБАВЛЕНО
-                save_loss_threshold=dataset_config["save_loss_limit"],  # <-- ДОБАВЛЕНО
+                save_start_epoch=dataset_config["save_start"],
+                save_loss_threshold=dataset_config["save_loss_limit"],
                 weight_decay=optimizer_config["weight_decay"],
                 max_grad_norm=optimizer_config["max_grad_norm"],
                 gradient_checkpointing=grad_ckpt,
@@ -1989,9 +2003,10 @@ class ACEStepFinetuneTrainer:
 
             module = FullFinetuneModuleV2(model, training_cfg, device, precision, encoder_train_mode, train_null_emb)
             
+            # Применение FP4/FP8 Quantization для замороженных базовых слоев (если вы включили эту фичу)
             target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
             apply_quantization_base_model(module.model, target_dtype, base_quantization, seed)
-            
+
             trainable_params = [p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
@@ -2049,11 +2064,62 @@ class ACEStepFinetuneTrainer:
                 lr=training_cfg.learning_rate, optimizer_type=training_cfg.optimizer_type
             )
 
-            pbar = ProgressBar(total_steps_approx)
-            start_time = time.time()
-
+            # Переменные истории обучения
             epoch_history, loss_history, ema_history, lr_history = [], [], [], []
             ema_loss, ema_alpha, saved_epochs = None, 0.1, []
+            
+            # ==============================================================
+            # БЛОК RESUME: ЗАГРУЗКА STATE И ВЕСОВ
+            # ==============================================================
+            start_epoch = 0
+            global_step = 0
+            resume_from = dataset_config.get("resume_from", "").strip('"')
+
+            if resume_from and os.path.exists(resume_from):
+                print(f"\n🔄 [Resume] Загрузка чекпоинта файнтюна из {resume_from}...")
+                model_path = os.path.join(resume_from, "model.safetensors")
+                state_path = os.path.join(resume_from, "training_state.pt")
+                
+                # Загрузка весов
+                if os.path.exists(model_path):
+                    from safetensors.torch import load_file
+                    state_dict = load_file(model_path)
+                    module.model.load_state_dict(state_dict, strict=False)
+                    print("📦 [Resume] Веса модели загружены.")
+                else:
+                    print("⚠️ [Resume] Файл model.safetensors не найден!")
+
+                # Загрузка состояния (Optim, LRs, Steps, Graphs)
+                if os.path.exists(state_path):
+                    state = torch.load(state_path, map_location="cpu", weights_only=False)
+                    start_epoch = state.get("epoch", 0)
+                    global_step = state.get("global_step", 0)
+                    
+                    if "optimizer_state_dict" in state: 
+                        optimizer.load_state_dict(state["optimizer_state_dict"])
+                        print("⚙️ [Resume] Состояние оптимизатора загружено.")
+                    if "scheduler_state_dict" in state: 
+                        scheduler.load_state_dict(state["scheduler_state_dict"])
+                        print("⏱️ [Resume] Состояние шедулера загружено.")
+                    
+                    # Восстановление графиков
+                    loss_history = state.get("loss_history", loss_history)
+                    ema_history = state.get("ema_history", ema_history)
+                    lr_history = state.get("lr_history", lr_history)
+                    epoch_history = state.get("epoch_history", epoch_history)
+                    saved_epochs = state.get("saved_epochs", saved_epochs)
+                    
+                    if ema_history: ema_loss = ema_history[-1]
+                    print(f"✅ [Resume] Возобновление с Эпохи {start_epoch}, Шага {global_step}")
+                else:
+                    print("⚠️ [Resume] training_state.pt не найден! Начинаем новую эпоху, но со старыми весами.")
+            # ==============================================================
+
+            pbar = ProgressBar(total_steps_approx)
+            # Перематываем pbar до текущего global_step
+            if global_step > 0: pbar.update(global_step)
+            
+            start_time = time.time()
             elapsed_str, eta_str, step_time_str, epoch_time_str = "00:00:00", "00:00:00", "0s/it", "0s/ep"
 
             def fmt_time(secs):
@@ -2061,14 +2127,14 @@ class ACEStepFinetuneTrainer:
                 h, m = divmod(m, 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
 
-            global_step = 0
             accum_step = 0
             accum_loss = 0.0
             optimizer.zero_grad(set_to_none=True)
             module.train()
 
             try:
-                for epoch in range(training_cfg.max_epochs):
+                # ВАЖНО: Цикл теперь начинается с start_epoch
+                for epoch in range(start_epoch, training_cfg.max_epochs):
                     epoch_loss = 0.0
                     num_updates = 0
                     
@@ -2116,7 +2182,7 @@ class ACEStepFinetuneTrainer:
 
                             elapsed = time.time() - start_time
                             if global_step > 0:
-                                time_per_step = elapsed / global_step
+                                time_per_step = elapsed / (global_step - state.get("global_step", 0) if resume_from and 'state' in locals() else global_step)
                                 remaining_steps = total_steps_approx - global_step
                                 eta_secs = remaining_steps * time_per_step
                                 step_time_str = f"{int(time_per_step * 1000)}ms/it" if time_per_step < 1.0 else f"{time_per_step:.2f}s/it"
@@ -2162,12 +2228,30 @@ class ACEStepFinetuneTrainer:
 
                     if should_save:
                         ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
-                        _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant)
+                        
+                        # 1. Сохранение весов (слитых с базой)
+                        _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant, extra_pnginfo, prompt)
+                        
+                        # 2. СОХРАНЕНИЕ РАБОЧЕГО СОСТОЯНИЯ (Для Resume)
+                        state_save = {
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "loss_history": loss_history,
+                            "ema_history": ema_history,
+                            "lr_history": lr_history,
+                            "epoch_history": epoch_history,
+                            "saved_epochs": saved_epochs,
+                        }
+                        torch.save(state_save, os.path.join(ckpt_dir, "training_state.pt"))
+                        
                         if epoch_history:
                             last_ep = epoch_history[-1]
                             if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                 saved_epochs.append(last_ep)
-                        print(f"💾 Checkpoint saved at epoch {epoch+1}")
+                                
+                        print(f"💾 Checkpoint and training state saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
                             self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
@@ -2185,8 +2269,9 @@ class ACEStepFinetuneTrainer:
                     )
                     
                 if dataset_config.get("save_final", True):
-                    print(f"💾 Saving final model weights...")
-                    _save_complete_model(module.model.state_dict(), os.path.join(output_dir, "final"), source_model_dir, model_variant)
+                    print(f"💾 Saving final model weights and workflow...")
+                    final_dir = os.path.join(output_dir, "final")
+                    _save_complete_model(module.model.state_dict(), final_dir, source_model_dir, model_variant, extra_pnginfo, prompt)
                 else: print(f"⏭️ Skipping final save as requested.")
 
             elapsed = time.time() - start_time
