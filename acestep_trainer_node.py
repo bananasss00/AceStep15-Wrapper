@@ -83,6 +83,53 @@ acestep.training.lora_utils.safe_path = bypass_safe_path
 import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
 
+# ======================================================================
+# ПАТЧ: БЛОКИРОВКА СОХРАНЕНИЯ СОСТОЯНИЙ ОПТИМИЗАТОРА (ЭКОНОМИЯ ДИСКА)
+# ======================================================================
+try:
+    import acestep.training_v2.trainer_helpers as th
+    
+    if not hasattr(th, "_original_save_checkpoint"):
+        th._original_save_checkpoint = th.save_checkpoint
+
+        def custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
+            import os
+            import torch
+            
+            # 1. Сохраняем ТОЛЬКО чистые веса (LoRA адаптер или LoKR)
+            th.save_adapter_flat(trainer, ckpt_dir)
+
+            # 2. Проверяем наш флаг из UI
+            save_state = getattr(trainer.training_config, "save_state", True)
+            if not save_state:
+                print(f"💾 Checkpoint saved at epoch {epoch} (training state skipped to save disk I/O)")
+                return
+
+            # 3. Если флаг включен - пишем тяжелые тензоры на диск
+            training_state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            state_path = os.path.join(ckpt_dir, "training_state.pt")
+            torch.save(training_state, state_path)
+
+            try:
+                from safetensors.torch import save_file as _save_safetensors
+                meta_tensors = {
+                    "epoch": torch.tensor([epoch], dtype=torch.int64),
+                    "global_step": torch.tensor([global_step], dtype=torch.int64),
+                }
+                sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
+                _save_safetensors(meta_tensors, sf_path)
+            except Exception: pass
+            print(f"💾 Checkpoint and training state saved at epoch {epoch}")
+
+        th.save_checkpoint = custom_save_checkpoint
+except Exception as e:
+    print(f"⚠️ [ACE-Step] Custom save patch failed: {e}")
+# ======================================================================
 
 # ======================================================================
 # FP8 / FP4 STOCHASTIC ROUNDING & QUANTIZATION UTILS
@@ -1695,62 +1742,6 @@ class ACEStepTrainer:
                                 last_ep = epoch_history[-1]
                                 if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                     saved_epochs.append(last_ep)
-                    try:
-                        from acestep.training_v2.trainer_fixed import FixedLoRATrainer
-                        
-                        # Существующий патч превью...
-                        if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
-                            FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
-                            def custom_generate_preview(self, output_dir, step, device):
-                                orig_dir = self.training_config.dataset_dir
-                                if hasattr(self, "main_tensor_dir"):
-                                    self.training_config.dataset_dir = self.main_tensor_dir
-                                try:
-                                    self._original_generate_preview(output_dir, step, device)
-                                finally:
-                                    self.training_config.dataset_dir = orig_dir
-                            FixedLoRATrainer._generate_preview = custom_generate_preview
-
-                        # НОВЫЙ ПАТЧ: Блокировка записи State на диск
-                        import acestep.training_v2.trainer_helpers as th
-                        if not hasattr(th, "_original_save_checkpoint"):
-                            th._original_save_checkpoint = th.save_checkpoint
-
-                            def custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
-                                # 1. Сохраняем ТОЛЬКО чистые веса (LoRA адаптер или LoKR)
-                                th.save_adapter_flat(trainer, ckpt_dir)
-
-                                # 2. Проверяем наш флаг из UI
-                                save_state = getattr(trainer.training_config, "save_state", True)
-                                if not save_state:
-                                    print(f"💾 Checkpoint saved at epoch {epoch} (training state skipped to save disk I/O)")
-                                    return
-
-                                # 3. Если флаг включен - пишем тяжелые тензоры на диск
-                                training_state = {
-                                    "epoch": epoch,
-                                    "global_step": global_step,
-                                    "optimizer_state_dict": optimizer.state_dict(),
-                                    "scheduler_state_dict": scheduler.state_dict(),
-                                }
-                                state_path = os.path.join(ckpt_dir, "training_state.pt")
-                                torch.save(training_state, state_path)
-
-                                try:
-                                    from safetensors.torch import save_file as _save_safetensors
-                                    meta_tensors = {
-                                        "epoch": torch.tensor([epoch], dtype=torch.int64),
-                                        "global_step": torch.tensor([global_step], dtype=torch.int64),
-                                    }
-                                    sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
-                                    _save_safetensors(meta_tensors, sf_path)
-                                except Exception: pass
-                                print(f"💾 Checkpoint and training state saved at epoch {epoch}")
-
-                            th.save_checkpoint = custom_save_checkpoint
-
-                    except ImportError as e:
-                        print(f"⚠️ [ACE-Step] Failed to import acestep v2 modules for patching: {e}")
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
                 if loss_history:
