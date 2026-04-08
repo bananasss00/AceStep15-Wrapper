@@ -195,9 +195,44 @@ class DequantizeNF4Linear(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class QuantizedNF4Linear(nn.Linear):
+    """
+    Динамическая обертка для обмана библиотеки PEFT.
+    Генерирует деквантованные веса "на лету" (JIT) при запросе module.weight
+    Это необходимо для инициализации DoRA, которая вычисляет L2-норму весов.
+    """
+    @property
+    def weight(self):
+        w_flat = self.weight_packed.view(torch.uint8)
+        high = (w_flat >> 4).long()
+        low = (w_flat & 0x0F).long()
+        
+        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=w_flat.device)
+        unpacked[0::2] = high
+        unpacked[1::2] = low
+        
+        padded_in_features = unpacked.shape[0] // self.orig_shape[0]
+        blocks_per_row = padded_in_features // self.group_size
+        
+        w_dequant = self.nf4_lut[unpacked].view(self.orig_shape[0], blocks_per_row, self.group_size)
+        w_dequant = (w_dequant * self.scales).view(self.orig_shape[0], padded_in_features)
+        
+        if padded_in_features > self.orig_shape[1]:
+            w_dequant = w_dequant[:, :self.orig_shape[1]]
+            
+        # PEFT ожидает параметр
+        return nn.Parameter(w_dequant.to(self.scales.dtype), requires_grad=False)
+
+    def forward(self, x):
+        return DequantizeNF4Linear.apply(
+            x, self.weight_packed, self.scales, self.bias, 
+            self.orig_shape, self.group_size, self.nf4_lut
+        )
+
+
 def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=42):
     """
-    OOM-Safe квантование в NF4 с обработкой по чанкам (экономит гигабайты VRAM).
+    OOM-Safe квантование в NF4 с обработкой по чанкам и интеграцией DoRA.
     """
     if quant_type == "none":
         return
@@ -219,48 +254,42 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=4
             orig_shape = module.weight.shape
             device = module.weight.device
             
-            # Паддинг для кратности 64
             pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
-            w_padded = module.weight.data.float() # Работаем в fp32 для точности
+            w_padded = module.weight.data.float() 
             if pad_len > 0:
                 w_padded = F.pad(w_padded, (0, pad_len))
                 
             w_grouped = w_padded.view(orig_shape[0], -1, group_size)
             blocks_per_row = w_grouped.shape[1]
             
-            # Предварительное выделение памяти, чтобы избежать фрагментации
             scales = torch.empty((orig_shape[0], blocks_per_row, 1), dtype=compute_dtype, device=device)
             quantized_indices = torch.empty((orig_shape[0], blocks_per_row, group_size), dtype=torch.uint8, device=device)
             
-            # === ФИКС OOM: ОБРАБОТКА ПО ЧАНКАМ ===
-            # Разбиваем 4096+ строк на блоки по 128 строк. Максимальный жор VRAM ~35 Мегабайт!
+            # Обработка по чанкам (защита от OOM при бродкастинге)
             CHUNK_SIZE = 128
             lut_device = NF4_LUT.to(device).view(1, 1, 1, 16)
             
             for i in range(0, orig_shape[0], CHUNK_SIZE):
                 end_i = min(i + CHUNK_SIZE, orig_shape[0])
-                w_chunk = w_grouped[i:end_i] # [Chunk, Blocks, 64]
+                w_chunk = w_grouped[i:end_i]
                 
-                # Ищем максимум в каждом блоке по 64
                 chunk_scales = w_chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
                 scales[i:end_i] = chunk_scales.to(compute_dtype)
                 
                 w_norm = w_chunk / chunk_scales
                 
-                # Бродкастинг теперь безопасен (маленький размер)
                 distances = torch.abs(w_norm.unsqueeze(-1) - lut_device)
                 quantized_indices[i:end_i] = torch.argmin(distances, dim=-1).to(torch.uint8)
-            # =====================================
 
-            # Упаковка 2x4-бит -> 1x8-бит (экономим 50% веса)
+            # Упаковка 2x4-бит -> 1x8-бит
             flat_indices = quantized_indices.view(-1)
             high = flat_indices[0::2] << 4
             low = flat_indices[1::2]
             packed_weights = (high | low).contiguous()
             
-            # Назначаем параметры
+            # Сохраняем новые параметры
             module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
-            module.scales = nn.Parameter(scales, requires_grad=False) # Уже имеет форму [Out, Blocks, 1]
+            module.scales = nn.Parameter(scales, requires_grad=False) 
             module.register_buffer("nf4_lut", NF4_LUT.to(device))
             module.orig_shape = orig_shape
             module.group_size = group_size
@@ -268,19 +297,15 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=4
             if module.bias is not None:
                 module.bias.data = module.bias.data.to(compute_dtype)
                 
-            # Очищаем оригинальную толстую матрицу
+            # === ФИКС PEFT DORA ===
+            # Удаляем оригинальный параметр, чтобы освободить память
             del module.weight 
             
-            # Патчим forward
-            def patch_forward(mod):
-                def forward(x):
-                    return DequantizeNF4Linear.apply(
-                        x, mod.weight_packed, mod.scales, mod.bias, 
-                        mod.orig_shape, mod.group_size, mod.nf4_lut
-                    )
-                return forward
-                
-            module.forward = patch_forward(module)
+            # Заменяем класс на лету. 
+            # Теперь module ведет себя как QuantizedNF4Linear, и при вызове module.weight сработает наш @property
+            module.__class__ = QuantizedNF4Linear
+            # ======================
+            
             converted_count += 1
             
     print(f"✅ [Future Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
