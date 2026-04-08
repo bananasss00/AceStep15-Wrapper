@@ -1557,6 +1557,7 @@ class ACEStepTrainer:
                 preview_lyrics=prev_cfg.get("prev_lyrics", "").strip() or None, preview_bpm=prev_cfg.get("prev_bpm", "").strip() or None, 
                 preview_keyscale=prev_cfg.get("prev_key", "").strip() or None, preview_timesig=prev_cfg.get("prev_ts", "").strip() or None,
             )
+            train_cfg.save_state = dataset_config.get("save_state", True)
             train_cfg.save_final_model = dataset_config.get("save_final", False)
 
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
@@ -1694,16 +1695,62 @@ class ACEStepTrainer:
                                 last_ep = epoch_history[-1]
                                 if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                     saved_epochs.append(last_ep)
-                    if update.kind == "checkpoint":
-                        if not dataset_config.get("save_state", True):
-                            ckpt_dir = getattr(update, "checkpoint_path", "")
-                            if ckpt_dir and os.path.exists(ckpt_dir):
-                                st_pt = os.path.join(ckpt_dir, "training_state.pt")
-                                st_sf = os.path.join(ckpt_dir, "training_state.safetensors")
+                    try:
+                        from acestep.training_v2.trainer_fixed import FixedLoRATrainer
+                        
+                        # Существующий патч превью...
+                        if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
+                            FixedLoRATrainer._original_generate_preview = FixedLoRATrainer._generate_preview
+                            def custom_generate_preview(self, output_dir, step, device):
+                                orig_dir = self.training_config.dataset_dir
+                                if hasattr(self, "main_tensor_dir"):
+                                    self.training_config.dataset_dir = self.main_tensor_dir
                                 try:
-                                    if os.path.exists(st_pt): os.remove(st_pt)
-                                    if os.path.exists(st_sf): os.remove(st_sf)
+                                    self._original_generate_preview(output_dir, step, device)
+                                finally:
+                                    self.training_config.dataset_dir = orig_dir
+                            FixedLoRATrainer._generate_preview = custom_generate_preview
+
+                        # НОВЫЙ ПАТЧ: Блокировка записи State на диск
+                        import acestep.training_v2.trainer_helpers as th
+                        if not hasattr(th, "_original_save_checkpoint"):
+                            th._original_save_checkpoint = th.save_checkpoint
+
+                            def custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
+                                # 1. Сохраняем ТОЛЬКО чистые веса (LoRA адаптер или LoKR)
+                                th.save_adapter_flat(trainer, ckpt_dir)
+
+                                # 2. Проверяем наш флаг из UI
+                                save_state = getattr(trainer.training_config, "save_state", True)
+                                if not save_state:
+                                    print(f"💾 Checkpoint saved at epoch {epoch} (training state skipped to save disk I/O)")
+                                    return
+
+                                # 3. Если флаг включен - пишем тяжелые тензоры на диск
+                                training_state = {
+                                    "epoch": epoch,
+                                    "global_step": global_step,
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                    "scheduler_state_dict": scheduler.state_dict(),
+                                }
+                                state_path = os.path.join(ckpt_dir, "training_state.pt")
+                                torch.save(training_state, state_path)
+
+                                try:
+                                    from safetensors.torch import save_file as _save_safetensors
+                                    meta_tensors = {
+                                        "epoch": torch.tensor([epoch], dtype=torch.int64),
+                                        "global_step": torch.tensor([global_step], dtype=torch.int64),
+                                    }
+                                    sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
+                                    _save_safetensors(meta_tensors, sf_path)
                                 except Exception: pass
+                                print(f"💾 Checkpoint and training state saved at epoch {epoch}")
+
+                            th.save_checkpoint = custom_save_checkpoint
+
+                    except ImportError as e:
+                        print(f"⚠️ [ACE-Step] Failed to import acestep v2 modules for patching: {e}")
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
                 if loss_history:
