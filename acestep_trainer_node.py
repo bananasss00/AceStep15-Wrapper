@@ -85,6 +85,99 @@ acestep.training.lokr_utils.safe_path = bypass_safe_path
 
 
 # ======================================================================
+# FP8 STOCHASTIC ROUNDING & QUANTIZATION UTILS
+# ======================================================================
+def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
+    mantissa_scaled = torch.where(
+        normal_mask,
+        (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
+        (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS)))
+    )
+    mantissa_scaled += torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator)
+    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+def manual_stochastic_round_to_float8(x, dtype, generator=None):
+    if dtype == torch.float8_e4m3fn:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7
+    elif dtype == torch.float8_e5m2:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 5, 2, 15
+    else:
+        raise ValueError("Unsupported dtype")
+
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
+        0, 2**EXPONENT_BITS - 1
+    )
+
+    normal_mask = ~(exponent == 0)
+    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator)
+
+    sign *= torch.where(
+        normal_mask,
+        (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
+        (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x
+    )
+
+    inf = torch.finfo(dtype)
+    torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
+    return sign
+
+def stochastic_rounding(value, dtype, seed=0):
+    if dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        return value.to(dtype=dtype)
+    if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        generator = torch.Generator(device=value.device)
+        generator.manual_seed(seed)
+        output = torch.empty_like(value, dtype=dtype)
+        num_slices = max(1, int(value.numel() / (4096 * 4096)))
+        slice_size = max(1, round(value.shape[0] / num_slices))
+        for i in range(0, value.shape[0], slice_size):
+            output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator))
+        return output
+    return value.to(dtype=dtype)
+
+def apply_fp8_base_model(model, compute_dtype, seed=42):
+    """
+    Сканирует модель на наличие nn.Linear. Если слой заморожен (requires_grad=False),
+    квантует его вес в FP8 со стохастическим округлением и заменяет метод forward
+    на JIT-upcast для совместимости с любым PyTorch и PEFT.
+    """
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("⚠️ [FP8] Ваша версия PyTorch не поддерживает float8_e4m3fn. Пропуск квантования.")
+        return
+
+    print("🪄 [FP8] Квантование замороженных слоев в FP8 (Stochastic Rounding)...")
+    converted_count = 0
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if not module.weight.requires_grad:
+                # Стохастическое округление
+                fp8_weight = stochastic_rounding(module.weight.data, torch.float8_e4m3fn, seed=seed)
+                module.weight = nn.Parameter(fp8_weight, requires_grad=False)
+                
+                # Bias оставляем в рабочем типе для точности
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(compute_dtype)
+                
+                # Заменяем forward для динамического распаковки перед умножением
+                def patch_forward(mod):
+                    def forward(x):
+                        w = mod.weight.to(x.dtype)
+                        return F.linear(x, w, mod.bias)
+                    return forward
+                
+                module.forward = patch_forward(module)
+                converted_count += 1
+                
+    print(f"✅ [FP8] Успешно сконвертировано {converted_count} Linear-слоев в float8_e4m3fn.")
+
+# ======================================================================
 # BLOCKSWAP MANAGER
 # ======================================================================
 class BlockSwapManager:
@@ -972,6 +1065,7 @@ class ACEStepTrainer:
                 "grad_ckpt": ("BOOLEAN", {"default": True}),
                 "offload_enc": ("BOOLEAN", {"default": False}),
                 "vram_cleanup": ("BOOLEAN", {"default": True}),
+                "use_fp8_base": ("BOOLEAN", {"default": False, "tooltip": "Квантует базовую модель в FP8 (экономит VRAM)"}),
             },
             "optional": {
                 "preview_config": ("ACESTEP_PREVIEW",),
@@ -1059,7 +1153,7 @@ class ACEStepTrainer:
         fig.clf()
 
     @torch.inference_mode(False)
-    def train_model(self, dataset_config, model_config, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_model(self, dataset_config, model_config, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, use_fp8_base, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         with torch.enable_grad():
             print("\n" + "="*60)
             print("🚀 ACE-Step LoRA/LoKR Training Node (ComfyUI)")
@@ -1178,6 +1272,10 @@ class ACEStepTrainer:
 
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
+
+            if use_fp8_base:
+                target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+                apply_fp8_base_model(model, target_dtype, seed)
 
             if vram_cleanup:
                 print(f"🧹[System] Aggressive VRAM Cleanup...")
@@ -1340,6 +1438,7 @@ class ACEStepFinetuneTrainer:
                 "block_swap_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1, "tooltip": "Offload layers to CPU. 1.0 = Max VRAM saving."}),
                 "encoder_train_mode": (["none", "projectors_only", "all"], {"default": "none", "tooltip": "none=frozen, projectors_only=low VRAM impact, all=OOM on 16GB unless adamw8bit"}),
                 "train_null_emb": ("BOOLEAN", {"default": True, "tooltip": "Train null_condition_emb (CFG)"}),
+                "use_fp8_base": ("BOOLEAN", {"default": False, "tooltip": "Квантовать замороженные энкодеры в FP8"}),
             },
             "optional": {
                 "preview_config": ("ACESTEP_PREVIEW",),
@@ -1611,7 +1710,7 @@ class ACEStepFinetuneTrainer:
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, encoder_train_mode, train_null_emb, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, encoder_train_mode, train_null_emb, use_fp8_base, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -1782,6 +1881,13 @@ class ACEStepFinetuneTrainer:
                 block_swap.apply(offload_ratio=block_swap_ratio)
 
             module = FullFinetuneModuleV2(model, training_cfg, device, precision, encoder_train_mode, train_null_emb)
+            
+            # В этот момент обучаемые слои разморожены (requires_grad=True), 
+            # а энкодеры (если не обучаются) - заморожены.
+            if use_fp8_base:
+                target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+                apply_fp8_base_model(module.model, target_dtype, seed)
+            
             trainable_params = [p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
