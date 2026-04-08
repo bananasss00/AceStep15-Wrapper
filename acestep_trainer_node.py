@@ -868,6 +868,7 @@ class ACEStepDatasetConfig:
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
                 "save_final": ("BOOLEAN", {"default": False}),
+                "save_state": ("BOOLEAN", {"default": False, "tooltip": "Сохранять training_state.pt (весит много, нужен только для возобновления обучения)"}),
             },
             "optional": {
                 "reg_data_source": ("STRING", {"default": ""}),
@@ -1693,6 +1694,16 @@ class ACEStepTrainer:
                                 last_ep = epoch_history[-1]
                                 if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                     saved_epochs.append(last_ep)
+                    if update.kind == "checkpoint":
+                        if not dataset_config.get("save_state", True):
+                            ckpt_dir = getattr(update, "checkpoint_path", "")
+                            if ckpt_dir and os.path.exists(ckpt_dir):
+                                st_pt = os.path.join(ckpt_dir, "training_state.pt")
+                                st_sf = os.path.join(ckpt_dir, "training_state.safetensors")
+                                try:
+                                    if os.path.exists(st_pt): os.remove(st_pt)
+                                    if os.path.exists(st_sf): os.remove(st_sf)
+                                except Exception: pass
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup
                 if loss_history:
@@ -2411,18 +2422,22 @@ class ACEStepFinetuneTrainer:
                         _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant, extra_pnginfo, prompt)
                         
                         # 2. СОХРАНЕНИЕ РАБОЧЕГО СОСТОЯНИЯ (Для Resume)
-                        state_save = {
-                            "epoch": epoch + 1,
-                            "global_step": global_step,
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "loss_history": loss_history,
-                            "ema_history": ema_history,
-                            "lr_history": lr_history,
-                            "epoch_history": epoch_history,
-                            "saved_epochs": saved_epochs,
-                        }
-                        torch.save(state_save, os.path.join(ckpt_dir, "training_state.pt"))
+                        if dataset_config.get("save_state", True):
+                            state_save = {
+                                "epoch": epoch + 1,
+                                "global_step": global_step,
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scheduler_state_dict": scheduler.state_dict(),
+                                "loss_history": loss_history,
+                                "ema_history": ema_history,
+                                "lr_history": lr_history,
+                                "epoch_history": epoch_history,
+                                "saved_epochs": saved_epochs,
+                            }
+                            torch.save(state_save, os.path.join(ckpt_dir, "training_state.pt"))
+                            print(f"💾 Checkpoint and training state saved at epoch {epoch+1}")
+                        else:
+                            print(f"💾 Checkpoint saved at epoch {epoch+1}")
                         
                         if epoch_history:
                             last_ep = epoch_history[-1]
