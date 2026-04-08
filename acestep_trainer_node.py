@@ -187,20 +187,14 @@ class DequantizeNF4Linear(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, w_dequant = ctx.saved_tensors
         grad_input = grad_weight = grad_scales = grad_bias = None
-        
         # Градиент только для входа (x), база остается замороженной
         if ctx.needs_input_grad[0]:
             grad_input = grad_output.matmul(w_dequant)
-            
         return grad_input, None, None, None, None, None, None
 
 
 class QuantizedNF4Linear(nn.Linear):
-    """
-    Динамическая обертка для обмана библиотеки PEFT.
-    Генерирует деквантованные веса "на лету" (JIT) при запросе module.weight
-    Это необходимо для инициализации DoRA, которая вычисляет L2-норму весов.
-    """
+    """Динамическая обертка для NF4 (FP4 в UI). Отдает BF16 веса для инициализации DoRA."""
     @property
     def weight(self):
         w_flat = self.weight_packed.view(torch.uint8)
@@ -220,7 +214,6 @@ class QuantizedNF4Linear(nn.Linear):
         if padded_in_features > self.orig_shape[1]:
             w_dequant = w_dequant[:, :self.orig_shape[1]]
             
-        # PEFT ожидает параметр
         return nn.Parameter(w_dequant.to(self.scales.dtype), requires_grad=False)
 
     def forward(self, x):
@@ -230,86 +223,120 @@ class QuantizedNF4Linear(nn.Linear):
         )
 
 
-def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=42):
+class QuantizedFP8Linear(nn.Linear):
+    """Динамическая обертка для FP8. Отдает BF16 веса для инициализации DoRA."""
+    @property
+    def weight(self):
+        # Нативный каст FP8 -> BF16 поддерживается PyTorch из коробки
+        return nn.Parameter(self.weight_fp8.to(self.compute_dtype), requires_grad=False)
+
+    def forward(self, x):
+        w_dequant = self.weight_fp8.to(x.dtype)
+        return F.linear(x, w_dequant, self.bias)
+
+
+def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=42):
     """
-    OOM-Safe квантование в NF4 с обработкой по чанкам и интеграцией DoRA.
+    Универсальный роутер квантования базы: поддерживает FP8 (нативный) и FP4 (кастомный NF4).
+    Обеспечивает полную совместимость с Weight-Decomposed LoRA (DoRA).
     """
     if quant_type == "none":
         return
 
-    print(f"🪄 [Future Quantization] Quantizing frozen layers to NF4 (Block-64, OOM-Safe)...")
     converted_count = 0
-    group_size = 64
 
-    # Идеальные квантили нормального распределения (NF4)
-    NF4_LUT = torch.tensor([
-        -1.0, -0.6961928, -0.52507305, -0.39491749,
-        -0.28444138, -0.18477343, -0.091050036, 0.0,
-        0.07958029, 0.1609302, 0.2461123, 0.33791524,
-        0.44070983, 0.562617, 0.72295684, 1.0
-    ], dtype=compute_dtype)
+    # ==========================================
+    # ВЕТКА 1: FP8 (Native PyTorch float8_e4m3fn)
+    # ==========================================
+    if quant_type == "fp8":
+        if not hasattr(torch, "float8_e4m3fn"):
+            print("⚠️ [Quantization] Your PyTorch version does not support float8_e4m3fn. Skipping.")
+            return
 
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and not module.weight.requires_grad:
-            orig_shape = module.weight.shape
-            device = module.weight.device
-            
-            pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
-            w_padded = module.weight.data.float() 
-            if pad_len > 0:
-                w_padded = F.pad(w_padded, (0, pad_len))
+        print(f"🪄 [Quantization] Quantizing frozen layers to FP8 (Stochastic Rounding)...")
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
+                # Используем твою функцию stochastic_rounding (она у тебя лежит выше в файле)
+                fp8_weight = stochastic_rounding(module.weight.data, torch.float8_e4m3fn, seed=seed)
                 
-            w_grouped = w_padded.view(orig_shape[0], -1, group_size)
-            blocks_per_row = w_grouped.shape[1]
-            
-            scales = torch.empty((orig_shape[0], blocks_per_row, 1), dtype=compute_dtype, device=device)
-            quantized_indices = torch.empty((orig_shape[0], blocks_per_row, group_size), dtype=torch.uint8, device=device)
-            
-            # Обработка по чанкам (защита от OOM при бродкастинге)
-            CHUNK_SIZE = 128
-            lut_device = NF4_LUT.to(device).view(1, 1, 1, 16)
-            
-            for i in range(0, orig_shape[0], CHUNK_SIZE):
-                end_i = min(i + CHUNK_SIZE, orig_shape[0])
-                w_chunk = w_grouped[i:end_i]
+                module.weight_fp8 = nn.Parameter(fp8_weight, requires_grad=False)
+                module.compute_dtype = compute_dtype
                 
-                chunk_scales = w_chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-                scales[i:end_i] = chunk_scales.to(compute_dtype)
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(compute_dtype)
+                    
+                del module.weight # Удаляем толстый тензор
+                module.__class__ = QuantizedFP8Linear # Внедряем DoRA-совместимый класс
+                converted_count += 1
                 
-                w_norm = w_chunk / chunk_scales
-                
-                distances = torch.abs(w_norm.unsqueeze(-1) - lut_device)
-                quantized_indices[i:end_i] = torch.argmin(distances, dim=-1).to(torch.uint8)
+        print(f"✅ [Quantization] Successfully converted {converted_count} layers to FP8.")
 
-            # Упаковка 2x4-бит -> 1x8-бит
-            flat_indices = quantized_indices.view(-1)
-            high = flat_indices[0::2] << 4
-            low = flat_indices[1::2]
-            packed_weights = (high | low).contiguous()
-            
-            # Сохраняем новые параметры
-            module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
-            module.scales = nn.Parameter(scales, requires_grad=False) 
-            module.register_buffer("nf4_lut", NF4_LUT.to(device))
-            module.orig_shape = orig_shape
-            module.group_size = group_size
-            
-            if module.bias is not None:
-                module.bias.data = module.bias.data.to(compute_dtype)
+    # ==========================================
+    # ВЕТКА 2: FP4 (Наш кастомный NF4 Block-64)
+    # ==========================================
+    elif quant_type == "fp4":
+        print(f"🪄 [Quantization] Quantizing frozen layers to NF4 (Block-64, OOM-Safe)...")
+        group_size = 64
+
+        NF4_LUT = torch.tensor([
+            -1.0, -0.6961928, -0.52507305, -0.39491749,
+            -0.28444138, -0.18477343, -0.091050036, 0.0,
+            0.07958029, 0.1609302, 0.2461123, 0.33791524,
+            0.44070983, 0.562617, 0.72295684, 1.0
+        ], dtype=compute_dtype)
+
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
+                orig_shape = module.weight.shape
+                device = module.weight.device
                 
-            # === ФИКС PEFT DORA ===
-            # Удаляем оригинальный параметр, чтобы освободить память
-            del module.weight 
-            
-            # Заменяем класс на лету. 
-            # Теперь module ведет себя как QuantizedNF4Linear, и при вызове module.weight сработает наш @property
-            module.__class__ = QuantizedNF4Linear
-            # ======================
-            
-            converted_count += 1
-            
-    print(f"✅ [Future Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
-    import gc; gc.collect(); torch.cuda.empty_cache()
+                pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
+                w_padded = module.weight.data.float() 
+                if pad_len > 0:
+                    w_padded = F.pad(w_padded, (0, pad_len))
+                    
+                w_grouped = w_padded.view(orig_shape[0], -1, group_size)
+                blocks_per_row = w_grouped.shape[1]
+                
+                scales = torch.empty((orig_shape[0], blocks_per_row, 1), dtype=compute_dtype, device=device)
+                quantized_indices = torch.empty((orig_shape[0], blocks_per_row, group_size), dtype=torch.uint8, device=device)
+                
+                CHUNK_SIZE = 128
+                lut_device = NF4_LUT.to(device).view(1, 1, 1, 16)
+                
+                for i in range(0, orig_shape[0], CHUNK_SIZE):
+                    end_i = min(i + CHUNK_SIZE, orig_shape[0])
+                    w_chunk = w_grouped[i:end_i]
+                    
+                    chunk_scales = w_chunk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                    scales[i:end_i] = chunk_scales.to(compute_dtype)
+                    w_norm = w_chunk / chunk_scales
+                    
+                    distances = torch.abs(w_norm.unsqueeze(-1) - lut_device)
+                    quantized_indices[i:end_i] = torch.argmin(distances, dim=-1).to(torch.uint8)
+
+                flat_indices = quantized_indices.view(-1)
+                high = flat_indices[0::2] << 4
+                low = flat_indices[1::2]
+                packed_weights = (high | low).contiguous()
+                
+                module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
+                module.scales = nn.Parameter(scales, requires_grad=False) 
+                module.register_buffer("nf4_lut", NF4_LUT.to(device))
+                module.orig_shape = orig_shape
+                module.group_size = group_size
+                
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(compute_dtype)
+                    
+                del module.weight 
+                module.__class__ = QuantizedNF4Linear # Внедряем DoRA-совместимый класс
+                converted_count += 1
+                
+        print(f"✅ [Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
+
+    import gc; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 # ======================================================================
 # BLOCKSWAP MANAGER
