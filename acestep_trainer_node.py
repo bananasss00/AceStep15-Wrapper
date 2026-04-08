@@ -314,24 +314,34 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=4
 # ======================================================================
 # BLOCKSWAP MANAGER
 # ======================================================================
-class BlockSwapManager:
+class AdvancedBlockSwapManager:
+    """
+    Магия из будущего: Асинхронный пайплайнинг слоев.
+    Использует параллельные CUDA Streams и Events для маскировки задержек шины PCI-E.
+    Поддерживает градиентный чекпоинтинг и CPU-Offload оптимизатора!
+    """
     def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
         self.model = model
         self.device = device
         self.offload_device = torch.device(offload_device)
         self.hook_handles = []
         self.pinned_cpu_state = {}
-        self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.pinned_grad_state = {}
+        self.is_loaded = {}
+        
+        self.compute_stream = torch.cuda.current_stream()
+        self.transfer_stream = torch.cuda.Stream()
+        
+        self.load_events = {}
+        self.compute_events = {}
+        self.offloaded_layers = []
 
     def _find_transformer_layers(self) -> nn.ModuleList:
         search_targets = ["layers", "h", "blocks", "transformer_blocks"]
         root = self.model
-        if hasattr(root, "base_model"):
-            root = root.base_model
-            if hasattr(root, "model"):
-                root = root.model
-        if hasattr(root, "decoder"):
-            root = root.decoder
+        if hasattr(root, "base_model"): root = root.base_model
+        if hasattr(root, "model"): root = root.model
+        if hasattr(root, "decoder"): root = root.decoder
 
         queue = [root]
         visited = set()
@@ -355,80 +365,138 @@ class BlockSwapManager:
         num_to_swap = int(total_layers * offload_ratio)
         if num_to_swap == 0: return
 
-        print(f"🔄 [BlockSwap] Offloading {num_to_swap}/{total_layers} layers to {self.offload_device}.")
+        print(f"🚀 [Advanced BlockSwap] Async Pipelining {num_to_swap}/{total_layers} layers to {self.offload_device} (CPU-Offload Optimizer enabled!)...")
 
-        for i in range(num_to_swap):
-            layer = layers[i]
+        self.offloaded_layers = [layers[i] for i in range(num_to_swap)]
+
+        for idx, layer in enumerate(self.offloaded_layers):
             layer_id = id(layer)
             self.pinned_cpu_state[layer_id] = {}
-            layer.to("cpu")
+            self.pinned_grad_state[layer_id] = {}
+            self.load_events[layer_id] = torch.cuda.Event()
+            self.compute_events[layer_id] = torch.cuda.Event()
+            self.is_loaded[layer_id] = True
+            
+            # Принудительная инициализация: копируем на CPU и подменяем
             for name, param in layer.named_parameters():
-                pinned_t = torch.empty_like(param.data, pin_memory=True)
+                pinned_t = torch.empty(param.shape, dtype=param.dtype, pin_memory=True)
                 pinned_t.copy_(param.data)
-                param.data = pinned_t
                 self.pinned_cpu_state[layer_id][name] = pinned_t
+                param.data = pinned_t # Отдаем CPU тензор
+                
             for name, buf in layer.named_buffers():
-                pinned_t = torch.empty_like(buf.data, pin_memory=True)
+                pinned_t = torch.empty(buf.shape, dtype=buf.dtype, pin_memory=True)
                 pinned_t.copy_(buf.data)
-                buf.data = pinned_t
                 self.pinned_cpu_state[layer_id][name] = pinned_t
+                buf.data = pinned_t
 
-        def _load_to_gpu(module):
-            layer_id = id(module)
-            if layer_id not in self.pinned_cpu_state: return
-            for name, param in module.named_parameters():
-                if param.device != self.device:
-                    param.data = param.data.to(self.device, non_blocking=True)
-                if param.grad is not None and param.grad.device != self.device:
-                    param.grad.data = param.grad.data.to(self.device, non_blocking=True)
-            for name, buf in module.named_buffers():
-                if buf.device != self.device:
-                    buf.data = buf.data.to(self.device, non_blocking=True)
+            self.is_loaded[layer_id] = False
 
-        def _offload_to_cpu(module, is_backward=False):
-            layer_id = id(module)
-            if layer_id not in self.pinned_cpu_state: return
-            for name, param in module.named_parameters():
-                if param.device != self.offload_device:
-                    cpu_t = self.pinned_cpu_state[layer_id][name]
-                    cpu_t.copy_(param.data, non_blocking=True)
-                    param.data = cpu_t
-                if is_backward and param.grad is not None:
-                    grad_name = f"{name}_grad"
-                    if grad_name not in self.pinned_cpu_state[layer_id]:
-                        self.pinned_cpu_state[layer_id][grad_name] = torch.empty_like(param.grad.data, device="cpu", pin_memory=True)
-                    cpu_grad = self.pinned_cpu_state[layer_id][grad_name]
-                    cpu_grad.copy_(param.grad.data, non_blocking=True)
-                    param.grad.data = cpu_grad
-            for name, buf in module.named_buffers():
-                if buf.device != self.offload_device:
-                    cpu_t = self.pinned_cpu_state[layer_id][name]
-                    cpu_t.copy_(buf.data, non_blocking=True)
-                    buf.data = cpu_t
+        def _async_load(layer_idx):
+            if layer_idx < 0 or layer_idx >= len(self.offloaded_layers): return
+            layer = self.offloaded_layers[layer_idx]
+            layer_id = id(layer)
+            
+            if self.is_loaded[layer_id]: return
+            self.is_loaded[layer_id] = True
+            
+            with torch.cuda.stream(self.transfer_stream):
+                for name, param in layer.named_parameters():
+                    # Создаем тензор на GPU и копируем из pinned CPU
+                    gpu_tensor = torch.empty_like(self.pinned_cpu_state[layer_id][name], device=self.device)
+                    gpu_tensor.copy_(self.pinned_cpu_state[layer_id][name], non_blocking=True)
+                    param.data = gpu_tensor
+                    
+                    if name in self.pinned_grad_state[layer_id]:
+                        if param.grad is None or param.grad.device != self.device:
+                            param.grad = torch.empty_like(self.pinned_grad_state[layer_id][name], device=self.device)
+                        param.grad.data.copy_(self.pinned_grad_state[layer_id][name], non_blocking=True)
 
+                for name, buf in layer.named_buffers():
+                    gpu_tensor = torch.empty_like(self.pinned_cpu_state[layer_id][name], device=self.device)
+                    gpu_tensor.copy_(self.pinned_cpu_state[layer_id][name], non_blocking=True)
+                    buf.data = gpu_tensor
+                    
+                self.load_events[layer_id].record(self.transfer_stream)
+
+        def _async_offload(layer_idx, is_backward=False):
+            if layer_idx < 0 or layer_idx >= len(self.offloaded_layers): return
+            layer = self.offloaded_layers[layer_idx]
+            layer_id = id(layer)
+            
+            if not self.is_loaded[layer_id]: return
+            self.is_loaded[layer_id] = False
+            
+            with torch.cuda.stream(self.transfer_stream):
+                self.transfer_stream.wait_event(self.compute_events[layer_id])
+                
+                for name, param in layer.named_parameters():
+                    if param.device != torch.device("cpu"):
+                        self.pinned_cpu_state[layer_id][name].copy_(param.data, non_blocking=True)
+                        param.data.record_stream(self.transfer_stream)
+                        # ВОТ ОНО: Вместо empty(0) мы присваиваем CPU-тензор!
+                        param.data = self.pinned_cpu_state[layer_id][name]
+                        
+                    if is_backward and param.grad is not None and param.grad.device != torch.device("cpu"):
+                        if name not in self.pinned_grad_state[layer_id]:
+                            self.pinned_grad_state[layer_id][name] = torch.empty_like(param.grad.data, device="cpu", pin_memory=True)
+                        self.pinned_grad_state[layer_id][name].copy_(param.grad.data, non_blocking=True)
+                        param.grad.data.record_stream(self.transfer_stream)
+                        # И градиенту тоже отдаем CPU-тензор для оптимизатора
+                        param.grad.data = self.pinned_grad_state[layer_id][name]
+
+                for name, buf in layer.named_buffers():
+                    if buf.device != torch.device("cpu"):
+                        self.pinned_cpu_state[layer_id][name].copy_(buf.data, non_blocking=True)
+                        buf.data.record_stream(self.transfer_stream)
+                        buf.data = self.pinned_cpu_state[layer_id][name]
+
+        # === Hooks ===
         def pre_forward_hook(module, args):
-            _load_to_gpu(module)
-            if self.stream: torch.cuda.current_stream().wait_stream(self.stream)
+            layer_idx = self.offloaded_layers.index(module)
+            layer_id = id(module)
+            
+            _async_load(layer_idx)
+            
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_event(self.load_events[layer_id])
+            
+            if not torch.is_grad_enabled():
+                _async_load(layer_idx + 1)
             return args
 
         def post_forward_hook(module, args, output):
-            if self.stream:
-                with torch.cuda.stream(self.stream): _offload_to_cpu(module, is_backward=False)
-            else: _offload_to_cpu(module, is_backward=False)
+            layer_idx = self.offloaded_layers.index(module)
+            layer_id = id(module)
+            
+            current_stream = torch.cuda.current_stream()
+            self.compute_events[layer_id].record(current_stream)
+            
+            if not torch.is_grad_enabled():
+                _async_offload(layer_idx, is_backward=False)
             return output
 
         def pre_backward_hook(module, grad_output):
-            _load_to_gpu(module)
-            if self.stream: torch.cuda.current_stream().wait_stream(self.stream)
+            layer_idx = self.offloaded_layers.index(module)
+            layer_id = id(module)
+            
+            _async_load(layer_idx)
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_event(self.load_events[layer_id])
+            
+            _async_load(layer_idx - 1)
             return grad_output
 
         def post_backward_hook(module, grad_input, grad_output):
-            if self.stream:
-                with torch.cuda.stream(self.stream): _offload_to_cpu(module, is_backward=True)
-            else: _offload_to_cpu(module, is_backward=True)
+            layer_idx = self.offloaded_layers.index(module)
+            layer_id = id(module)
+            
+            current_stream = torch.cuda.current_stream()
+            self.compute_events[layer_id].record(current_stream)
+            
+            _async_offload(layer_idx, is_backward=True)
 
-        for i in range(num_to_swap):
-            layer = layers[i]
+        for layer in self.offloaded_layers:
             self.hook_handles.append(layer.register_forward_pre_hook(pre_forward_hook))
             self.hook_handles.append(layer.register_forward_hook(post_forward_hook))
             self.hook_handles.append(layer.register_full_backward_pre_hook(pre_backward_hook))
@@ -437,12 +505,22 @@ class BlockSwapManager:
     def remove(self):
         for handle in self.hook_handles: handle.remove()
         self.hook_handles.clear()
-        layers = self._find_transformer_layers()
-        if layers:
-            for layer in layers: layer.to(self.device)
+        
+        for layer_id, state in self.pinned_cpu_state.items():
+            for layer in self.offloaded_layers:
+                if id(layer) == layer_id:
+                    for name, param in layer.named_parameters():
+                        param.data = state[name].to(self.device)
+                        if name in self.pinned_grad_state[layer_id]:
+                            if param.grad is None: param.grad = torch.empty_like(param.data)
+                            param.grad.data = self.pinned_grad_state[layer_id][name].to(self.device)
+                    for name, buf in layer.named_buffers():
+                        buf.data = state[name].to(self.device)
+                        
         self.pinned_cpu_state.clear()
+        self.pinned_grad_state.clear()
+        self.offloaded_layers.clear()
         torch.cuda.empty_cache()
-
 
 # ======================================================================
 # V2 FULL FINETUNE MODULE & UTILS
@@ -2026,7 +2104,7 @@ class ACEStepFinetuneTrainer:
             
             block_swap = None
             if block_swap_ratio > 0.0:
-                block_swap = BlockSwapManager(model.decoder, device=device, offload_device="cpu")
+                block_swap = AdvancedBlockSwapManager(model.decoder, device=device, offload_device="cpu")
                 block_swap.apply(offload_ratio=block_swap_ratio)
 
             module = FullFinetuneModuleV2(model, training_cfg, device, precision, encoder_train_mode, train_null_emb)
