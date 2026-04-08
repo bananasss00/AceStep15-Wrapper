@@ -142,9 +142,14 @@ def build_optimizer(
             relative_step = optimizer_kwargs.get("relative_step", False)
             warmup_init = optimizer_kwargs.get("warmup_init", False)
 
+            actual_lr = lr
+            if relative_step:
+                logger.info("[Side-Step] Adafactor: 'relative_step=True' enabled. Ignoring manual learning_rate.")
+                actual_lr = None
+
             return Adafactor(
                 params,
-                lr=lr,
+                lr=actual_lr,
                 weight_decay=weight_decay,
                 scale_parameter=scale_parameter,
                 relative_step=relative_step,
@@ -217,6 +222,22 @@ def build_scheduler(
     (Prodigy manages LR internally).
     """
     scheduler_type = scheduler_type.lower().strip()
+
+    # Если оптимизатор управляет LR сам (Adafactor + relative_step=True),
+    # у него в param_groups лежит lr=None. Стандартные шедулеры упадут!
+    is_auto_lr = False
+    for group in optimizer.param_groups:
+        if group.get("lr") is None:
+            is_auto_lr = True
+            break
+
+    if is_auto_lr:
+        logger.info(f"[Side-Step] Optimizer uses internal LR (e.g. Adafactor). Disabling external scheduler.")
+        class DummyScheduler:
+            def __init__(self, optimizer): self.optimizer = optimizer
+            def step(self): pass
+            def get_last_lr(self): return [0.0] # На графике LR будет 0, т.к. он скрыт
+        return DummyScheduler(optimizer)
 
     # Prodigy family (Plus & Standard) usually handle LR internally
     if optimizer_type in ["prodigy", "prodigy_plus"] and scheduler_type not in ("constant", "constant_with_warmup"):
