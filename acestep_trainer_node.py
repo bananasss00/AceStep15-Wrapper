@@ -316,17 +316,19 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="fp4", seed=4
 # ======================================================================
 class AdvancedBlockSwapManager:
     """
-    Магия из будущего: Асинхронный пайплайнинг слоев.
-    Использует параллельные CUDA Streams и Events для маскировки задержек шины PCI-E.
-    Поддерживает градиентный чекпоинтинг и CPU-Offload оптимизатора!
+    True ZeRO-Offload Optimizer Manager.
+    Разгоняет GPU до максимума на момент шага оптимизатора, а затем 
+    принудительно сбрасывает кэш VRAM, возвращая состояния в RAM.
     """
     def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
         self.model = model
         self.device = device
         self.offload_device = torch.device(offload_device)
         self.hook_handles = []
+        
         self.pinned_cpu_state = {}
         self.pinned_grad_state = {}
+        self.pinned_opt_state = {} 
         self.is_loaded = {}
         
         self.compute_stream = torch.cuda.current_stream()
@@ -365,7 +367,7 @@ class AdvancedBlockSwapManager:
         num_to_swap = int(total_layers * offload_ratio)
         if num_to_swap == 0: return
 
-        print(f"🚀 [Advanced BlockSwap] Async Pipelining {num_to_swap}/{total_layers} layers to {self.offload_device} (CPU-Offload Optimizer enabled!)...")
+        print(f"🚀 [ZeRO-Offload] Pipelining {num_to_swap}/{total_layers} layers. VRAM cache flush enabled.")
 
         self.offloaded_layers = [layers[i] for i in range(num_to_swap)]
 
@@ -377,12 +379,11 @@ class AdvancedBlockSwapManager:
             self.compute_events[layer_id] = torch.cuda.Event()
             self.is_loaded[layer_id] = True
             
-            # Принудительная инициализация: копируем на CPU и подменяем
             for name, param in layer.named_parameters():
                 pinned_t = torch.empty(param.shape, dtype=param.dtype, pin_memory=True)
                 pinned_t.copy_(param.data)
                 self.pinned_cpu_state[layer_id][name] = pinned_t
-                param.data = pinned_t # Отдаем CPU тензор
+                param.data = pinned_t 
                 
             for name, buf in layer.named_buffers():
                 pinned_t = torch.empty(buf.shape, dtype=buf.dtype, pin_memory=True)
@@ -396,104 +397,81 @@ class AdvancedBlockSwapManager:
             if layer_idx < 0 or layer_idx >= len(self.offloaded_layers): return
             layer = self.offloaded_layers[layer_idx]
             layer_id = id(layer)
-            
             if self.is_loaded[layer_id]: return
             self.is_loaded[layer_id] = True
             
             with torch.cuda.stream(self.transfer_stream):
                 for name, param in layer.named_parameters():
-                    # Создаем тензор на GPU и копируем из pinned CPU
                     gpu_tensor = torch.empty_like(self.pinned_cpu_state[layer_id][name], device=self.device)
                     gpu_tensor.copy_(self.pinned_cpu_state[layer_id][name], non_blocking=True)
                     param.data = gpu_tensor
-                    
                     if name in self.pinned_grad_state[layer_id]:
                         if param.grad is None or param.grad.device != self.device:
                             param.grad = torch.empty_like(self.pinned_grad_state[layer_id][name], device=self.device)
                         param.grad.data.copy_(self.pinned_grad_state[layer_id][name], non_blocking=True)
-
                 for name, buf in layer.named_buffers():
                     gpu_tensor = torch.empty_like(self.pinned_cpu_state[layer_id][name], device=self.device)
                     gpu_tensor.copy_(self.pinned_cpu_state[layer_id][name], non_blocking=True)
                     buf.data = gpu_tensor
-                    
                 self.load_events[layer_id].record(self.transfer_stream)
 
         def _async_offload(layer_idx, is_backward=False):
             if layer_idx < 0 or layer_idx >= len(self.offloaded_layers): return
             layer = self.offloaded_layers[layer_idx]
             layer_id = id(layer)
-            
             if not self.is_loaded[layer_id]: return
             self.is_loaded[layer_id] = False
             
             with torch.cuda.stream(self.transfer_stream):
                 self.transfer_stream.wait_event(self.compute_events[layer_id])
-                
                 for name, param in layer.named_parameters():
                     if param.device != torch.device("cpu"):
                         self.pinned_cpu_state[layer_id][name].copy_(param.data, non_blocking=True)
                         param.data.record_stream(self.transfer_stream)
-                        # ВОТ ОНО: Вместо empty(0) мы присваиваем CPU-тензор!
                         param.data = self.pinned_cpu_state[layer_id][name]
-                        
                     if is_backward and param.grad is not None and param.grad.device != torch.device("cpu"):
                         if name not in self.pinned_grad_state[layer_id]:
                             self.pinned_grad_state[layer_id][name] = torch.empty_like(param.grad.data, device="cpu", pin_memory=True)
                         self.pinned_grad_state[layer_id][name].copy_(param.grad.data, non_blocking=True)
                         param.grad.data.record_stream(self.transfer_stream)
-                        # И градиенту тоже отдаем CPU-тензор для оптимизатора
                         param.grad.data = self.pinned_grad_state[layer_id][name]
-
                 for name, buf in layer.named_buffers():
                     if buf.device != torch.device("cpu"):
                         self.pinned_cpu_state[layer_id][name].copy_(buf.data, non_blocking=True)
                         buf.data.record_stream(self.transfer_stream)
                         buf.data = self.pinned_cpu_state[layer_id][name]
 
-        # === Hooks ===
         def pre_forward_hook(module, args):
             layer_idx = self.offloaded_layers.index(module)
             layer_id = id(module)
-            
             _async_load(layer_idx)
-            
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(self.load_events[layer_id])
-            
-            if not torch.is_grad_enabled():
-                _async_load(layer_idx + 1)
+            if not torch.is_grad_enabled(): _async_load(layer_idx + 1)
             return args
 
         def post_forward_hook(module, args, output):
             layer_idx = self.offloaded_layers.index(module)
             layer_id = id(module)
-            
             current_stream = torch.cuda.current_stream()
             self.compute_events[layer_id].record(current_stream)
-            
-            if not torch.is_grad_enabled():
-                _async_offload(layer_idx, is_backward=False)
+            if not torch.is_grad_enabled(): _async_offload(layer_idx, is_backward=False)
             return output
 
         def pre_backward_hook(module, grad_output):
             layer_idx = self.offloaded_layers.index(module)
             layer_id = id(module)
-            
             _async_load(layer_idx)
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(self.load_events[layer_id])
-            
             _async_load(layer_idx - 1)
             return grad_output
 
         def post_backward_hook(module, grad_input, grad_output):
             layer_idx = self.offloaded_layers.index(module)
             layer_id = id(module)
-            
             current_stream = torch.cuda.current_stream()
             self.compute_events[layer_id].record(current_stream)
-            
             _async_offload(layer_idx, is_backward=True)
 
         for layer in self.offloaded_layers:
@@ -502,23 +480,78 @@ class AdvancedBlockSwapManager:
             self.hook_handles.append(layer.register_full_backward_pre_hook(pre_backward_hook))
             self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
 
+    def prepare_for_optimizer(self, optimizer):
+        """Мгновенно забрасывает состояния на GPU для быстрого шага"""
+        for i in range(len(self.offloaded_layers)):
+            layer = self.offloaded_layers[i]
+            layer_id = id(layer)
+            if self.is_loaded[layer_id]: continue
+            
+            for name, param in layer.named_parameters():
+                if param.data.device.type == "cpu":
+                    param.data = param.data.to(self.device, non_blocking=True)
+                if name in self.pinned_grad_state[layer_id] and param.grad is not None:
+                    if param.grad.data.device.type == "cpu":
+                        param.grad.data = param.grad.data.to(self.device, non_blocking=True)
+                
+                # Перенос состояний Prodigy
+                if param in optimizer.state:
+                    for k, v in optimizer.state[param].items():
+                        if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                            optimizer.state[param][k] = v.to(self.device, non_blocking=True)
+                            
+            for name, buf in layer.named_buffers():
+                if buf.data.device.type == "cpu":
+                    buf.data = buf.data.to(self.device, non_blocking=True)
+            self.is_loaded[layer_id] = True
+            
+        # ЖДЕМ завершения копирования до запуска оптимизатора!
+        torch.cuda.current_stream().synchronize()
+
+    def cleanup_after_optimizer(self, optimizer):
+        """Мгновенно выгружает состояния в RAM и УБИВАЕТ кэш VRAM"""
+        for i in range(len(self.offloaded_layers)):
+            layer = self.offloaded_layers[i]
+            layer_id = id(layer)
+            if not self.is_loaded[layer_id]: continue
+            
+            for name, param in layer.named_parameters():
+                # Возврат весов
+                if param.data.device.type != "cpu":
+                    self.pinned_cpu_state[layer_id][name].copy_(param.data, non_blocking=True)
+                    param.data = self.pinned_cpu_state[layer_id][name]
+                
+                # Возврат состояний Prodigy
+                if param in optimizer.state:
+                    pid = id(param)
+                    if pid not in self.pinned_opt_state:
+                        self.pinned_opt_state[pid] = {}
+                        
+                    for k, v in optimizer.state[param].items():
+                        if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                            if k not in self.pinned_opt_state[pid]:
+                                self.pinned_opt_state[pid][k] = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+                            self.pinned_opt_state[pid][k].copy_(v, non_blocking=True)
+                            optimizer.state[param][k] = self.pinned_opt_state[pid][k] # Разрыв связи с GPU-тензором
+
+            for name, buf in layer.named_buffers():
+                if buf.data.device.type != "cpu":
+                    self.pinned_cpu_state[layer_id][name].copy_(buf.data, non_blocking=True)
+                    buf.data = self.pinned_cpu_state[layer_id][name]
+            self.is_loaded[layer_id] = False
+            
+        # ЖДЕМ завершения выгрузки, чтобы не убить тензоры в полете
+        torch.cuda.current_stream().synchronize()
+        # ПРИНУДИТЕЛЬНО ОСВОБОЖДАЕМ ВИДЕОПАМЯТЬ! График упадет вниз.
+        torch.cuda.empty_cache()
+
     def remove(self):
         for handle in self.hook_handles: handle.remove()
         self.hook_handles.clear()
-        
-        for layer_id, state in self.pinned_cpu_state.items():
-            for layer in self.offloaded_layers:
-                if id(layer) == layer_id:
-                    for name, param in layer.named_parameters():
-                        param.data = state[name].to(self.device)
-                        if name in self.pinned_grad_state[layer_id]:
-                            if param.grad is None: param.grad = torch.empty_like(param.data)
-                            param.grad.data = self.pinned_grad_state[layer_id][name].to(self.device)
-                    for name, buf in layer.named_buffers():
-                        buf.data = state[name].to(self.device)
-                        
+        self.prepare_for_optimizer(None) # Фейк загрузка перед удалением
         self.pinned_cpu_state.clear()
         self.pinned_grad_state.clear()
+        self.pinned_opt_state.clear()
         self.offloaded_layers.clear()
         torch.cuda.empty_cache()
 
@@ -2263,10 +2296,16 @@ class ACEStepFinetuneTrainer:
                         accum_step += 1
 
                         if accum_step >= training_cfg.gradient_accumulation_steps:
+                            if block_swap is not None:
+                                block_swap.prepare_for_optimizer(optimizer)
+
                             torch.nn.utils.clip_grad_norm_(trainable_params, training_cfg.max_grad_norm)
                             optimizer.step()
                             scheduler.step()
                             optimizer.zero_grad(set_to_none=True)
+
+                            if block_swap is not None:
+                                block_swap.cleanup_after_optimizer(optimizer)
                             
                             global_step += 1
                             avg_loss = accum_loss / accum_step
