@@ -110,7 +110,7 @@ if not hasattr(mm, "_original_unload_all_models_acestep"):
 # ============================================================================
 def get_available_acestep_models():
     checkpoints_dir = os.path.join(ACESTEP_MODELS_DIR, "checkpoints")
-    models =["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft"] # Дефолтные
+    models =["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft", "acestep-v15-xl-base", "acestep-v15-xl-turbo", "acestep-v15-xl-sft"] # Дефолтные
     if os.path.exists(checkpoints_dir):
         for d in os.listdir(checkpoints_dir):
             if os.path.isdir(os.path.join(checkpoints_dir, d)) and d not in models:

@@ -691,7 +691,9 @@ def _save_complete_model(trained_model_state, output_dir, source_model_dir, vari
         code_files = ["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
         if variant == "turbo": code_files.append("modeling_acestep_v15_turbo.py")
         elif variant == "base": code_files.append("modeling_acestep_v15_base.py")
-        elif variant == "sft": code_files.append("modeling_acestep_v15_sft.py")
+        elif variant == "sft": code_files.append("modeling_acestep_v15_base.py")  # sft использует base модель
+        elif variant == "xl_turbo": code_files.append("modeling_acestep_v15_xl_turbo.py")
+        elif variant in ["xl_base", "xl_sft"]: code_files.append("modeling_acestep_v15_xl_base.py")  # xl_sft использует xl_base
         
         for f in code_files:
             src = os.path.join(source_model_dir, f)
@@ -932,7 +934,7 @@ class ACEStepModelConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "dropout": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -957,7 +959,7 @@ class ACEStepLoKRConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "linear_dim": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "linear_alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "factor": ("INT", {"default": -1, "min": -1, "max": 256}),
@@ -1764,7 +1766,7 @@ class ACEStepFinetuneTrainer:
         return {
             "required": {
                 "dataset_config": ("ACESTEP_DATASET",),
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
@@ -2515,7 +2517,7 @@ class ACEStepLoRAExtractor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo)"}),
+                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo, acestep-v15-xl-base и т.д.)"}),
                 "finetuned_model_path": ("STRING", {"default": "", "placeholder": "Путь к папке файнтюна"}),
                 "output_path": ("STRING", {"default": "./extracted_lora"}),
                 "rank": ("INT", {"default": 32, "min": 1}),
