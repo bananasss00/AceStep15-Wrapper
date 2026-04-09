@@ -73,9 +73,9 @@ def send_audio_to_remix(audio_file, lm_metadata, current_lyrics, current_caption
         llm_handler: Optional LLM handler.
 
     Returns:
-        46-tuple of Gradio updates (4 data + 42 mode-UI).
+        50-tuple of Gradio updates (4 data + 46 mode-UI).
     """
-    n_outputs = 46
+    n_outputs = 50
     if audio_file is None:
         return (gr.skip(),) * n_outputs
 
@@ -103,9 +103,9 @@ def send_audio_to_repaint(audio_file, lm_metadata, current_lyrics, current_capti
         llm_handler: Optional LLM handler.
 
     Returns:
-        46-tuple of Gradio updates (4 data + 42 mode-UI).
+        50-tuple of Gradio updates (4 data + 46 mode-UI).
     """
-    n_outputs = 46
+    n_outputs = 50
     if audio_file is None:
         return (gr.skip(),) * n_outputs
 

@@ -96,3 +96,6 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 /ACE-Step-1.5_ft
+/_acestep
+/acestep_diff
+/__acestep

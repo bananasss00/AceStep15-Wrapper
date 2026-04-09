@@ -1,6 +1,6 @@
 """Diffusion-related handler helpers."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from acestep.models.mlx.dit_generate import mlx_generate_diffusion
@@ -25,17 +25,21 @@ class DiffusionMixin:
         infer_method: str = "ode",
         shift: float = 3.0,
         timesteps=None,
+        infer_steps: Optional[int] = None,
+        guidance_scale: float = 1.0,
+        null_condition_emb: Optional[torch.Tensor] = None,
+        cfg_interval_start: float = 0.0,
+        cfg_interval_end: float = 1.0,
         audio_cover_strength: float = 1.0,
         encoder_hidden_states_non_cover=None,
         encoder_attention_mask_non_cover=None,
         context_latents_non_cover=None,
         disable_tqdm: bool = False,
+        sampler_mode: str = "euler",
+        velocity_norm_threshold: float = 0.0,
+        velocity_ema_factor: float = 0.0,
     ) -> Dict[str, Any]:
         """Run the MLX diffusion loop and return generated latents.
-
-        This method accepts the same signature as the handler diffusion path for
-        API compatibility. Attention-mask parameters are intentionally accepted
-        but unused because the MLX generator consumes hidden states/latents only.
 
         Args:
             encoder_hidden_states: Prompt conditioning tensor.
@@ -46,23 +50,25 @@ class DiffusionMixin:
             infer_method: Diffusion method, one of ``"ode"`` or ``"sde"``.
             shift: Timestep shift value.
             timesteps: Optional iterable or tensor-like custom timesteps.
+            infer_steps: Number of diffusion steps (overrides fixed 8-step table).
+            guidance_scale: CFG guidance strength (>1.0 enables CFG).
+            null_condition_emb: Null condition embedding tensor for CFG.
+            cfg_interval_start: Timestep ratio below which CFG is disabled.
+            cfg_interval_end: Timestep ratio above which CFG is disabled.
             audio_cover_strength: Blend factor for cover conditioning.
             encoder_hidden_states_non_cover: Optional non-cover conditioning tensor.
             encoder_attention_mask_non_cover: Unused; accepted for API compatibility.
             context_latents_non_cover: Optional non-cover context latent tensor.
             disable_tqdm: If True, suppress the diffusion progress bar.
+            sampler_mode: Sampler algorithm — ``"euler"`` or ``"heun"``.
+            velocity_norm_threshold: Velocity norm clamping threshold (0 = disabled).
+            velocity_ema_factor: Velocity EMA smoothing factor (0 = disabled).
 
         Returns:
             Dict[str, Any]: ``{"target_latents": torch.Tensor, "time_costs": dict}``.
-
-        Raises:
-            AttributeError: If required host attributes are missing.
-            ValueError: If infer method is unsupported or batch dimensions mismatch.
-            TypeError: If ``timesteps`` is neither iterable nor tensor-like.
         """
         import numpy as np
 
-        # Kept for API compatibility with non-MLX diffusion path.
         _ = encoder_attention_mask, encoder_attention_mask_non_cover
 
         for required_attr in ("mlx_decoder", "device", "dtype"):
@@ -92,7 +98,6 @@ class DiffusionMixin:
                 "Batch dimension mismatch: context_latents_non_cover must share dim 0 with context_latents"
             )
 
-        # Convert inputs to numpy (float32)
         enc_np = encoder_hidden_states.detach().cpu().float().numpy()
         ctx_np = context_latents.detach().cpu().float().numpy()
         src_shape = (src_latents.shape[0], src_latents.shape[1], src_latents.shape[2])
@@ -106,7 +111,11 @@ class DiffusionMixin:
             if context_latents_non_cover is not None else None
         )
 
-        # Convert timesteps tensor if present
+        null_cond_np = (
+            null_condition_emb.detach().cpu().float().numpy()
+            if null_condition_emb is not None else None
+        )
+
         ts_list = None
         if timesteps is not None:
             if hasattr(timesteps, "tolist"):
@@ -123,14 +132,21 @@ class DiffusionMixin:
             infer_method=infer_method,
             shift=shift,
             timesteps=ts_list,
+            infer_steps=infer_steps,
+            guidance_scale=guidance_scale,
+            null_condition_emb_np=null_cond_np,
+            cfg_interval_start=cfg_interval_start,
+            cfg_interval_end=cfg_interval_end,
             audio_cover_strength=audio_cover_strength,
             encoder_hidden_states_non_cover_np=enc_nc_np,
             context_latents_non_cover_np=ctx_nc_np,
             compile_model=getattr(self, "mlx_dit_compiled", False),
             disable_tqdm=disable_tqdm,
+            sampler_mode=sampler_mode,
+            velocity_norm_threshold=velocity_norm_threshold,
+            velocity_ema_factor=velocity_ema_factor,
         )
 
-        # Convert result latents back to PyTorch tensor on the correct device
         target_np = result["target_latents"]
         target_tensor = torch.from_numpy(target_np).to(device=self.device, dtype=self.dtype)
 

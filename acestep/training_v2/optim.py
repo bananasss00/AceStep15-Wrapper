@@ -32,7 +32,6 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     SequentialLR,
 )
-from acestep.training_v2.ademamix import AdEMAMix
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +46,6 @@ def build_optimizer(
     lr: float = 1e-4,
     weight_decay: float = 0.01,
     device_type: str = "cuda",
-    optimizer_kwargs: Optional[Dict[str, Any]] = None,
 ) -> torch.optim.Optimizer:
     """Create an optimizer from a string key.
 
@@ -55,72 +53,6 @@ def build_optimizer(
     """
     optimizer_type = optimizer_type.lower().strip()
 
-    if optimizer_kwargs is None:
-        optimizer_kwargs = {}
-
-    # --- Ademamix ---
-    if optimizer_type == "ademamix":
-        logger.info("[Side-Step] Using Bundled AdEMAMix optimizer")
-        
-        # Получаем параметры из UI (они передаются через kwargs)
-        alpha = optimizer_kwargs.get("ademamix_alpha", 5.0)
-        beta3 = optimizer_kwargs.get("ademamix_beta3", 0.9)
-        t_alpha_beta3 = optimizer_kwargs.get("ademamix_t_alpha_beta3", None)
-        
-        return AdEMAMix(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            alpha=alpha,
-            betas=(0.9, 0.999, beta3), # beta3 идет третьим параметром
-            t_alpha_beta3=t_alpha_beta3,
-            eps=1e-8
-        )
-
-    # --- Prodigy Plus Schedule Free ---
-    if optimizer_type == "prodigy_plus":
-        try:
-            from prodigyplus import ProdigyPlusScheduleFree
-            logger.info("[Side-Step] Using Prodigy Plus Schedule Free optimizer (Full Config)")
-            
-            actual_lr = lr if lr != 1e-4 else 1.0
-            
-            return ProdigyPlusScheduleFree(
-                params,
-                lr=actual_lr,
-                betas=optimizer_kwargs.get("betas", (0.9, 0.99)),
-                beta3=optimizer_kwargs.get("beta3", None),
-                weight_decay=weight_decay,
-                weight_decay_by_lr=optimizer_kwargs.get("weight_decay_by_lr", True),
-                d0=optimizer_kwargs.get("d0", 1e-6),
-                d_coef=optimizer_kwargs.get("d_coef", 1.0),
-                d_limiter=optimizer_kwargs.get("d_limiter", True),
-                prodigy_steps=optimizer_kwargs.get("prodigy_steps", 0),
-                schedulefree_c=optimizer_kwargs.get("schedulefree_c", 0),
-                eps=optimizer_kwargs.get("eps", 1e-8),
-                split_groups=optimizer_kwargs.get("split_groups", True),
-                split_groups_mean=optimizer_kwargs.get("split_groups_mean", False),
-                factored=optimizer_kwargs.get("factored", True),
-                factored_fp32=optimizer_kwargs.get("factored_fp32", True),
-                use_bias_correction=optimizer_kwargs.get("use_bias_correction", False),
-                use_stableadamw=optimizer_kwargs.get("use_stableadamw", True),
-                use_schedulefree=optimizer_kwargs.get("use_schedulefree", True),
-                use_speed=optimizer_kwargs.get("use_speed", False),
-                stochastic_rounding=optimizer_kwargs.get("stochastic_rounding", True),
-                fused_back_pass=optimizer_kwargs.get("fused_back_pass", False),
-                use_cautious=optimizer_kwargs.get("use_cautious", False),
-                use_grams=optimizer_kwargs.get("use_grams", False),
-                use_adopt=optimizer_kwargs.get("use_adopt", False),
-                use_orthograd=optimizer_kwargs.get("use_orthograd", False),
-                use_focus=optimizer_kwargs.get("use_focus", False)
-            )
-        except ImportError:
-            logger.warning(
-                "[Side-Step] prodigy-plus-schedule-free not installed. Falling back to AdamW."
-            )
-            optimizer_type = "adamw"
-
-    # --- Existing Optimizers ---
     if optimizer_type == "adamw8bit":
         try:
             from bitsandbytes.optim import AdamW8bit
@@ -137,23 +69,12 @@ def build_optimizer(
         try:
             from transformers.optimization import Adafactor
             logger.info("[Side-Step] Using Adafactor optimizer (minimal state memory)")
-
-            scale_parameter = optimizer_kwargs.get("scale_parameter", False)
-            relative_step = optimizer_kwargs.get("relative_step", False)
-            warmup_init = optimizer_kwargs.get("warmup_init", False)
-
-            actual_lr = lr
-            if relative_step:
-                logger.info("[Side-Step] Adafactor: 'relative_step=True' enabled. Ignoring manual learning_rate.")
-                actual_lr = None
-
             return Adafactor(
                 params,
-                lr=actual_lr,
+                lr=lr,
                 weight_decay=weight_decay,
-                scale_parameter=scale_parameter,
-                relative_step=relative_step,
-                warmup_init=warmup_init,
+                scale_parameter=False,
+                relative_step=False,
             )
         except ImportError:
             logger.warning(
@@ -167,22 +88,10 @@ def build_optimizer(
             logger.info(
                 "[Side-Step] Using Prodigy optimizer (adaptive LR -- set LR=1.0 for best results)"
             )
-
-            d_coef = optimizer_kwargs.get("d_coef", 1.0)
-            d0 = optimizer_kwargs.get("d0", 1e-6)
-            use_bias_correction = optimizer_kwargs.get("use_bias_correction", False)
-            safeguard_warmup = optimizer_kwargs.get("safeguard_warmup", False)
-
-            actual_lr = lr if lr != 1e-4 else 1.0
-
             return Prodigy(
                 params,
-                lr=actual_lr,
+                lr=lr if lr != 1e-4 else 1.0,  # Default to 1.0 for Prodigy
                 weight_decay=weight_decay,
-                d_coef=d_coef,
-                d0=d0,
-                use_bias_correction=use_bias_correction,
-                safeguard_warmup=safeguard_warmup,
             )
         except ImportError:
             logger.warning(
@@ -223,25 +132,12 @@ def build_scheduler(
     """
     scheduler_type = scheduler_type.lower().strip()
 
-    # Если оптимизатор управляет LR сам (Adafactor + relative_step=True),
-    # у него в param_groups лежит lr=None. Стандартные шедулеры упадут!
-    is_auto_lr = False
-    for group in optimizer.param_groups:
-        if group.get("lr") is None:
-            is_auto_lr = True
-            break
-
-    if is_auto_lr:
-        logger.info(f"[Side-Step] Optimizer uses internal LR (e.g. Adafactor). Disabling external scheduler.")
-        class DummyScheduler:
-            def __init__(self, optimizer): self.optimizer = optimizer
-            def step(self): pass
-            def get_last_lr(self): return [0.0] # На графике LR будет 0, т.к. он скрыт
-        return DummyScheduler(optimizer)
-
-    # Prodigy family (Plus & Standard) usually handle LR internally
-    if optimizer_type in ["prodigy", "prodigy_plus"] and scheduler_type not in ("constant", "constant_with_warmup"):
-        logger.info(f"[Side-Step] {optimizer_type} detected -- overriding scheduler to 'constant'")
+    # Prodigy handles its own LR -- force constant
+    if optimizer_type == "prodigy" and scheduler_type not in ("constant", "constant_with_warmup"):
+        logger.info(
+            "[Side-Step] Prodigy optimizer detected -- overriding scheduler to 'constant' "
+            "(Prodigy adapts LR internally)"
+        )
         scheduler_type = "constant"
 
     # Clamp warmup to avoid exceeding total

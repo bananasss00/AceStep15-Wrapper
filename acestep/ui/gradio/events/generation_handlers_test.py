@@ -18,6 +18,7 @@ class _FakeDitHandler:
     """Minimal DiT handler stub for analyze-src-audio tests."""
 
     def __init__(self, convert_result):
+        """Store a configurable conversion return value for test scenarios."""
         self._convert_result = convert_result
         self.model = MagicMock()  # Required by analyze_src_audio guard
 
@@ -30,8 +31,8 @@ class _FakeDitHandler:
 class GenerationHandlersTests(unittest.TestCase):
     """Tests for source-audio analysis validation behavior."""
 
-    @patch("acestep.ui.gradio.events.generation.llm_actions.gr.Warning")
-    @patch("acestep.ui.gradio.events.generation.llm_actions.understand_music")
+    @patch("acestep.ui.gradio.events.generation.llm_analysis_actions.gr.Warning")
+    @patch("acestep.ui.gradio.events.generation.llm_analysis_actions.understand_music")
     def test_analyze_src_audio_rejects_non_audio_code_output(
         self,
         understand_music_mock,
@@ -59,8 +60,8 @@ class GenerationHandlersTests(unittest.TestCase):
         understand_music_mock.assert_not_called()
         warning_mock.assert_called_once()
 
-    @patch("acestep.ui.gradio.events.generation.llm_actions.gr.Warning")
-    @patch("acestep.ui.gradio.events.generation.llm_actions.understand_music")
+    @patch("acestep.ui.gradio.events.generation.llm_analysis_actions.gr.Warning")
+    @patch("acestep.ui.gradio.events.generation.llm_analysis_actions.understand_music")
     def test_analyze_src_audio_allows_valid_audio_code_output(
         self,
         understand_music_mock,
@@ -248,6 +249,148 @@ class GenerationHandlersTests(unittest.TestCase):
             expected_message
         )
 
+    @patch("acestep.ui.gradio.events.generation.llm_sample_actions.gr.Info")
+    @patch("acestep.ui.gradio.events.generation.llm_sample_actions.create_sample")
+    def test_handle_create_sample_success_path(
+        self,
+        create_sample_mock,
+        info_mock,
+    ):
+        """Successful sample creation should populate generation fields and mode switch."""
+        llm_handler = SimpleNamespace(llm_initialized=True)
+        create_sample_mock.return_value = SimpleNamespace(
+            success=True,
+            caption="new caption",
+            lyrics="new lyrics",
+            bpm=120,
+            duration=42.0,
+            keyscale="C major",
+            language="en",
+            timesignature="4",
+            instrumental=False,
+            status_message="ok",
+        )
+
+        result = generation_handlers.handle_create_sample(
+            llm_handler=llm_handler,
+            query="test prompt",
+            instrumental=False,
+            vocal_language="en",
+            lm_temperature=0.85,
+            lm_top_k=20,
+            lm_top_p=0.9,
+            constrained_decoding_debug=False,
+        )
+
+        self.assertEqual(result[0], "new caption")
+        self.assertEqual(result[1], "new lyrics")
+        self.assertEqual(result[3], 42.0)
+        self.assertEqual(result[5], "en")
+        self.assertEqual(result[6], "en")
+        self.assertEqual(len(result), 15)
+        self.assertTrue(result[10])
+        self.assertEqual(result[13], "ok")
+        self.assertEqual(result[14]["value"], "Custom")
+        create_sample_mock.assert_called_once()
+        info_mock.assert_called_once()
+
+    @patch("acestep.ui.gradio.events.generation.llm_format_actions.gr.Warning")
+    def test_handle_format_caption_lm_not_initialized_regression(self, warning_mock):
+        """Caption formatting should return lm-not-initialized status when LM is unavailable."""
+        llm_handler = SimpleNamespace(llm_initialized=False)
+
+        result = generation_handlers.handle_format_caption(
+            llm_handler=llm_handler,
+            caption="caption",
+            lyrics="lyrics",
+            bpm=120,
+            audio_duration=30.0,
+            key_scale="C major",
+            time_signature="4",
+            lm_temperature=0.85,
+            lm_top_k=0,
+            lm_top_p=0.9,
+            constrained_decoding_debug=False,
+        )
+
+        self.assertEqual(result[-1], _t("messages.lm_not_initialized"))
+        warning_mock.assert_called_once_with(_t("messages.lm_not_initialized"))
+
+    @patch("acestep.ui.gradio.events.generation.llm_format_actions.gr.Info")
+    @patch("acestep.ui.gradio.events.generation.llm_format_actions.format_sample")
+    def test_handle_format_lyrics_strips_quotes(self, format_sample_mock, info_mock):
+        """Lyrics-only formatting should strip wrapper quotes from returned lyrics."""
+        llm_handler = SimpleNamespace(llm_initialized=True)
+        format_sample_mock.return_value = SimpleNamespace(
+            success=True,
+            caption="unused",
+            lyrics="'quoted lyrics'",
+            bpm=100,
+            duration=10.0,
+            keyscale="D minor",
+            language="en",
+            timesignature="4",
+            status_message="formatted",
+        )
+
+        result = generation_handlers.handle_format_lyrics(
+            llm_handler=llm_handler,
+            caption="caption",
+            lyrics="lyrics",
+            bpm=100,
+            audio_duration=10.0,
+            key_scale="D minor",
+            time_signature="4",
+            lm_temperature=0.85,
+            lm_top_k=0,
+            lm_top_p=0.9,
+            constrained_decoding_debug=False,
+        )
+
+        self.assertEqual(result[0], "quoted lyrics")
+        self.assertEqual(result[4], "en")
+        self.assertEqual(len(result), 8)
+        self.assertEqual(result[-1], "formatted")
+        format_sample_mock.assert_called_once()
+        info_mock.assert_called_once()
+
+    @patch("acestep.ui.gradio.events.generation.llm_format_actions.gr.Info")
+    @patch("acestep.ui.gradio.events.generation.llm_format_actions.format_sample")
+    def test_handle_format_sample_preserves_output_contract(self, format_sample_mock, info_mock):
+        """Full sample formatting should return 9 outputs with language at index 5."""
+        llm_handler = SimpleNamespace(llm_initialized=True)
+        format_sample_mock.return_value = SimpleNamespace(
+            success=True,
+            caption="caption out",
+            lyrics="lyrics out",
+            bpm=112,
+            duration=12.0,
+            keyscale="G major",
+            language="en",
+            timesignature="3/4",
+            status_message="formatted",
+        )
+
+        result = generation_handlers.handle_format_sample(
+            llm_handler=llm_handler,
+            caption="caption in",
+            lyrics="lyrics in",
+            bpm=112,
+            audio_duration=12.0,
+            key_scale="G major",
+            time_signature="3/4",
+            lm_temperature=0.85,
+            lm_top_k=0,
+            lm_top_p=0.9,
+            constrained_decoding_debug=False,
+        )
+
+        self.assertEqual(len(result), 9)
+        self.assertEqual(result[5], "en")
+        self.assertEqual(result[8], "formatted")
+        format_sample_mock.assert_called_once()
+        info_mock.assert_called_once()
+
 
 @unittest.skipIf(generation_handlers is None, f"generation_handlers import unavailable: {_IMPORT_ERROR}")
 class LoadMetadataLmCodesTests(unittest.TestCase):
@@ -280,9 +423,9 @@ class LoadMetadataLmCodesTests(unittest.TestCase):
             })
             result = generation_handlers.load_metadata(file_obj, llm_handler)
 
-        # think is at return position 30 (0-indexed)
-        think_value = result[30]
-        audio_codes_value = result[31]
+        # think is at return position 33 (0-indexed) after MP3 UI outputs
+        think_value = result[33]
+        audio_codes_value = result[34]
         self.assertFalse(think_value, "think should be False when audio_codes present")
         self.assertEqual(audio_codes_value, "<|audio_code_1|><|audio_code_2|>")
 
@@ -305,9 +448,69 @@ class LoadMetadataLmCodesTests(unittest.TestCase):
             })
             result = generation_handlers.load_metadata(file_obj, llm_handler)
 
-        think_value = result[30]
+        think_value = result[33]
         self.assertTrue(think_value, "think should remain True when audio_codes is empty")
 
+
+
+
+@unittest.skipIf(generation_handlers is None, f"generation_handlers import unavailable: {_IMPORT_ERROR}")
+class LoadMetadataMp3SanitizationTests(unittest.TestCase):
+    """Tests for MP3 metadata normalization and fallback behavior."""
+
+    def _write_json(self, tmpdir, data):
+        """Write a JSON file and return a SimpleNamespace with .name pointing to it."""
+        import json, os
+        path = os.path.join(tmpdir, "test.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return SimpleNamespace(name=path)
+
+    @patch("acestep.ui.gradio.events.generation.metadata_loading.gr.Info")
+    @patch("acestep.ui.gradio.events.generation.metadata_loading.get_global_gpu_config")
+    def test_load_metadata_normalizes_mp3_values_from_json(self, gpu_mock, info_mock):
+        """Uppercase MP3 metadata should be normalized to the UI-compatible values."""
+        import tempfile
+        gpu_cfg = MagicMock()
+        gpu_cfg.max_batch_size_with_lm = 8
+        gpu_cfg.max_batch_size_without_lm = 8
+        gpu_mock.return_value = gpu_cfg
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_obj = self._write_json(tmpdir, {
+                "audio_format": " MP3 ",
+                "mp3_bitrate": "320K",
+                "mp3_sample_rate": "44100",
+            })
+            result = generation_handlers.load_metadata(file_obj, None)
+
+        self.assertEqual(result[19], "mp3")
+        self.assertTrue(result[20]["visible"])
+        self.assertEqual(result[21]["value"], "320k")
+        self.assertEqual(result[22]["value"], 44100)
+
+    @patch("acestep.ui.gradio.events.generation.metadata_loading.gr.Info")
+    @patch("acestep.ui.gradio.events.generation.metadata_loading.get_global_gpu_config")
+    def test_load_metadata_falls_back_for_invalid_mp3_values(self, gpu_mock, info_mock):
+        """Invalid MP3 metadata should fall back to the supported defaults."""
+        import tempfile
+        gpu_cfg = MagicMock()
+        gpu_cfg.max_batch_size_with_lm = 8
+        gpu_cfg.max_batch_size_without_lm = 8
+        gpu_mock.return_value = gpu_cfg
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_obj = self._write_json(tmpdir, {
+                "audio_format": "mp3",
+                "mp3_bitrate": "999k",
+                "mp3_sample_rate": "44.1",
+            })
+            result = generation_handlers.load_metadata(file_obj, None)
+
+        self.assertEqual(result[19], "mp3")
+        self.assertTrue(result[20]["visible"])
+        self.assertEqual(result[21]["value"], "128k")
+        self.assertEqual(result[22]["value"], 48000)
 
 @unittest.skipIf(generation_handlers is None, f"generation_handlers import unavailable: {_IMPORT_ERROR}")
 class AutoCheckboxTests(unittest.TestCase):
