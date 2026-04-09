@@ -234,24 +234,29 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
         import peft.tuners.lora.torchao as peft_torchao
         import inspect
         
-        # Проверяем, не пропатчили ли мы уже
+        # 1. Патчим диспетчер (ошибка 'get_apply_tensor_subclass')
         if hasattr(peft_model, "dispatch_torchao") and not getattr(peft_model.dispatch_torchao, "_is_patched", False):
             orig_dispatch = peft_model.dispatch_torchao
             
             def patched_dispatch(target, adpt_name, **kwargs):
                 if hasattr(peft_torchao, "TorchaoLoraLinear"):
                     sig = inspect.signature(peft_torchao.TorchaoLoraLinear.__init__)
-                    # Добавляем аргумент, который разработчики PEFT забыли передать
                     if 'get_apply_tensor_subclass' in sig.parameters and 'get_apply_tensor_subclass' not in kwargs:
                         kwargs['get_apply_tensor_subclass'] = lambda *args, **kw: lambda x: x
                 return orig_dispatch(target, adpt_name, **kwargs)
             
             patched_dispatch._is_patched = True
-            
-            # Подменяем функцию во ВСЕХ модулях PEFT
             peft_model.dispatch_torchao = patched_dispatch
-            peft_torchao.dispatch_torchao = patched_dispatch
-            logger.info("Applied PEFT+TorchAO hotfix for FP8 LoRA loading (Full Coverage).")
+            if hasattr(peft_torchao, "dispatch_torchao"):
+                peft_torchao.dispatch_torchao = patched_dispatch
+            
+        # 2. СНИМАЕМ ИСКУССТВЕННЫЙ БЛОК НА FP8 (ошибка 'only supports int8')
+        if hasattr(peft_torchao, "TorchaoLoraLinear") and not getattr(peft_torchao.TorchaoLoraLinear, "_fp8_patched", False):
+            # Подменяем функцию проверки типов на "пустышку", чтобы она ничего не блокировала
+            peft_torchao.TorchaoLoraLinear._check_dtype_supported = lambda self: None
+            peft_torchao.TorchaoLoraLinear._fp8_patched = True
+            logger.info("Applied PEFT+TorchAO hotfix: FP8 support unlocked!")
+            
     except Exception as e:
         logger.warning(f"Failed to apply PEFT hotfix: {e}")
 
