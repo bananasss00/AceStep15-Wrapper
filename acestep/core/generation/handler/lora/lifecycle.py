@@ -229,6 +229,32 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
     if not lora_path or not lora_path.strip():
         return "❌ Please provide a LoRA path."
 
+    try:
+        import peft.tuners.lora.model as peft_model
+        import peft.tuners.lora.torchao as peft_torchao
+        import inspect
+        
+        # Проверяем, не пропатчили ли мы уже
+        if hasattr(peft_model, "dispatch_torchao") and not getattr(peft_model.dispatch_torchao, "_is_patched", False):
+            orig_dispatch = peft_model.dispatch_torchao
+            
+            def patched_dispatch(target, adpt_name, **kwargs):
+                if hasattr(peft_torchao, "TorchaoLoraLinear"):
+                    sig = inspect.signature(peft_torchao.TorchaoLoraLinear.__init__)
+                    # Добавляем аргумент, который разработчики PEFT забыли передать
+                    if 'get_apply_tensor_subclass' in sig.parameters and 'get_apply_tensor_subclass' not in kwargs:
+                        kwargs['get_apply_tensor_subclass'] = lambda *args, **kw: lambda x: x
+                return orig_dispatch(target, adpt_name, **kwargs)
+            
+            patched_dispatch._is_patched = True
+            
+            # Подменяем функцию во ВСЕХ модулях PEFT
+            peft_model.dispatch_torchao = patched_dispatch
+            peft_torchao.dispatch_torchao = patched_dispatch
+            logger.info("Applied PEFT+TorchAO hotfix for FP8 LoRA loading (Full Coverage).")
+    except Exception as e:
+        logger.warning(f"Failed to apply PEFT hotfix: {e}")
+
     lora_path = lora_path.strip()
     if not os.path.exists(lora_path):
         return f"❌ LoRA path not found: {lora_path}"
@@ -344,7 +370,7 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
             
             incompatible = set_peft_model_state_dict(self.model.decoder, clean_state_dict, adapter_name=effective_name)
             
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+            self._recursive_to_device(self.model.decoder, self.device, self.dtype)
             self.model.decoder.eval()
             
             if hasattr(self, "_memory_allocated"):
@@ -430,7 +456,7 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
             self.model.decoder.load_adapter(lora_path, adapter_name=effective_name)
             self._adapter_type = "lora"
 
-        self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+        self._recursive_to_device(self.model.decoder, self.device, self.dtype)
         self.model.decoder.eval()
 
         if hasattr(self, "_memory_allocated"):
@@ -554,7 +580,7 @@ def remove_lora(self, adapter_name: str) -> str:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+            self._recursive_to_device(self.model.decoder, self.device, self.dtype)
             self.model.decoder.eval()
             self.lora_loaded = False
             self.use_lora = False
@@ -654,7 +680,7 @@ def unload_lora(self) -> str:
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
 
-        self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+        self._recursive_to_device(self.model.decoder, self.device, self.dtype)
         self.model.decoder.eval()
 
         self.lora_loaded = False
