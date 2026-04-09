@@ -128,6 +128,7 @@ class AceStepModelLoader:
                 "lm_model_path": (["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-4B"], {"default": "acestep-5Hz-lm-1.7B"}),
                 "lm_backend": (["vllm", "pt", "mlx"], {"default": "vllm"}),
                 "use_flash_attention": ("BOOLEAN", {"default": True}),
+                "quantization": (["none", "fp8_weight_only", "w8a8_dynamic", "int8_weight_only"], {"default": "none", "tooltip": "FP8: Stochastic rounding для точности. W8A8: Динамическая активация. INT8: Базовая квантизация."}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -140,8 +141,10 @@ class AceStepModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "ACE-Step"
 
-    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, offload_to_cpu, custom_model_path=""):
+    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, quantization, offload_to_cpu, custom_model_path=""):
         print(f"[ACE-Step] Инициализация. Целевая папка моделей: {ACESTEP_MODELS_DIR}")
+        if quantization and quantization != "none":
+            print(f"[ACE-Step] 🪄 Квантизация модели: {quantization}")
         
         cleanup_all_acestep()
         
@@ -165,6 +168,7 @@ class AceStepModelLoader:
             device=device,
             use_flash_attention=use_flash_attention,
             compile_model=False,
+            quantization=quantization if quantization != "none" else None,
             offload_to_cpu=offload_to_cpu,
             offload_dit_to_cpu=offload_to_cpu
         )
@@ -198,6 +202,134 @@ class AceStepModelLoader:
         GLOBAL_ACESTEP_HANDLERS.append((dit_handler, llm_handler if llm_handler.llm_initialized else None))
 
         return ({"dit_handler": dit_handler, "llm_handler": llm_handler if llm_handler.llm_initialized else None, "active_adapters": {}},)
+
+# ============================================================================
+# FP8 КВАНТИЗАЦИЯ СО STOCHASTIC ROUNDING
+# ============================================================================
+def _calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
+    mantissa_scaled = torch.where(
+        normal_mask,
+        (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
+        (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS)))
+    )
+    mantissa_scaled += torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator)
+    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+def _manual_stochastic_round_to_float8(x, dtype, generator=None):
+    if dtype == torch.float8_e4m3fn:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7
+    elif dtype == getattr(torch, "float8_e5m2", None):
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 5, 2, 15
+    else:
+        raise ValueError("Unsupported dtype")
+
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
+        0, 2**EXPONENT_BITS - 1
+    )
+
+    normal_mask = ~(exponent == 0)
+    abs_x[:] = _calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator)
+
+    sign *= torch.where(
+        normal_mask,
+        (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
+        (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x
+    )
+
+    inf = torch.finfo(dtype)
+    torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
+    return sign
+
+def _stochastic_rounding_fp8(value, dtype, seed=0):
+    """Stochastic rounding для FP8 с использованием генератора случайных чисел."""
+    if dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        return value.to(dtype=dtype)
+    if dtype in [getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)]:
+        generator = torch.Generator(device=value.device)
+        generator.manual_seed(seed)
+        output = torch.empty_like(value, dtype=dtype)
+        num_slices = max(1, int(value.numel() / (4096 * 4096)))
+        slice_size = max(1, round(value.shape[0] / num_slices))
+        for i in range(0, value.shape[0], slice_size):
+            output[i:i+slice_size].copy_(_manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator))
+        return output
+    return value.to(dtype=dtype)
+
+class _QuantizedFP8Linear(torch.nn.Linear):
+    """DoRA-совместимая обертка для FP8. Возвращает BF16 веса для инициализации LoRA."""
+    @property
+    def weight(self):
+        return torch.nn.Parameter(self.weight_fp8.to(self.compute_dtype), requires_grad=False)
+
+    def forward(self, x):
+        w_dequant = self.weight_fp8.to(x.dtype)
+        return torch.nn.functional.linear(x, w_dequant, self.bias)
+
+class AceStepModelQuantizer:
+    """
+    Применяет FP8 квантизацию со stochastic rounding к уже загруженной модели.
+    Полезна для экономии VRAM при тренировке LoRA/DoRA.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("ACESTEP_MODEL",),
+                "quant_type": (["fp8", "none"], {"default": "fp8", "tooltip": "FP8 со stochastic rounding для точности"}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Сид для stochastic rounding"}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "quantize"
+    CATEGORY = "ACE-Step"
+
+    def quantize(self, model, quant_type, seed):
+        if quant_type == "none":
+            print("[ACE-Step Quantizer] ⏭️ Квантизация пропущена.")
+            return (model,)
+
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("[ACE-Step Quantizer] ❌ Ваша версия PyTorch не поддерживает float8_e4m3fn.")
+
+        dit_handler = model["dit_handler"]
+        decoder = getattr(dit_handler.model, "decoder", None)
+        
+        if decoder is None:
+            raise RuntimeError("[ACE-Step Quantizer] ❌ Не найден decoder в модели.")
+
+        print(f"\n[ACE-Step Quantizer] 🪄 Квантизация замороженных слоев в FP8 (Stochastic Rounding)...")
+        converted_count = 0
+
+        for name, module in decoder.named_modules():
+            if isinstance(module, torch.nn.Linear) and not module.weight.requires_grad:
+                # Применяем stochastic rounding
+                fp8_weight = _stochastic_rounding_fp8(module.weight.data, torch.float8_e4m3fn, seed=seed)
+
+                module.weight_fp8 = torch.nn.Parameter(fp8_weight, requires_grad=False)
+                module.compute_dtype = torch.bfloat16
+
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(torch.bfloat16)
+
+                del module.weight  # Удаляем BF16 тензор для экономии памяти
+                module.__class__ = _QuantizedFP8Linear
+                converted_count += 1
+
+        print(f"[ACE-Step Quantizer] ✅ Успешно конвертировано {converted_count} слоев в FP8.")
+        print(f"[ACE-Step Quantizer] 💾 Экономия VRAM: ~{converted_count * 0.5:.1f} МБ (приблизительно)")
+
+        # Обновляем состояние квантизации в handler
+        dit_handler.quantization = "fp8_weight_only"
+
+        return (model,)
 
 # ============================================================================
 # 2. Загрузчик LoRA
