@@ -87,6 +87,25 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
         if quantization == "w8a8_dynamic":
             from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
             return Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
+        if quantization == "nvfp4":
+            # Поддержка NVFP4 зависит от версии torchao, пробуем разные варианты импорта
+            try:
+                # Для новых версий (Float4 / FP4)
+                from torchao.quantization import Float4WeightOnlyConfig
+                return Float4WeightOnlyConfig()
+            except ImportError:
+                try:
+                    # Для прототипов NVFP4
+                    from torchao.quantization.prototype.nvfp4 import NVFP4WeightOnlyConfig
+                    return NVFP4WeightOnlyConfig()
+                except ImportError:
+                    try:
+                        # Fallback на универсальную fpx квантизацию (e2m1 - 2 бита экспоненты, 1 мантиссы)
+                        from torchao.quantization import fpx_weight_only
+                        return fpx_weight_only(3, 0)
+                    except ImportError:
+                        raise ValueError("NVFP4 is not supported in your current version of torchao. Please update torchao to the latest nightly build.")
+                        
         raise ValueError(f"Unsupported quantization type: {quantization}")
 
     def _apply_dit_quantization(self, quantization: Optional[str]) -> None:

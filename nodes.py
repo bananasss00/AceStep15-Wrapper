@@ -128,7 +128,7 @@ class AceStepModelLoader:
                 "lm_model_path": (["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-4B"], {"default": "acestep-5Hz-lm-1.7B"}),
                 "lm_backend": (["vllm", "pt", "mlx"], {"default": "vllm"}),
                 "use_flash_attention": ("BOOLEAN", {"default": True}),
-                "quantization": (["none", "fp8_weight_only", "w8a8_dynamic", "int8_weight_only"], {"default": "none", "tooltip": "FP8: Stochastic rounding для точности. W8A8: Динамическая активация. INT8: Базовая квантизация."}),
+                "quantization": (["none", "fp8_weight_only", "w8a8_dynamic", "int8_weight_only", "nvfp4"], {"default": "none", "tooltip": "NVFP4: Экспериментальная 4-битная float квантизация. FP8/INT8/W8A8: Стандартные методы."}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -1154,19 +1154,25 @@ class AceStepMusicGenerator:
         self._sync_loras(dit_handler, active_adapters, unload_unused_loras)
 
         is_merged = False
+        
+        # Проверяем, квантована ли модель
+        is_quantized = dit_handler.quantization is not None and dit_handler.quantization != "none"
+        
         if merge_loras:
-            # =================================================================
-            # ОПТИМИЗАЦИЯ VRAM: Слияние LoRA с базовой моделью "на лету"
-            # Это убирает накладные расходы на VRAM во время forward pass
-            # =================================================================
-            decoder = getattr(dit_handler.model, "decoder", None)
-            if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
-                try:
-                    print("[ACE-Step] Оптимизация VRAM: Временное слияние (merge) LoRA...")
-                    decoder.merge_adapter()
-                    is_merged = True
-                except Exception as e:
-                    print(f"[ACE-Step] Предупреждение: не удалось выполнить merge_adapter: {e}")
+            if is_quantized:
+                print("[ACE-Step] ℹ️ Слияние (merge) отключено: модель квантована. PEFT не поддерживает merge для torchao-тензоров. LoRA работает в динамическом режиме.")
+            else:
+                # =================================================================
+                # ОПТИМИЗАЦИЯ VRAM: Слияние LoRA с базовой моделью "на лету"
+                # =================================================================
+                decoder = getattr(dit_handler.model, "decoder", None)
+                if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
+                    try:
+                        print("[ACE-Step] Оптимизация VRAM: Временное слияние (merge) LoRA...")
+                        decoder.merge_adapter()
+                        is_merged = True
+                    except Exception as e:
+                        print(f"[ACE-Step] Предупреждение: не удалось выполнить merge_adapter: {e}")
             # =================================================================
 
         if thinking and llm_handler is None:
