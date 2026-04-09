@@ -193,50 +193,59 @@ def stochastic_rounding(value, dtype, seed=0):
         
     return value.to(dtype=dtype)
 
+def _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, compute_dtype):
+    """Оптимизированная распаковка NF4 без использования тяжелых Int64 (long)"""
+    w_flat = weight_packed.view(torch.uint8)
+    
+    # Используем int32 вместо long (int64), чтобы срезать потребление памяти в 2 раза!
+    unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.int32, device=w_flat.device)
+    unpacked[0::2] = (w_flat >> 4).to(torch.int32)
+    unpacked[1::2] = (w_flat & 0x0F).to(torch.int32)
+    
+    padded_in_features = unpacked.shape[0] // orig_shape[0]
+    blocks_per_row = padded_in_features // group_size
+    
+    w_dequant = lut[unpacked].view(orig_shape[0], blocks_per_row, group_size)
+    w_dequant = (w_dequant * scales).view(orig_shape[0], padded_in_features)
+    
+    if padded_in_features > orig_shape[1]:
+        w_dequant = w_dequant[:, :orig_shape[1]]
+        
+    return w_dequant.to(compute_dtype)
+
 class DequantizeNF4Linear(torch.autograd.Function):
     """
-    Кастомный Autograd для распаковки NF4 на лету. 
-    Математически точное применение скейлов к правильным размерностям.
+    True ZeRO-VRAM Autograd для NF4.
+    Деквантует веса на лету как в forward, так и в backward, 
+    НЕ сохраняя жирные 16-битные матрицы в кэше градиентов.
     """
     @staticmethod
     def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut):
-        # Быстрая распаковка 4 бита -> 8 бит
-        w_flat = weight_packed.view(torch.uint8)
-        high = (w_flat >> 4).long()
-        low = (w_flat & 0x0F).long()
+        # Деквантуем ТОЛЬКО для forward pass
+        w_dequant = _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, x.dtype)
         
-        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=x.device)
-        unpacked[0::2] = high
-        unpacked[1::2] = low
-        
-        # Восстанавливаем геометрию: [Out, Blocks, 64]
-        padded_in_features = unpacked.shape[0] // orig_shape[0]
-        blocks_per_row = padded_in_features // group_size
-        
-        # Де-квантование через LUT
-        w_dequant = lut[unpacked].view(orig_shape[0], blocks_per_row, group_size)
-        
-        # Умножаем на скейлы (scales имеет форму [Out, Blocks, 1]) и склеиваем в 2D
-        w_dequant = (w_dequant * scales).view(orig_shape[0], padded_in_features)
-        
-        # Обрезаем паддинг, если он был
-        if padded_in_features > orig_shape[1]:
-            w_dequant = w_dequant[:, :orig_shape[1]]
-            
-        w_dequant = w_dequant.to(x.dtype)
-        
-        ctx.save_for_backward(x, w_dequant)
+        # СОХРАНЯЕМ УПАКОВАННЫЕ (4-bit) ТЕНЗОРЫ, А НЕ w_dequant!
+        ctx.save_for_backward(x, weight_packed, scales, lut)
         ctx.use_bias = bias is not None
+        ctx.orig_shape = orig_shape
+        ctx.group_size = group_size
+        ctx.compute_dtype = x.dtype
         
+        # Вычисляем выход (внутри F.linear w_dequant будет уничтожен сборщиком мусора)
         return F.linear(x, w_dequant, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, w_dequant = ctx.saved_tensors
+        # Достаем 4-битные веса
+        x, weight_packed, scales, lut = ctx.saved_tensors
         grad_input = grad_weight = grad_scales = grad_bias = None
-        # Градиент только для входа (x), база остается замороженной
+        
         if ctx.needs_input_grad[0]:
+            # ПОВТОРНАЯ распаковка на лету ТОЛЬКО для расчета градиентов входа
+            w_dequant = _dequantize_nf4(weight_packed, scales, ctx.orig_shape, ctx.group_size, lut, ctx.compute_dtype)
             grad_input = grad_output.matmul(w_dequant)
+            # w_dequant снова удалится из памяти после этой строчки
+            
         return grad_input, None, None, None, None, None, None
 
 
@@ -244,24 +253,12 @@ class QuantizedNF4Linear(nn.Linear):
     """Динамическая обертка для NF4 (FP4 в UI). Отдает BF16 веса для инициализации DoRA."""
     @property
     def weight(self):
-        w_flat = self.weight_packed.view(torch.uint8)
-        high = (w_flat >> 4).long()
-        low = (w_flat & 0x0F).long()
-        
-        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=w_flat.device)
-        unpacked[0::2] = high
-        unpacked[1::2] = low
-        
-        padded_in_features = unpacked.shape[0] // self.orig_shape[0]
-        blocks_per_row = padded_in_features // self.group_size
-        
-        w_dequant = self.nf4_lut[unpacked].view(self.orig_shape[0], blocks_per_row, self.group_size)
-        w_dequant = (w_dequant * self.scales).view(self.orig_shape[0], padded_in_features)
-        
-        if padded_in_features > self.orig_shape[1]:
-            w_dequant = w_dequant[:, :self.orig_shape[1]]
-            
-        return nn.Parameter(w_dequant.to(self.scales.dtype), requires_grad=False)
+        # Вместо дублирования логики используем нашу чистую функцию
+        w_dequant = _dequantize_nf4(
+            self.weight_packed, self.scales, self.orig_shape, 
+            self.group_size, self.nf4_lut, self.scales.dtype
+        )
+        return nn.Parameter(w_dequant, requires_grad=False)
 
     def forward(self, x):
         return DequantizeNF4Linear.apply(
