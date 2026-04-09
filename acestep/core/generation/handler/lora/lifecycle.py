@@ -219,12 +219,12 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
     if self.model is None:
         return "❌ Model not initialized. Please initialize service first."
 
-    if self.quantization is not None:
-        return (
-            "❌ LoRA loading is not supported on quantized models. "
-            f"Current quantization: {self.quantization}. "
-            "Please re-initialize the service with quantization disabled, then try loading the LoRA adapter again."
-        )
+    # if self.quantization is not None:
+    #     return (
+    #         "❌ LoRA loading is not supported on quantized models. "
+    #         f"Current quantization: {self.quantization}. "
+    #         "Please re-initialize the service with quantization disabled, then try loading the LoRA adapter again."
+    #     )
 
     if not lora_path or not lora_path.strip():
         return "❌ Please provide a LoRA path."
@@ -319,7 +319,16 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
                         base_sd = decoder.state_dict()
                         if not base_sd:
                             raise ValueError("state_dict is empty - cannot backup decoder")
-                        self._base_decoder = {k: v.detach().cpu().clone() for k, v in base_sd.items()}
+                        
+                        self._base_decoder = {}
+                        for k, v in base_sd.items():
+                            try:
+                                self._base_decoder[k] = v.detach().cpu().clone()
+                            except Exception:
+                                # Fallback для квантованных тензоров (FP8/torchao), 
+                                # которые не поддерживают .clone()
+                                self._base_decoder[k] = v
+                                
                     except Exception as e:
                         logger.error(f"Failed to create state_dict backup: {e}")
                         raise
@@ -385,7 +394,15 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias:
                     state_dict = decoder.state_dict()
                     if not state_dict:
                         raise ValueError("state_dict is empty - cannot backup decoder")
-                    self._base_decoder = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+                    
+                    self._base_decoder = {}
+                    for k, v in state_dict.items():
+                        try:
+                            self._base_decoder[k] = v.detach().cpu().clone()
+                        except Exception:
+                            # Fallback для квантованных тензоров
+                            self._base_decoder[k] = v
+                            
                 except Exception as e:
                     logger.error(f"Failed to create state_dict backup: {e}")
                     raise
