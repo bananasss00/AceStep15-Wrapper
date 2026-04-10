@@ -220,32 +220,63 @@ def _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, compute_
         
     return w_dequant.to(compute_dtype)
 
-class DequantizeNF4Linear(torch.autograd.Function):
-    """True ZeRO-VRAM Autograd для NF4. Распаковывает на лету, не сохраняя 16-бит матрицу в графе."""
+class DequantizeFP8Linear(torch.autograd.Function):
+    """ZeRO-VRAM Autograd для FP8. Запрещает кешировать входы X и 16-битные веса."""
     @staticmethod
-    def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut):
-        w_dequant = _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, x.dtype)
-        
-        ctx.save_for_backward(x, weight_packed, scales, lut)
-        ctx.use_bias = bias is not None
-        ctx.orig_shape = orig_shape
-        ctx.group_size = group_size
-        ctx.compute_dtype = x.dtype
-        
-        return F.linear(x, w_dequant, bias)
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
+    def forward(ctx, x, weight_fp8, bias, compute_dtype):
+        w_dequant = weight_fp8.to(compute_dtype)
+        # Сохраняем ТОЛЬКО 8-битный вес! Мы не сохраняем X, т.к. градиент для слоя не нужен
+        ctx.save_for_backward(weight_fp8)
+        ctx.compute_dtype = compute_dtype
+        output = F.linear(x, w_dequant, bias)
+        del w_dequant # Обязательно освобождаем память
+        return output
 
     @staticmethod
+    @torch.cuda.amp.custom_bwd
     def backward(ctx, grad_output):
-        x, weight_packed, scales, lut = ctx.saved_tensors
+        weight_fp8, = ctx.saved_tensors
         grad_input = None
-        
+        if ctx.needs_input_grad[0]:
+            w_dequant = weight_fp8.to(ctx.compute_dtype)
+            grad_input = grad_output.matmul(w_dequant)
+            del w_dequant
+        return grad_input, None, None, None
+
+class QuantizedFP8Linear(nn.Linear):
+    @property
+    def weight(self):
+        w_dequant = self.weight_fp8.to(self.compute_dtype)
+        return nn.Parameter(w_dequant, requires_grad=False)
+
+    def forward(self, x):
+        return DequantizeFP8Linear.apply(x, self.weight_fp8, self.bias, self.compute_dtype)
+
+class DequantizeNF4Linear(torch.autograd.Function):
+    """ZeRO-VRAM Autograd для NF4. Запрещает кешировать входы X и 16-битные веса."""
+    @staticmethod
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
+    def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut, compute_dtype):
+        w_dequant = _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, compute_dtype)
+        ctx.save_for_backward(weight_packed, scales, lut)
+        ctx.orig_shape = orig_shape
+        ctx.group_size = group_size
+        ctx.compute_dtype = compute_dtype
+        output = F.linear(x, w_dequant, bias)
+        del w_dequant
+        return output
+
+    @staticmethod
+    @torch.cuda.amp.custom_bwd
+    def backward(ctx, grad_output):
+        weight_packed, scales, lut = ctx.saved_tensors
+        grad_input = None
         if ctx.needs_input_grad[0]:
             w_dequant = _dequantize_nf4(weight_packed, scales, ctx.orig_shape, ctx.group_size, lut, ctx.compute_dtype)
             grad_input = grad_output.matmul(w_dequant)
-            del w_dequant # Очищаем сразу после умножения
-            
-        return grad_input, None, None, None, None, None, None
-
+            del w_dequant
+        return grad_input, None, None, None, None, None, None, None
 
 class QuantizedNF4Linear(nn.Linear):
     @property
@@ -259,25 +290,15 @@ class QuantizedNF4Linear(nn.Linear):
     def forward(self, x):
         return DequantizeNF4Linear.apply(
             x, self.weight_packed, self.scales, self.bias, 
-            self.orig_shape, self.group_size, self.nf4_lut
+            self.orig_shape, self.group_size, self.nf4_lut, self.scales.dtype
         )
-
-
-class QuantizedFP8Linear(nn.Linear):
-    @property
-    def weight(self):
-        return nn.Parameter(self.weight_fp8.to(self.compute_dtype), requires_grad=False)
-
-    def forward(self, x):
-        w_dequant = self.weight_fp8.to(x.dtype)
-        return F.linear(x, w_dequant, self.bias)
-
 
 def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=42):
     if quant_type == "none":
         return
 
     converted_count = 0
+    visited = set() # ЗАЩИТА: хранит id() обработанных модулей, чтобы не сжимать их дважды
 
     if quant_type == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
@@ -286,17 +307,39 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
 
         print(f"🪄 [Quantization] Quantizing frozen layers to FP8 (Stochastic Rounding)...")
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
-                fp8_weight = stochastic_rounding(module.weight.data, torch.float8_e4m3fn, seed=seed)
+            # Достаем оригинальный слой из-под обертки PEFT, если она есть
+            if hasattr(module, 'base_layer') and isinstance(module.base_layer, nn.Linear):
+                target_module = module.base_layer
+            elif isinstance(module, nn.Linear):
+                target_module = module
+            else:
+                continue
+
+            # ЗАЩИТА от двойной обработки генератором
+            if id(target_module) in visited:
+                continue
+
+            # Убеждаемся, что мы не пытаемся сжать обучаемые веса (LoRA A/B и т.д.)
+            if hasattr(target_module, 'weight') and target_module.weight is not None and not target_module.weight.requires_grad:
+                if "lora_" in name or "lycoris" in target_module.__class__.__name__.lower() or "lora" in target_module.__class__.__name__.lower():
+                    continue
                 
-                module.weight_fp8 = nn.Parameter(fp8_weight, requires_grad=False)
-                module.compute_dtype = compute_dtype
+                visited.add(id(target_module))
                 
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(compute_dtype)
+                fp8_weight = stochastic_rounding(target_module.weight.data, torch.float8_e4m3fn, seed=seed)
+                target_module.weight_fp8 = nn.Parameter(fp8_weight, requires_grad=False)
+                target_module.compute_dtype = compute_dtype
+                
+                if target_module.bias is not None:
+                    target_module.bias.data = target_module.bias.data.to(compute_dtype)
                     
-                del module.weight 
-                module.__class__ = QuantizedFP8Linear 
+                # Безопасное удаление оригинального 16-битного веса
+                if hasattr(target_module, 'weight') and 'weight' in target_module._parameters:
+                    del target_module._parameters['weight']
+                elif hasattr(target_module, 'weight'):
+                    delattr(target_module, 'weight')
+                    
+                target_module.__class__ = QuantizedFP8Linear 
                 converted_count += 1
                 
         print(f"✅ [Quantization] Successfully converted {converted_count} layers to FP8.")
@@ -313,12 +356,27 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
         ], dtype=compute_dtype)
 
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
-                orig_shape = module.weight.shape
-                device = module.weight.device
+            if hasattr(module, 'base_layer') and isinstance(module.base_layer, nn.Linear):
+                target_module = module.base_layer
+            elif isinstance(module, nn.Linear):
+                target_module = module
+            else:
+                continue
+
+            if id(target_module) in visited:
+                continue
+
+            if hasattr(target_module, 'weight') and target_module.weight is not None and not target_module.weight.requires_grad:
+                if "lora_" in name or "lycoris" in target_module.__class__.__name__.lower() or "lora" in target_module.__class__.__name__.lower():
+                    continue
+
+                visited.add(id(target_module))
+
+                orig_shape = target_module.weight.shape
+                device = target_module.weight.device
                 
                 pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
-                w_padded = module.weight.data.float() 
+                w_padded = target_module.weight.data.float() 
                 if pad_len > 0:
                     w_padded = F.pad(w_padded, (0, pad_len))
                     
@@ -347,17 +405,22 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
                 low = flat_indices[1::2]
                 packed_weights = (high | low).contiguous()
                 
-                module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
-                module.scales = nn.Parameter(scales, requires_grad=False) 
-                module.register_buffer("nf4_lut", NF4_LUT.to(device))
-                module.orig_shape = orig_shape
-                module.group_size = group_size
+                target_module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
+                target_module.scales = nn.Parameter(scales, requires_grad=False) 
+                target_module.register_buffer("nf4_lut", NF4_LUT.to(device))
+                target_module.orig_shape = orig_shape
+                target_module.group_size = group_size
                 
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(compute_dtype)
+                if target_module.bias is not None:
+                    target_module.bias.data = target_module.bias.data.to(compute_dtype)
                     
-                del module.weight 
-                module.__class__ = QuantizedNF4Linear 
+                # Безопасное удаление оригинального 16-битного веса
+                if hasattr(target_module, 'weight') and 'weight' in target_module._parameters:
+                    del target_module._parameters['weight']
+                elif hasattr(target_module, 'weight'):
+                    delattr(target_module, 'weight')
+                    
+                target_module.__class__ = QuantizedNF4Linear 
                 converted_count += 1
                 
         print(f"✅ [Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
@@ -1579,9 +1642,6 @@ class ACEStepTrainer:
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
 
-            target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
-            apply_quantization_base_model(model, target_dtype, base_quantization, seed)
-
             if vram_cleanup:
                 print(f"🧹[System] Aggressive VRAM Cleanup...")
                 to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
@@ -1608,7 +1668,7 @@ class ACEStepTrainer:
             print("\n🔥 Starting Training Loop...")
             trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
             trainer.main_tensor_dir = main_tensor_dir
-            
+
             # === ВСТРАИВАЕМ WORKFLOW В SAFETENSORS ===
             if extra_pnginfo and "workflow" in extra_pnginfo:
                 try:
@@ -1663,8 +1723,17 @@ class ACEStepTrainer:
                 h, m = divmod(m, 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
 
+            is_first_yield = True
+
             try:
                 for update in trainer.train(training_state):
+                    # В этот момент trainer.module уже создан и PEFT внедрил LoRA адаптеры!
+                    if is_first_yield and trainer.module is not None:
+                        print("🪄 [Phase 3] Applying VRAM optimizations (FP8/NF4) to wrapped base layers...")
+                        target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+                        apply_quantization_base_model(trainer.module.model, target_dtype, base_quantization, seed)
+                        is_first_yield = False
+
                     if mm.processing_interrupted():
                         print("\n🛑 Training Interrupted by User via ComfyUI!")
                         training_state["should_stop"] = True
