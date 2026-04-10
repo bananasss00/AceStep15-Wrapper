@@ -1609,6 +1609,14 @@ class ACEStepTrainer:
             trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
             trainer.main_tensor_dir = main_tensor_dir
             
+            # === ВСТРАИВАЕМ WORKFLOW В SAFETENSORS ===
+            if extra_pnginfo and "workflow" in extra_pnginfo:
+                try:
+                    trainer.workflow_json = json.dumps(extra_pnginfo["workflow"], ensure_ascii=False)
+                    print("✅ [Workflow] Workflow JSON передан тренеру для встраивания в safetensors")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сериализации workflow: {e}")
+            
             import acestep.training.data_module as dm_module
             original_setup = dm_module.PreprocessedDataModule.setup
 

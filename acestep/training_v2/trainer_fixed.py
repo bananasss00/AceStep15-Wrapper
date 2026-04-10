@@ -98,6 +98,7 @@ class FixedLoRATrainer:
         self.module: Optional[FixedLoRAModule] = None
         self.fabric: Optional[Any] = None
         self.is_training = False
+        self.workflow_json: Optional[str] = None  # Workflow JSON для встраивания в safetensors
 
     # ------------------------------------------------------------------
     # Public API
