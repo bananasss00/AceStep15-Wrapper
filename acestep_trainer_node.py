@@ -1446,17 +1446,26 @@ class ACEStepTrainer:
             CURRENT_REG_WEIGHT = reg_weight
 
             os.makedirs(output_dir, exist_ok=True)
+            
+            # === СОХРАНЯЕМ WORKFLOW СРАЗУ В НАЧАЛЕ ТРЕНИРОВКИ ===
+            print(f"🔍 [Workflow] extra_pnginfo keys: {list(extra_pnginfo.keys()) if extra_pnginfo else 'None'}")
             if extra_pnginfo and "workflow" in extra_pnginfo:
+                workflow_path = os.path.join(output_dir, "workflow.json")
+                print(f"💾 [Workflow] Сохранение workflow в {workflow_path}")
                 try:
-                    with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
-                        json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except: pass
+                    with open(workflow_path, "w", encoding="utf-8") as f:
+                        json.dump(extra_pnginfo["workflow"], f, indent=2, ensure_ascii=False)
+                    print(f"✅ [Workflow] Workflow успешно сохранён!")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сохранения workflow: {e}")
+            else:
+                print("⚠️ [Workflow] Workflow данные не найдены в extra_pnginfo")
 
             dataset_name = "default_dataset"
             if clean_source:
                 dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
-            
+
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
             gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
             device = gpu_info.device if gpu_info else "cuda"
@@ -2018,20 +2027,28 @@ class ACEStepFinetuneTrainer:
                     print("⚠️ Expect OOM on 16GB GPU. Use AdamW8bit or Adafactor, or set to 'projectors_only'.")
 
             os.makedirs(output_dir, exist_ok=True)
+            
+            # === СОХРАНЯЕМ WORKFLOW СРАЗУ В НАЧАЛЕ ТРЕНИРОВКИ ===
+            print(f"🔍 [Workflow] extra_pnginfo keys: {list(extra_pnginfo.keys()) if extra_pnginfo else 'None'}")
             if extra_pnginfo and "workflow" in extra_pnginfo:
-                print(f"💾 Saving workflow to {output_dir}/workflow.json")
+                workflow_path = os.path.join(output_dir, "workflow.json")
+                print(f"💾 [Workflow] Сохранение workflow в {workflow_path}")
                 try:
-                    with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
-                        json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except: pass
+                    with open(workflow_path, "w", encoding="utf-8") as f:
+                        json.dump(extra_pnginfo["workflow"], f, indent=2, ensure_ascii=False)
+                    print(f"✅ [Workflow] Workflow успешно сохранён!")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сохранения workflow: {e}")
+            else:
+                print("⚠️ [Workflow] Workflow данные не найдены в extra_pnginfo")
 
             dataset_name = "default_dataset"
             if clean_source:
                 dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
-            
+
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
-            
+
             gpu_info = None
             try:
                 from acestep.training_v2.gpu_utils import detect_gpu
