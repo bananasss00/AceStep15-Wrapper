@@ -201,6 +201,17 @@ def save_checkpoint(
     """
     save_adapter_flat(trainer, ckpt_dir)
 
+    # Проверяем, нужно ли сохранять training_state
+    save_state = getattr(trainer.training_config, "save_state", True)
+    if not save_state:
+        logger.info(
+            "Training checkpoint saved to %s (epoch %d, step %d) - training_state skipped to save disk I/O",
+            ckpt_dir,
+            epoch,
+            global_step,
+        )
+        return
+
     # Save optimizer / scheduler / progress for resume
     training_state = {
         "epoch": epoch,

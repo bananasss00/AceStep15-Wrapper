@@ -30,7 +30,7 @@ from server import PromptServer
 
 try:
     from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
-    from acestep.training_v2.trainer_fixed import FixedLoRATrainer
+    # ВАЖНО: Не импортировать trainer_fixed здесь! Сначала применяем патч, потом импортируем
     from acestep.training_v2.model_loader import load_decoder_for_training
     from acestep.training_v2.preprocess import preprocess_audio_files
     from acestep.training_v2.gpu_utils import detect_gpu
@@ -47,6 +47,59 @@ try:
     torch.set_float32_matmul_precision('medium')
 except:
     pass
+
+# ======================================================================
+# ПАТЧ: БЛОКИРОВКА СОХРАНЕНИЯ СОСТОЯНИЙ ОПТИМИЗАТОРА (РЕЗЕРВНЫЙ)
+# Примечание: Основная поддержка добавлена в бекенд trainer_helpers.py
+# Этот патч — резервная копия на случай обновлений бекенда
+# ======================================================================
+try:
+    import acestep.training_v2.trainer_helpers as _th_pre_import
+
+    if not hasattr(_th_pre_import, "_original_save_checkpoint"):
+        _th_pre_import._original_save_checkpoint = _th_pre_import.save_checkpoint
+
+        def _custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
+            import os
+            import torch
+
+            _th_pre_import.save_adapter_flat(trainer, ckpt_dir)
+            save_state = getattr(trainer.training_config, "save_state", True)
+            if not save_state:
+                print(f"💾 [Checkpoint] Сохранение адаптеров на epoch {epoch} (training_state пропущен для экономии места)")
+                return
+
+            training_state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            state_path = os.path.join(ckpt_dir, "training_state.pt")
+            torch.save(training_state, state_path)
+
+            try:
+                from safetensors.torch import save_file as _save_safetensors
+                meta_tensors = {
+                    "epoch": torch.tensor([epoch], dtype=torch.int64),
+                    "global_step": torch.tensor([global_step], dtype=torch.int64),
+                }
+                sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
+                _save_safetensors(meta_tensors, sf_path)
+            except Exception:
+                pass
+            print(f"💾 [Checkpoint] Адаптеры + training_state сохранены на epoch {epoch}")
+
+        _th_pre_import.save_checkpoint = _custom_save_checkpoint
+        print("✅ [Patch] save_checkpoint резервный патч применён")
+except Exception as e:
+    print(f"⚠️ [Patch] Ошибка резервного патча save_checkpoint: {e}")
+
+# Теперь импортируем trainer_fixed после применения патча
+try:
+    from acestep.training_v2.trainer_fixed import FixedLoRATrainer
+except ImportError as e:
+    print(f"⚠️ [ACE-Step] Failed to import FixedLoRATrainer: {e}")
 
 # Оптимизированный CFG Dropout (Без создания лишних нулей/единиц)
 def fast_cfg_dropout(encoder_hidden_states, null_condition_emb, cfg_ratio=0.15):
@@ -92,49 +145,6 @@ import acestep.training.lora_utils
 acestep.training.lora_utils.safe_path = bypass_safe_path
 import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
-
-# ======================================================================
-# ПАТЧ: БЛОКИРОВКА СОХРАНЕНИЯ СОСТОЯНИЙ ОПТИМИЗАТОРА (ЭКОНОМИЯ ДИСКА)
-# ======================================================================
-try:
-    import acestep.training_v2.trainer_helpers as th
-    
-    if not hasattr(th, "_original_save_checkpoint"):
-        th._original_save_checkpoint = th.save_checkpoint
-
-        def custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
-            import os
-            import torch
-            
-            th.save_adapter_flat(trainer, ckpt_dir)
-            save_state = getattr(trainer.training_config, "save_state", True)
-            if not save_state:
-                print(f"💾 Checkpoint saved at epoch {epoch} (training state skipped to save disk I/O)")
-                return
-
-            training_state = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-            }
-            state_path = os.path.join(ckpt_dir, "training_state.pt")
-            torch.save(training_state, state_path)
-
-            try:
-                from safetensors.torch import save_file as _save_safetensors
-                meta_tensors = {
-                    "epoch": torch.tensor([epoch], dtype=torch.int64),
-                    "global_step": torch.tensor([global_step], dtype=torch.int64),
-                }
-                sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
-                _save_safetensors(meta_tensors, sf_path)
-            except Exception: pass
-            print(f"💾 Checkpoint and training state saved at epoch {epoch}")
-
-        th.save_checkpoint = custom_save_checkpoint
-except Exception as e:
-    print(f"⚠️ [ACE-Step] Custom save patch failed: {e}")
 
 # ======================================================================
 # FP8 / FP4 STOCHASTIC ROUNDING & QUANTIZATION UTILS
@@ -856,7 +866,7 @@ class ACEStepDatasetConfig:
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
                 "save_final": ("BOOLEAN", {"default": False}),
-                "save_state": ("BOOLEAN", {"default": False, "tooltip": "Save training_state.pt for resuming"}),
+                "save_state": ("BOOLEAN", {"default": False, "label_on": "Yes", "label_off": "No", "tooltip": "Сохранять training_state.pt (optimizer, scheduler) для возобновления тренировки. Включите только если планируете продолжать тренировку. Экономит ~50-200 МБ на чекпоинт."}),
             },
             "optional": {
                 "reg_data_source": ("STRING", {"default": ""}),
@@ -1559,6 +1569,12 @@ class ACEStepTrainer:
             )
             train_cfg.save_state = dataset_config.get("save_state", True)
             train_cfg.save_final_model = dataset_config.get("save_final", False)
+            
+            # Информируем о режиме сохранения training_state
+            if train_cfg.save_state:
+                print("💾 [Save State] ✅ Сохранение training_state.pt ВКЛЮЧЕНО (можно возобновить тренировку)")
+            else:
+                print("💾 [Save State] ⏭️ Сохранение training_state.pt ОТКЛЮЧЕНО (экономия места, только адаптеры)")
 
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
@@ -2133,6 +2149,13 @@ class ACEStepFinetuneTrainer:
                 model_variant=model_variant,
                 dataset_dir=main_tensor_dir
             )
+            
+            # Информируем о режиме сохранения training_state
+            finetune_save_state = dataset_config.get("save_state", False)
+            if finetune_save_state:
+                print("💾 [Save State] ✅ Сохранение training_state.pt ВКЛЮЧЕНО (можно возобновить тренировку)")
+            else:
+                print("💾 [Save State] ⏭️ Сохранение training_state.pt ОТКЛЮЧЕНО (экономия места, только адаптеры)")
 
             print(f"🧠[Phase 2] Loading {model_variant} model on {device} ({precision})...")
             from acestep.training_v2.model_loader import load_decoder_for_training
@@ -2414,10 +2437,10 @@ class ACEStepFinetuneTrainer:
 
                     if should_save:
                         ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
-                        
+
                         _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant, extra_pnginfo, prompt)
-                        
-                        if dataset_config.get("save_state", True):
+
+                        if finetune_save_state:
                             state_save = {
                                 "epoch": epoch + 1,
                                 "global_step": global_step,
@@ -2438,8 +2461,6 @@ class ACEStepFinetuneTrainer:
                             last_ep = epoch_history[-1]
                             if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                 saved_epochs.append(last_ep)
-                                
-                        print(f"💾 Checkpoint and training state saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
                             self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
