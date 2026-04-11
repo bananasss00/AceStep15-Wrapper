@@ -251,6 +251,14 @@ class QuantizedFP8Linear(nn.Linear):
         return nn.Parameter(w_dequant, requires_grad=False)
 
     def forward(self, x):
+        # БАГФИКС: Обходим autograd.Function во время генерации (инференса)
+        if not torch.is_grad_enabled():
+            w_dequant = self.weight_fp8.to(self.compute_dtype)
+            # Фикс несовпадения типов (Float32 vs BFloat16)
+            if w_dequant.dtype != x.dtype:
+                w_dequant = w_dequant.to(x.dtype)
+            return F.linear(x, w_dequant, self.bias)
+            
         return DequantizeFP8Linear.apply(x, self.weight_fp8, self.bias, self.compute_dtype)
 
 class DequantizeNF4Linear(torch.autograd.Function):
@@ -288,6 +296,17 @@ class QuantizedNF4Linear(nn.Linear):
         return nn.Parameter(w_dequant, requires_grad=False)
 
     def forward(self, x):
+        # БАГФИКС: Обходим autograd.Function во время генерации (инференса)
+        if not torch.is_grad_enabled():
+            w_dequant = _dequantize_nf4(
+                self.weight_packed, self.scales, self.orig_shape, 
+                self.group_size, self.nf4_lut, self.scales.dtype
+            )
+            # Фикс несовпадения типов (Float32 vs BFloat16)
+            if w_dequant.dtype != x.dtype:
+                w_dequant = w_dequant.to(x.dtype)
+            return F.linear(x, w_dequant, self.bias)
+            
         return DequantizeNF4Linear.apply(
             x, self.weight_packed, self.scales, self.bias, 
             self.orig_shape, self.group_size, self.nf4_lut, self.scales.dtype

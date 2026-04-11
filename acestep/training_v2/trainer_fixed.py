@@ -392,7 +392,7 @@ class FixedLoRATrainer:
                     attention_mask=attention_mask,
                     is_covers=is_covers,
                     infer_steps=steps,
-                    diffusion_guidance_sale=guidance_scale,
+                    diffusion_guidance_scale=guidance_scale,
                     shift=shift,
                     use_cache=True,
                     infer_method="ode",
