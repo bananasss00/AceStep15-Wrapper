@@ -942,6 +942,75 @@ class AceStepPromptEnhancer:
         return (final_caption, final_lyrics, final_bpm, final_key, final_ts, final_lang)
 
 # ============================================================================
+# Настройки для режима Cover (Ремикс / Перепевка)
+# ============================================================================
+class AceStepCoverConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_audio": ("AUDIO", {"tooltip": "Исходное аудио, из которого будет сделан кавер"}),
+                "audio_cover_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "1.0 = максимально близко к исходнику, меньше = больше креатива/изменений ритма."}),
+                "cover_noise_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0.0 = чистый звук, 1.0 = звук ближе к оригиналу с сохранением исходного тембра."}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_EDIT_CONFIG",)
+    RETURN_NAMES = ("edit_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Modes"
+
+    def create_config(self, source_audio, audio_cover_strength, cover_noise_strength):
+        return ({
+            "task_type": "cover",
+            "source_audio": source_audio,
+            "audio_cover_strength": audio_cover_strength,
+            "cover_noise_strength": cover_noise_strength,
+            "repainting_start": 0.0,
+            "repainting_end": -1.0,
+            "repaint_mode": "balanced",
+            "repaint_strength": 0.5,
+        },)
+
+
+# ============================================================================
+# Настройки для режимов Repaint / Complete / Lego
+# ============================================================================
+class AceStepRepaintConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "task_type": (["repaint", "complete", "lego"], {"default": "repaint", "tooltip": "Repaint: Замена куска. Complete: Продление трека. Lego: Добавление инструмента поверх."}),
+                "source_audio": ("AUDIO", {"tooltip": "Исходное аудио, которое будем редактировать"}),
+                "edit_start_sec": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 0.1, "tooltip": "Время начала редактирования (в секундах)"}),
+                "edit_end_sec": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "step": 0.1, "tooltip": "Время окончания. -1 означает 'редактировать до конца трека'"}),
+                "repaint_mode": (["balanced", "conservative", "aggressive"], {"default": "balanced", "tooltip": "Conservative = сохраняет максимум оригинала на стыках."}),
+                "repaint_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Интенсивность перерисовки (только для режима 'balanced')"}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_EDIT_CONFIG",)
+    RETURN_NAMES = ("edit_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Modes"
+
+    def create_config(self, task_type, source_audio, edit_start_sec, edit_end_sec, repaint_mode, repaint_strength):
+        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
+             raise ValueError(f"[ACE-Step Repaint] ОШИБКА: Время окончания ({edit_end_sec}s) должно быть больше времени начала ({edit_start_sec}s).")
+             
+        return ({
+            "task_type": task_type,
+            "source_audio": source_audio,
+            "repainting_start": edit_start_sec,
+            "repainting_end": edit_end_sec,
+            "repaint_mode": repaint_mode,
+            "repaint_strength": repaint_strength,
+            "audio_cover_strength": 1.0, # Не используется в repaint
+            "cover_noise_strength": 0.0, # Не используется в repaint
+        },)
+    
+# ============================================================================
 # 5. Генератор Музыки
 # ============================================================================
 class AceStepMusicGenerator:
@@ -950,38 +1019,25 @@ class AceStepMusicGenerator:
         return {
             "required": {
                 "model": ("ACESTEP_MODEL",),
-                "task_type": (["text2music", "cover", "repaint", "complete", "lego"], {"default": "text2music"}),
                 "caption": ("STRING", {"multiline": True, "default": "piano solo"}),
                 "lyrics": ("STRING", {"multiline": True, "default": "[Instrumental]"}),
-                "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "tooltip": "Длительность в секундах (-1 для автоматического определения по тексту/аудио)"}),
+                "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "tooltip": "Длительность (-1 для авто-определения)"}),
                 "inference_steps": ("INT", {"default": 8, "min": 1, "max": 200}),
                 "guidance_scale": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 15.0, "step": 0.1}),
-                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1, "tooltip": "Смещение таймстепов (Timestep shift factor)"}),
-                "thinking": ("BOOLEAN", {"default": True, "tooltip": "Генерация недостающих данных и аудио-кодов через LLM"}),
+                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "thinking": ("BOOLEAN", {"default": True, "tooltip": "Использовать LLM для рассуждений (CoT)"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
                 "merge_loras": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "reference_audio": ("AUDIO", {"tooltip": "РЕФЕРЕНС: Аудио для переноса стиля и звучания"}),
-                "source_audio": ("AUDIO", {"tooltip": "ИСХОДНОЕ АУДИО: Обязательно подключите для режимов cover, repaint, complete, lego"}),
-
-                # --- Музыкальные метаданные ---
+                "edit_config": ("ACESTEP_EDIT_CONFIG", {"tooltip": "Подключите сюда ноду Cover Config или Repaint Config для активации этих режимов."}),
+                "reference_audio": ("AUDIO", {"tooltip": "РЕФЕРЕНС: Аудио для переноса стиля и общего звучания (работает во всех режимах)"}),
                 "vocal_language": (["unknown", "en", "ja", "zh", "es", "de", "fr", "pt", "ru", "it", "nl", "pl", "tr", "vi", "cs", "fa", "id", "ko", "uk", "hu", "ar", "sv", "ro", "el"], {"default": "unknown"}),
                 "bpm": ("INT", {"default": 0, "tooltip": "0 = Авто"}),
-                "key_scale": ([""] + [f"{root} {quality}" for quality in ["major", "minor"] for root in["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]], {"default": ""}),
+                "key_scale": ([""] +[f"{root} {quality}" for quality in ["major", "minor"] for root in["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]], {"default": ""}),
                 "time_signature": (['', '2', '3', '4', '6'], {"default": ""}),
                 "lm_config": ("ACESTEP_LM_CONFIG",),
-
-                # --- Тайминги для режимов Repaint / Complete / Lego ---
-                "edit_start_sec": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 0.1, "tooltip": "[Repaint/Complete/Lego] Время начала редактирования трека (в секундах)"}),
-                "edit_end_sec": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "step": 0.1, "tooltip": "[Repaint/Complete/Lego] Время окончания редактирования. -1 означает 'до конца трека'"}),
-                "repaint_mode": (["balanced", "conservative", "aggressive"], {"default": "balanced", "tooltip": "[Repaint] Стиль наложения и кроссфейда на границах. Conservative сохраняет максимум оригинального звука."}),
-                "repaint_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "[Repaint] Интенсивность перерисовки (от 0.0 до 1.0). Работает только в режиме 'balanced'"}),
-                
-                # --- Настройки режима Cover ---
-                "audio_cover_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "[Cover] Степень сохранения оригинала. 1.0 = максимально близко к исходнику, меньше = больше креатива."}),
-                "cover_noise_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "[Cover] Уровень шума. 0.0 = чистый новый звук, 1.0 = ближе к оригиналу."}),
             }
         }
 
@@ -1151,22 +1207,31 @@ class AceStepMusicGenerator:
                             
                 dit_handler.use_lora = False
 
-    def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
+    def generate(self, model, caption, lyrics, duration, inference_steps, 
                  guidance_scale, shift, thinking, seed, unload_unused_loras, merge_loras, 
-                 source_audio=None, reference_audio=None, 
-                 edit_start_sec=0.0, edit_end_sec=-1.0, repaint_mode="balanced", repaint_strength=0.5,
-                 audio_cover_strength=1.0, cover_noise_strength=0.0,
+                 edit_config=None, reference_audio=None, 
                  vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
         
-        # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
-        requires_source = ["cover", "repaint", "complete", "lego"]
-        if task_type in requires_source and source_audio is None:
-            raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
-        
-        # ЗАЩИТА: Проверка валидности времени редактирования
-        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
-             raise ValueError(f"[ACE-Step] ОШИБКА: Время окончания (edit_end_sec) должно быть больше времени начала (edit_start_sec) или равно -1.0 (до конца трека).")
-        
+        # Распаковка режима из edit_config (если не подключен, то базовый text2music)
+        task_type = "text2music"
+        source_audio = None
+        edit_start_sec = 0.0
+        edit_end_sec = -1.0
+        repaint_mode = "balanced"
+        repaint_strength = 0.5
+        audio_cover_strength = 1.0
+        cover_noise_strength = 0.0
+
+        if edit_config is not None:
+            task_type = edit_config.get("task_type", "text2music")
+            source_audio = edit_config.get("source_audio")
+            edit_start_sec = edit_config.get("repainting_start", 0.0)
+            edit_end_sec = edit_config.get("repainting_end", -1.0)
+            repaint_mode = edit_config.get("repaint_mode", "balanced")
+            repaint_strength = edit_config.get("repaint_strength", 0.5)
+            audio_cover_strength = edit_config.get("audio_cover_strength", 1.0)
+            cover_noise_strength = edit_config.get("cover_noise_strength", 0.0)
+
         dit_handler = model["dit_handler"]
         llm_handler = model["llm_handler"]
         active_adapters = model.get("active_adapters", {})
@@ -1178,16 +1243,14 @@ class AceStepMusicGenerator:
         
         if merge_loras:
             if is_quantized:
-                print("[ACE-Step] ℹ️ Слияние (merge) отключено: модель квантована. LoRA работает в динамическом режиме.")
+                print("[ACE-Step] ℹ️ Слияние отключено: модель квантована.")
             else:
                 decoder = getattr(dit_handler.model, "decoder", None)
                 if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
                     try:
-                        print("[ACE-Step] Оптимизация VRAM: Временное слияние (merge) LoRA...")
                         decoder.merge_adapter()
                         is_merged = True
-                    except Exception as e:
-                        print(f"[ACE-Step] Предупреждение: не удалось выполнить merge_adapter: {e}")
+                    except Exception: pass
 
         if thinking and llm_handler is None:
             thinking = False
@@ -1211,7 +1274,6 @@ class AceStepMusicGenerator:
             lm_cfg = lm_config.get("lm_cfg_scale", 2.0)
             lm_tk = lm_config.get("lm_top_k", 0)
             lm_tp = lm_config.get("lm_top_p", 0.9)
-            
             lm_neg_prompt = lm_config.get("lm_negative_prompt", "NO USER INPUT")
             use_cot_metas = lm_config.get("use_cot_metas", True)
             use_cot_caption = lm_config.get("use_cot_caption", True)
@@ -1225,14 +1287,13 @@ class AceStepMusicGenerator:
             inference_steps=inference_steps, guidance_scale=guidance_scale,
             shift=shift, seed=seed,
             thinking=thinking, reference_audio=ref_path,
-            src_audio=src_path if task_type != "text2music" else None,
+            src_audio=src_path, # Для text2music src_path будет None
             use_cot_metas=use_cot_metas, 
             use_cot_caption=use_cot_caption, 
             use_cot_language=use_cot_language,
             lm_temperature=lm_temp, lm_cfg_scale=lm_cfg, lm_top_k=lm_tk, 
             lm_top_p=lm_tp, lm_negative_prompt=lm_neg_prompt,
             
-            # Новые параметры редактирования
             audio_cover_strength=audio_cover_strength,
             cover_noise_strength=cover_noise_strength,
             repainting_start=edit_start_sec,
@@ -1295,13 +1356,14 @@ class AceStepMusicGenerator:
             if ref_path and os.path.exists(ref_path): os.remove(ref_path)
             if src_path and os.path.exists(src_path): os.remove(src_path)
 
-
 NODE_CLASS_MAPPINGS = {
     "AceStepModelLoader": AceStepModelLoader,
     "AceStepLoraLoader": AceStepLoraLoader,
     "AceStepLoraBaker": AceStepLoraBaker,
     "AceStepLMConfig": AceStepLMConfig,
     "AceStepPromptEnhancer": AceStepPromptEnhancer,
+    "AceStepCoverConfig": AceStepCoverConfig,
+    "AceStepRepaintConfig": AceStepRepaintConfig,
     "AceStepMusicGenerator": AceStepMusicGenerator,
     "AceStepLoraAnalyzer": AceStepLoraAnalyzer,
     "AceStepAdvancedLoraLoader": AceStepAdvancedLoraLoader
@@ -1313,6 +1375,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepLoraBaker": "ACE-Step LoRA Baker 🍳",
     "AceStepLMConfig": "ACE-Step LM Config ⚙️",
     "AceStepPromptEnhancer": "ACE-Step Prompt Enhancer ✍️",
+    "AceStepCoverConfig": "ACE-Step Cover/Remix Config 🎤",
+    "AceStepRepaintConfig": "ACE-Step Repaint/Extend Config 🎨",
     "AceStepMusicGenerator": "ACE-Step Music Generator 🎵",
     "AceStepLoraAnalyzer": "ACE-Step LoRA Analyzer 🔬",
     "AceStepAdvancedLoraLoader": "ACE-Step Advanced LoRA Loader 🎛️"
