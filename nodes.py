@@ -12,6 +12,8 @@ import comfy.utils
 import comfy.model_management as mm
 import gc
 import re
+import random
+import numpy as np
 
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1212,6 +1214,26 @@ class AceStepMusicGenerator:
                  edit_config=None, reference_audio=None, 
                  vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
         
+        # === 1. ПРИНУДИТЕЛЬНАЯ ФИКСАЦИЯ ВСЕХ СИДОВ ===
+        if seed != -1:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            # Отключаем бенчмарк cudnn для строгой детерминированности (если поддерживается)
+            # torch.backends.cudnn.deterministic = True
+            # torch.backends.cudnn.benchmark = False
+
+        # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
+        requires_source = ["cover", "repaint", "complete", "lego"]
+        if task_type in requires_source and source_audio is None:
+            raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
+        
+        # ЗАЩИТА: Проверка валидности времени редактирования
+        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
+             raise ValueError(f"[ACE-Step] ОШИБКА: Время окончания (edit_end_sec) должно быть больше времени начала (edit_start_sec) или равно -1.0 (до конца трека).")
+        
         # Распаковка режима из edit_config (если не подключен, то базовый text2music)
         task_type = "text2music"
         source_audio = None
@@ -1305,6 +1327,7 @@ class AceStepMusicGenerator:
         config = GenerationConfig(
             batch_size=1, 
             use_random_seed=(seed == -1), 
+            seeds=[seed] if seed != -1 else None,
             audio_format="wav",
             allow_lm_batch=allow_lm_batch
         )
@@ -1323,7 +1346,7 @@ class AceStepMusicGenerator:
                     pbar.update(current_percent - last_percent)
                     last_percent = current_percent
 
-        print(f"[ACE-Step] Начинаем генерацию. Режим: {task_type.upper()}")
+        print(f"[ACE-Step] Начинаем генерацию. Режим: {task_type.upper()}, Seed: {seed}")
         try:
             result = generate_music(
                 dit_handler=dit_handler, 
