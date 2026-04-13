@@ -1337,9 +1337,11 @@ class AceStepMusicGenerator:
 
         def progress_callback(value, desc=None, *args, **kwargs):
             nonlocal last_percent
-            if isinstance(value, str):
-                return
-                
+            
+            import comfy.model_management as mm
+            mm.throw_exception_if_processing_interrupted()
+            
+            if isinstance(value, str): return
             if isinstance(value, (int, float)):
                 current_percent = min(100, max(0, int(value * 100)))
                 if current_percent > last_percent:
@@ -1358,6 +1360,11 @@ class AceStepMusicGenerator:
             )
             
             if not result.success:
+                # Если движок перехватил наше прерывание, пробрасываем его обратно в ComfyUI
+                if "InterruptProcessingException" in str(result.error):
+                    print("\n[ACE-Step] 🛑 Генерация прервана пользователем.\n")
+                    import comfy.model_management as mm
+                    raise mm.InterruptProcessingException()
                 raise RuntimeError(f"Generation Failed: {result.error}")
 
             if last_percent < 100:
