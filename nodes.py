@@ -1216,23 +1216,16 @@ class AceStepMusicGenerator:
         
         # === 1. ПРИНУДИТЕЛЬНАЯ ФИКСАЦИЯ ВСЕХ СИДОВ ===
         if seed != -1:
+            numpy_seed = seed % (2**32)
+
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
             random.seed(seed)
-            np.random.seed(seed)
+            np.random.seed(numpy_seed)
             # Отключаем бенчмарк cudnn для строгой детерминированности (если поддерживается)
             # torch.backends.cudnn.deterministic = True
             # torch.backends.cudnn.benchmark = False
-
-        # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
-        requires_source = ["cover", "repaint", "complete", "lego"]
-        if task_type in requires_source and source_audio is None:
-            raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
-        
-        # ЗАЩИТА: Проверка валидности времени редактирования
-        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
-             raise ValueError(f"[ACE-Step] ОШИБКА: Время окончания (edit_end_sec) должно быть больше времени начала (edit_start_sec) или равно -1.0 (до конца трека).")
         
         # Распаковка режима из edit_config (если не подключен, то базовый text2music)
         task_type = "text2music"
@@ -1253,6 +1246,15 @@ class AceStepMusicGenerator:
             repaint_strength = edit_config.get("repaint_strength", 0.5)
             audio_cover_strength = edit_config.get("audio_cover_strength", 1.0)
             cover_noise_strength = edit_config.get("cover_noise_strength", 0.0)
+
+        # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
+        requires_source = ["cover", "repaint", "complete", "lego"]
+        if task_type in requires_source and source_audio is None:
+            raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
+        
+        # ЗАЩИТА: Проверка валидности времени редактирования
+        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
+             raise ValueError(f"[ACE-Step] ОШИБКА: Время окончания (edit_end_sec) должно быть больше времени начала (edit_start_sec) или равно -1.0 (до конца трека).")
 
         dit_handler = model["dit_handler"]
         llm_handler = model["llm_handler"]
