@@ -217,7 +217,9 @@ def load_preprocessing_models(
     result["model"] = model
 
     # 2. VAE
-    from acestep.model_downloader import resolve_vae_path
+    from acestep.model_downloader import resolve_vae_path, ensure_vae_model
+    
+    ensure_vae_model(vae_variant, checkpoint_dir)
     vae_path = resolve_vae_path(checkpoint_dir, vae_variant)
     if vae_path.is_dir():
         vae = AutoencoderOobleck.from_pretrained(str(vae_path))
@@ -282,8 +284,9 @@ def load_vae(
     if the ``vae/`` directory is missing.
     """
     from diffusers.models import AutoencoderOobleck
-    from acestep.model_downloader import resolve_vae_path
+    from acestep.model_downloader import resolve_vae_path, ensure_vae_model
 
+    ensure_vae_model(vae_variant, checkpoint_dir)
     vae_path = resolve_vae_path(checkpoint_dir, vae_variant)
     if not vae_path.is_dir():
         raise FileNotFoundError(f"VAE directory not found: {vae_path}")
