@@ -29,3 +29,6 @@ safetensors>=0.4.0
 
 # Optional: vLLM backend for LLM (uncomment if needed)
 # vllm>=0.4.0
+
+pytorch_wavelets
+PyWavelets
