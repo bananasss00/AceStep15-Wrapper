@@ -1026,6 +1026,53 @@ class AceStepRepaintConfig:
 # ============================================================================
 # 5. Генератор Музыки
 # ============================================================================
+class AceStepSamplerConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "inference_steps": ("INT", {"default": 8, "min": 1, "max": 200, "tooltip": "Количество шагов диффузии. Для Turbo моделей достаточно 8, для Base рекомендуется 30-50."}),
+                "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 15.0, "step": 0.1, "tooltip": "Сила следования промпту (CFG). У турбо-моделей игнорируется."}),
+                "shift": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 5.0, "step": 0.1, "tooltip": "Смещение расписания шума. Выше = больше внимания деталям."}),
+                "infer_method": (["ode", "sde"], {"default": "ode", "tooltip": "Метод диффузии. ode (стандартный) или sde (стохастический, может добавить шум/детали)."}),
+                "sampler_mode": (["euler", "heun"], {"default": "euler", "tooltip": "Алгоритм сэмплера. euler (быстрее, 1 порядок) или heun (точнее, 2 порядок, 2x вычислений)."}),
+                "use_adg": ("BOOLEAN", {"default": False, "tooltip": "Включить Adaptive Diffusion Guidance (ADG). Динамически управляет углом CFG."}),
+                "cfg_interval_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Начальная отметка t для работы CFG (0.0 = конец генерации, 1.0 = начало)."}),
+                "cfg_interval_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Конечная отметка t для работы CFG."}),
+                "velocity_norm_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 50.0, "step": 0.1, "tooltip": "Лимит скорости. Спасает от мусора при включенном DCW на Base моделях. Рекомендуется 1.5 - 2.5."}),
+                "velocity_ema_factor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Экспоненциальное сглаживание скорости (EMA). Уменьшает резкие скачки. Рекомендуется 0.05 - 0.2."}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_SAMPLER_CONFIG",)
+    RETURN_NAMES = ("sampler_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Configs"
+
+    def create_config(self, **kwargs):
+        return (kwargs,)
+
+class AceStepDCWConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dcw_enabled": ("BOOLEAN", {"default": True, "tooltip": "Включить Differential Correction in Wavelet domain (DCW) для компенсации SNR-смещения."}),
+                "dcw_mode": (["double", "low", "high", "pix"], {"default": "double", "tooltip": "Режим DCW: double (НЧ+ВЧ), low (только НЧ), high (только ВЧ), pix (в латентном пространстве без вейвлетов)."}),
+                "dcw_scaler": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции (для НЧ или pix)."}),
+                "dcw_high_scaler": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции высоких частот (только для режима double)."}),
+                "dcw_wavelet": (["haar", "db2", "db4", "sym4", "sym8", "coif2"], {"default": "haar", "tooltip": "Базис вейвлета. Haar - самый быстрый и нативно поддерживается на Mac (MLX)."}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_DCW_CONFIG",)
+    RETURN_NAMES = ("dcw_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Configs"
+
+    def create_config(self, **kwargs):
+        return (kwargs,)
+
 class AceStepMusicGenerator:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1035,24 +1082,14 @@ class AceStepMusicGenerator:
                 "caption": ("STRING", {"multiline": True, "default": "piano solo"}),
                 "lyrics": ("STRING", {"multiline": True, "default": "[Instrumental]"}),
                 "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "tooltip": "Длительность (-1 для авто-определения)"}),
-                "inference_steps": ("INT", {"default": 8, "min": 1, "max": 200}),
-                "guidance_scale": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 15.0, "step": 0.1}),
-                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1}),
-                "infer_method": (["ode", "sde"], {"default": "ode"}),
-                "sampler_mode": (["euler", "heun"], {"default": "euler"}),
-                "velocity_norm_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 50.0, "step": 0.1, "tooltip": "Лимит скорости. Спасает от мусора при DCW"}),
-                "velocity_ema_factor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "thinking": ("BOOLEAN", {"default": True, "tooltip": "Использовать LLM для рассуждений (CoT)"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
                 "merge_loras": ("BOOLEAN", {"default": True}),
-                "dcw_enabled": ("BOOLEAN", {"default": True, "tooltip": "Enable Differential Correction in Wavelet domain"}),
-                "dcw_mode": (["low", "high", "double", "pix"], {"default": "double"}),
-                "dcw_scaler": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.1, "step": 0.001}),
-                "dcw_high_scaler": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.1, "step": 0.001}),
-                "dcw_wavelet": (["haar", "db2", "db4", "sym4", "sym8", "coif2"], {"default": "haar"}),
             },
             "optional": {
+                "sampler_config": ("ACESTEP_SAMPLER_CONFIG",),
+                "dcw_config": ("ACESTEP_DCW_CONFIG",),
                 "edit_config": ("ACESTEP_EDIT_CONFIG", {"tooltip": "Подключите сюда ноду Cover Config или Repaint Config для активации этих режимов."}),
                 "reference_audio": ("AUDIO", {"tooltip": "РЕФЕРЕНС: Аудио для переноса стиля и общего звучания (работает во всех режимах)"}),
                 "vocal_language": (["unknown", "en", "ja", "zh", "es", "de", "fr", "pt", "ru", "it", "nl", "pl", "tr", "vi", "cs", "fa", "id", "ko", "uk", "hu", "ar", "sv", "ro", "el"], {"default": "unknown"}),
@@ -1229,10 +1266,9 @@ class AceStepMusicGenerator:
                             
                 dit_handler.use_lora = False
 
-    def generate(self, model, caption, lyrics, duration, inference_steps, 
-                 guidance_scale, shift, infer_method, sampler_mode, velocity_norm_threshold, velocity_ema_factor,
+    def generate(self, model, caption, lyrics, duration,
                  thinking, seed, unload_unused_loras, merge_loras, 
-                 dcw_enabled=True, dcw_mode="double", dcw_scaler=0.05, dcw_high_scaler=0.02, dcw_wavelet="haar",
+                 sampler_config=None, dcw_config=None,
                  edit_config=None, reference_audio=None, 
                  vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
         
@@ -1302,6 +1338,62 @@ class AceStepMusicGenerator:
         src_path = self._save_comfy_audio_to_temp(source_audio)
 
         # Вытаскиваем параметры LLM
+        if sampler_config is None:
+            config_path = ""
+            dit_handler = model.get("dit_handler")
+            if dit_handler and hasattr(dit_handler, "last_init_params") and dit_handler.last_init_params:
+                config_path = dit_handler.last_init_params.get("config_path", "").lower()
+                
+            if "turbo" in config_path:
+                sampler_config = {
+                    "inference_steps": 8,
+                    "guidance_scale": 1.0,
+                    "shift": 3.0,
+                    "infer_method": "ode",
+                    "sampler_mode": "euler",
+                    "use_adg": False,
+                    "cfg_interval_start": 0.0,
+                    "cfg_interval_end": 1.0,
+                    "velocity_norm_threshold": 0.0,
+                    "velocity_ema_factor": 0.0
+                }
+            elif "sft" in config_path:
+                sampler_config = {
+                    "inference_steps": 32,
+                    "guidance_scale": 7.0,
+                    "shift": 1.0,
+                    "infer_method": "ode",
+                    "sampler_mode": "euler",
+                    "use_adg": False,
+                    "cfg_interval_start": 0.0,
+                    "cfg_interval_end": 1.0,
+                    "velocity_norm_threshold": 0.0,
+                    "velocity_ema_factor": 0.0
+                }
+            else: # Base варианты
+                sampler_config = {
+                    "inference_steps": 32,
+                    "guidance_scale": 7.0,
+                    "shift": 1.0,
+                    "infer_method": "ode",
+                    "sampler_mode": "euler",
+                    "use_adg": False,
+                    "cfg_interval_start": 0.0,
+                    "cfg_interval_end": 1.0,
+                    "velocity_norm_threshold": 0.0,
+                    "velocity_ema_factor": 0.0
+                }
+        
+        if dcw_config is None:
+            dcw_config = {
+                "dcw_enabled": False,
+                "dcw_mode": "double",
+                "dcw_scaler": 0.05,
+                "dcw_high_scaler": 0.02,
+                "dcw_wavelet": "haar"
+            }
+
+        # Вытаскиваем параметры LLM
         lm_temp = 0.85
         lm_cfg = 2.0
         lm_tk = 0
@@ -1327,12 +1419,17 @@ class AceStepMusicGenerator:
             task_type=task_type, caption=caption, lyrics=lyrics,
             bpm=bpm if bpm > 0 else None, keyscale=key_scale, timesignature=time_signature,
             duration=duration if duration > 0 else None, vocal_language=vocal_language,
-            inference_steps=inference_steps, guidance_scale=guidance_scale,
-            shift=shift, seed=seed,
-            infer_method=infer_method,
-            sampler_mode=sampler_mode,
-            velocity_norm_threshold=velocity_norm_threshold,
-            velocity_ema_factor=velocity_ema_factor,
+            inference_steps=sampler_config.get("inference_steps", 8), 
+            guidance_scale=sampler_config.get("guidance_scale", 7.0),
+            shift=sampler_config.get("shift", 1.0), 
+            seed=seed,
+            infer_method=sampler_config.get("infer_method", "ode"),
+            sampler_mode=sampler_config.get("sampler_mode", "euler"),
+            velocity_norm_threshold=sampler_config.get("velocity_norm_threshold", 0.0),
+            velocity_ema_factor=sampler_config.get("velocity_ema_factor", 0.0),
+            use_adg=sampler_config.get("use_adg", False),
+            cfg_interval_start=sampler_config.get("cfg_interval_start", 0.0),
+            cfg_interval_end=sampler_config.get("cfg_interval_end", 1.0),
             thinking=thinking, reference_audio=ref_path,
             src_audio=src_path, 
             use_cot_metas=use_cot_metas, 
@@ -1348,11 +1445,11 @@ class AceStepMusicGenerator:
             repaint_mode=repaint_mode,
             repaint_strength=repaint_strength,
             
-            dcw_enabled=dcw_enabled,
-            dcw_mode=dcw_mode,
-            dcw_scaler=dcw_scaler,
-            dcw_high_scaler=dcw_high_scaler,
-            dcw_wavelet=dcw_wavelet,
+            dcw_enabled=dcw_config.get("dcw_enabled", False),
+            dcw_mode=dcw_config.get("dcw_mode", "double"),
+            dcw_scaler=dcw_config.get("dcw_scaler", 0.05),
+            dcw_high_scaler=dcw_config.get("dcw_high_scaler", 0.02),
+            dcw_wavelet=dcw_config.get("dcw_wavelet", "haar"),
         )
 
         config = GenerationConfig(
@@ -1421,6 +1518,8 @@ NODE_CLASS_MAPPINGS = {
     "AceStepModelLoader": AceStepModelLoader,
     "AceStepLoraLoader": AceStepLoraLoader,
     "AceStepLoraBaker": AceStepLoraBaker,
+    "AceStepSamplerConfig": AceStepSamplerConfig,
+    "AceStepDCWConfig": AceStepDCWConfig,
     "AceStepLMConfig": AceStepLMConfig,
     "AceStepPromptEnhancer": AceStepPromptEnhancer,
     "AceStepCoverConfig": AceStepCoverConfig,
@@ -1434,6 +1533,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepModelLoader": "ACE-Step Model Loader 🎵",
     "AceStepLoraLoader": "ACE-Step LoRA Loader 💊",
     "AceStepLoraBaker": "ACE-Step LoRA Baker 🍳",
+    "AceStepSamplerConfig": "ACE-Step Sampler Config ⚙️",
+    "AceStepDCWConfig": "ACE-Step DCW Config 🎛️",
     "AceStepLMConfig": "ACE-Step LM Config ⚙️",
     "AceStepPromptEnhancer": "ACE-Step Prompt Enhancer ✍️",
     "AceStepCoverConfig": "ACE-Step Cover/Remix Config 🎤",
