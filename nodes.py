@@ -1059,8 +1059,8 @@ class AceStepDCWConfig:
             "required": {
                 "dcw_enabled": ("BOOLEAN", {"default": True, "tooltip": "Включить Differential Correction in Wavelet domain (DCW) для компенсации SNR-смещения."}),
                 "dcw_mode": (["double", "low", "high", "pix"], {"default": "double", "tooltip": "Режим DCW: double (НЧ+ВЧ), low (только НЧ), high (только ВЧ), pix (в латентном пространстве без вейвлетов)."}),
-                "dcw_scaler": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции (для НЧ или pix)."}),
-                "dcw_high_scaler": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции высоких частот (только для режима double)."}),
+                "dcw_scaler": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции (для НЧ или pix)."}),
+                "dcw_high_scaler": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.5, "step": 0.001, "tooltip": "Сила коррекции высоких частот (только для режима double)."}),
                 "dcw_wavelet": (["haar", "db2", "db4", "sym4", "sym8", "coif2"], {"default": "haar", "tooltip": "Базис вейвлета. Haar - самый быстрый и нативно поддерживается на Mac (MLX)."}),
             }
         }
