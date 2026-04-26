@@ -30,14 +30,15 @@ from server import PromptServer
 
 try:
     from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
-    from acestep.training_v2.trainer_fixed import FixedLoRATrainer
+    # ВАЖНО: Не импортировать trainer_fixed здесь! Сначала применяем патч, потом импортируем
     from acestep.training_v2.model_loader import load_decoder_for_training
     from acestep.training_v2.preprocess import preprocess_audio_files
     from acestep.training_v2.gpu_utils import detect_gpu
     from acestep.training_v2.cli.validation import resolve_target_modules
     from acestep.training_v2.estimate import run_estimation
     from acestep.training_v2.fixed_lora_module import FixedLoRAModule
-    from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
+    from acestep.training_v2.timestep_sampling import sample_timesteps
+    import acestep.training_v2.timestep_sampling as ts
     from acestep.training_v2.optim import build_optimizer, build_scheduler
 except ImportError as e:
     print(f"⚠️ [ACE-Step] Failed to import acestep v2 modules: {e}")
@@ -46,6 +47,68 @@ try:
     torch.set_float32_matmul_precision('medium')
 except:
     pass
+
+# ======================================================================
+# ПАТЧ: БЛОКИРОВКА СОХРАНЕНИЯ СОСТОЯНИЙ ОПТИМИЗАТОРА (РЕЗЕРВНЫЙ)
+# Примечание: Основная поддержка добавлена в бекенд trainer_helpers.py
+# Этот патч — резервная копия на случай обновлений бекенда
+# ======================================================================
+try:
+    import acestep.training_v2.trainer_helpers as _th_pre_import
+
+    if not hasattr(_th_pre_import, "_original_save_checkpoint"):
+        _th_pre_import._original_save_checkpoint = _th_pre_import.save_checkpoint
+
+        def _custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
+            import os
+            import torch
+
+            _th_pre_import.save_adapter_flat(trainer, ckpt_dir)
+            save_state = getattr(trainer.training_config, "save_state", True)
+            if not save_state:
+                print(f"💾 [Checkpoint] Сохранение адаптеров на epoch {epoch} (training_state пропущен для экономии места)")
+                return
+
+            training_state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            state_path = os.path.join(ckpt_dir, "training_state.pt")
+            torch.save(training_state, state_path)
+
+            try:
+                from safetensors.torch import save_file as _save_safetensors
+                meta_tensors = {
+                    "epoch": torch.tensor([epoch], dtype=torch.int64),
+                    "global_step": torch.tensor([global_step], dtype=torch.int64),
+                }
+                sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
+                _save_safetensors(meta_tensors, sf_path)
+            except Exception:
+                pass
+            print(f"💾 [Checkpoint] Адаптеры + training_state сохранены на epoch {epoch}")
+
+        _th_pre_import.save_checkpoint = _custom_save_checkpoint
+        print("✅ [Patch] save_checkpoint резервный патч применён")
+except Exception as e:
+    print(f"⚠️ [Patch] Ошибка резервного патча save_checkpoint: {e}")
+
+# Теперь импортируем trainer_fixed после применения патча
+try:
+    from acestep.training_v2.trainer_fixed import FixedLoRATrainer
+except ImportError as e:
+    print(f"⚠️ [ACE-Step] Failed to import FixedLoRATrainer: {e}")
+
+# Оптимизированный CFG Dropout (Без создания лишних нулей/единиц)
+def fast_cfg_dropout(encoder_hidden_states, null_condition_emb, cfg_ratio=0.15):
+    bsz = encoder_hidden_states.shape[0]
+    device = encoder_hidden_states.device
+    mask = (torch.rand(bsz, 1, 1, device=device) >= cfg_ratio)
+    return torch.where(mask, encoder_hidden_states, null_condition_emb.to(encoder_hidden_states.dtype))
+
+ts.apply_cfg_dropout = fast_cfg_dropout
 
 try:
     if not hasattr(FixedLoRATrainer, "_original_generate_preview"):
@@ -84,54 +147,6 @@ import acestep.training.lokr_utils
 acestep.training.lokr_utils.safe_path = bypass_safe_path
 
 # ======================================================================
-# ПАТЧ: БЛОКИРОВКА СОХРАНЕНИЯ СОСТОЯНИЙ ОПТИМИЗАТОРА (ЭКОНОМИЯ ДИСКА)
-# ======================================================================
-try:
-    import acestep.training_v2.trainer_helpers as th
-    
-    if not hasattr(th, "_original_save_checkpoint"):
-        th._original_save_checkpoint = th.save_checkpoint
-
-        def custom_save_checkpoint(trainer, optimizer, scheduler, epoch, global_step, ckpt_dir):
-            import os
-            import torch
-            
-            # 1. Сохраняем ТОЛЬКО чистые веса (LoRA адаптер или LoKR)
-            th.save_adapter_flat(trainer, ckpt_dir)
-
-            # 2. Проверяем наш флаг из UI
-            save_state = getattr(trainer.training_config, "save_state", True)
-            if not save_state:
-                print(f"💾 Checkpoint saved at epoch {epoch} (training state skipped to save disk I/O)")
-                return
-
-            # 3. Если флаг включен - пишем тяжелые тензоры на диск
-            training_state = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-            }
-            state_path = os.path.join(ckpt_dir, "training_state.pt")
-            torch.save(training_state, state_path)
-
-            try:
-                from safetensors.torch import save_file as _save_safetensors
-                meta_tensors = {
-                    "epoch": torch.tensor([epoch], dtype=torch.int64),
-                    "global_step": torch.tensor([global_step], dtype=torch.int64),
-                }
-                sf_path = os.path.join(ckpt_dir, "training_state.safetensors")
-                _save_safetensors(meta_tensors, sf_path)
-            except Exception: pass
-            print(f"💾 Checkpoint and training state saved at epoch {epoch}")
-
-        th.save_checkpoint = custom_save_checkpoint
-except Exception as e:
-    print(f"⚠️ [ACE-Step] Custom save patch failed: {e}")
-# ======================================================================
-
-# ======================================================================
 # FP8 / FP4 STOCHASTIC ROUNDING & QUANTIZATION UTILS
 # ======================================================================
 def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
@@ -155,11 +170,7 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
     sign = torch.sign(x)
     abs_x = x.abs()
     sign = torch.where(abs_x == 0, 0, sign)
-
-    exponent = torch.clamp(
-        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
-        0, 2**EXPONENT_BITS - 1
-    )
+    exponent = torch.clamp(torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS, 0, 2**EXPONENT_BITS - 1)
 
     normal_mask = ~(exponent == 0)
     abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator)
@@ -177,7 +188,7 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
 def stochastic_rounding(value, dtype, seed=0):
     if dtype in [torch.float32, torch.float16, torch.bfloat16]:
         return value.to(dtype=dtype)
-    if dtype in [getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)]:
+    if dtype in[getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)]:
         generator = torch.Generator(device=value.device)
         generator.manual_seed(seed)
         output = torch.empty_like(value, dtype=dtype)
@@ -186,115 +197,128 @@ def stochastic_rounding(value, dtype, seed=0):
         for i in range(0, value.shape[0], slice_size):
             output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator))
         return output
-    
-    # Fallback for native FP4 if supported by user's PyTorch 2.9+
     if hasattr(torch, "float4_e2m1fn") and dtype == torch.float4_e2m1fn:
         return value.to(dtype)
-        
     return value.to(dtype=dtype)
 
-class DequantizeNF4Linear(torch.autograd.Function):
-    """
-    Кастомный Autograd для распаковки NF4 на лету. 
-    Математически точное применение скейлов к правильным размерностям.
-    """
+def _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, compute_dtype):
+    """Оптимизированная распаковка NF4 без использования тяжелых Int64 (long)"""
+    w_flat = weight_packed.view(torch.uint8)
+    
+    unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.int32, device=w_flat.device)
+    unpacked[0::2] = (w_flat >> 4).to(torch.int32)
+    unpacked[1::2] = (w_flat & 0x0F).to(torch.int32)
+    
+    padded_in_features = unpacked.shape[0] // orig_shape[0]
+    blocks_per_row = padded_in_features // group_size
+    
+    w_dequant = lut[unpacked].view(orig_shape[0], blocks_per_row, group_size)
+    w_dequant = (w_dequant * scales).view(orig_shape[0], padded_in_features)
+    
+    if padded_in_features > orig_shape[1]:
+        w_dequant = w_dequant[:, :orig_shape[1]]
+        
+    return w_dequant.to(compute_dtype)
+
+class DequantizeFP8Linear(torch.autograd.Function):
+    """ZeRO-VRAM Autograd для FP8. Запрещает кешировать входы X и 16-битные веса."""
     @staticmethod
-    def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut):
-        # Быстрая распаковка 4 бита -> 8 бит
-        w_flat = weight_packed.view(torch.uint8)
-        high = (w_flat >> 4).long()
-        low = (w_flat & 0x0F).long()
-        
-        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=x.device)
-        unpacked[0::2] = high
-        unpacked[1::2] = low
-        
-        # Восстанавливаем геометрию: [Out, Blocks, 64]
-        padded_in_features = unpacked.shape[0] // orig_shape[0]
-        blocks_per_row = padded_in_features // group_size
-        
-        # Де-квантование через LUT
-        w_dequant = lut[unpacked].view(orig_shape[0], blocks_per_row, group_size)
-        
-        # Умножаем на скейлы (scales имеет форму [Out, Blocks, 1]) и склеиваем в 2D
-        w_dequant = (w_dequant * scales).view(orig_shape[0], padded_in_features)
-        
-        # Обрезаем паддинг, если он был
-        if padded_in_features > orig_shape[1]:
-            w_dequant = w_dequant[:, :orig_shape[1]]
-            
-        w_dequant = w_dequant.to(x.dtype)
-        
-        ctx.save_for_backward(x, w_dequant)
-        ctx.use_bias = bias is not None
-        
-        return F.linear(x, w_dequant, bias)
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
+    def forward(ctx, x, weight_fp8, bias, compute_dtype):
+        w_dequant = weight_fp8.to(compute_dtype)
+        # Сохраняем ТОЛЬКО 8-битный вес! Мы не сохраняем X, т.к. градиент для слоя не нужен
+        ctx.save_for_backward(weight_fp8)
+        ctx.compute_dtype = compute_dtype
+        output = F.linear(x, w_dequant, bias)
+        del w_dequant # Обязательно освобождаем память
+        return output
 
     @staticmethod
+    @torch.cuda.amp.custom_bwd
     def backward(ctx, grad_output):
-        x, w_dequant = ctx.saved_tensors
-        grad_input = grad_weight = grad_scales = grad_bias = None
-        # Градиент только для входа (x), база остается замороженной
+        weight_fp8, = ctx.saved_tensors
+        grad_input = None
         if ctx.needs_input_grad[0]:
+            w_dequant = weight_fp8.to(ctx.compute_dtype)
             grad_input = grad_output.matmul(w_dequant)
-        return grad_input, None, None, None, None, None, None
-
-
-class QuantizedNF4Linear(nn.Linear):
-    """Динамическая обертка для NF4 (FP4 в UI). Отдает BF16 веса для инициализации DoRA."""
-    @property
-    def weight(self):
-        w_flat = self.weight_packed.view(torch.uint8)
-        high = (w_flat >> 4).long()
-        low = (w_flat & 0x0F).long()
-        
-        unpacked = torch.empty((w_flat.shape[0] * 2,), dtype=torch.long, device=w_flat.device)
-        unpacked[0::2] = high
-        unpacked[1::2] = low
-        
-        padded_in_features = unpacked.shape[0] // self.orig_shape[0]
-        blocks_per_row = padded_in_features // self.group_size
-        
-        w_dequant = self.nf4_lut[unpacked].view(self.orig_shape[0], blocks_per_row, self.group_size)
-        w_dequant = (w_dequant * self.scales).view(self.orig_shape[0], padded_in_features)
-        
-        if padded_in_features > self.orig_shape[1]:
-            w_dequant = w_dequant[:, :self.orig_shape[1]]
-            
-        return nn.Parameter(w_dequant.to(self.scales.dtype), requires_grad=False)
-
-    def forward(self, x):
-        return DequantizeNF4Linear.apply(
-            x, self.weight_packed, self.scales, self.bias, 
-            self.orig_shape, self.group_size, self.nf4_lut
-        )
-
+            del w_dequant
+        return grad_input, None, None, None
 
 class QuantizedFP8Linear(nn.Linear):
-    """Динамическая обертка для FP8. Отдает BF16 веса для инициализации DoRA."""
     @property
     def weight(self):
-        # Нативный каст FP8 -> BF16 поддерживается PyTorch из коробки
-        return nn.Parameter(self.weight_fp8.to(self.compute_dtype), requires_grad=False)
+        w_dequant = self.weight_fp8.to(self.compute_dtype)
+        return nn.Parameter(w_dequant, requires_grad=False)
 
     def forward(self, x):
-        w_dequant = self.weight_fp8.to(x.dtype)
-        return F.linear(x, w_dequant, self.bias)
+        # БАГФИКС: Обходим autograd.Function во время генерации (инференса)
+        if not torch.is_grad_enabled():
+            w_dequant = self.weight_fp8.to(self.compute_dtype)
+            # Фикс несовпадения типов (Float32 vs BFloat16)
+            if w_dequant.dtype != x.dtype:
+                w_dequant = w_dequant.to(x.dtype)
+            return F.linear(x, w_dequant, self.bias)
+            
+        return DequantizeFP8Linear.apply(x, self.weight_fp8, self.bias, self.compute_dtype)
 
+class DequantizeNF4Linear(torch.autograd.Function):
+    """ZeRO-VRAM Autograd для NF4. Запрещает кешировать входы X и 16-битные веса."""
+    @staticmethod
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
+    def forward(ctx, x, weight_packed, scales, bias, orig_shape, group_size, lut, compute_dtype):
+        w_dequant = _dequantize_nf4(weight_packed, scales, orig_shape, group_size, lut, compute_dtype)
+        ctx.save_for_backward(weight_packed, scales, lut)
+        ctx.orig_shape = orig_shape
+        ctx.group_size = group_size
+        ctx.compute_dtype = compute_dtype
+        output = F.linear(x, w_dequant, bias)
+        del w_dequant
+        return output
+
+    @staticmethod
+    @torch.cuda.amp.custom_bwd
+    def backward(ctx, grad_output):
+        weight_packed, scales, lut = ctx.saved_tensors
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            w_dequant = _dequantize_nf4(weight_packed, scales, ctx.orig_shape, ctx.group_size, lut, ctx.compute_dtype)
+            grad_input = grad_output.matmul(w_dequant)
+            del w_dequant
+        return grad_input, None, None, None, None, None, None, None
+
+class QuantizedNF4Linear(nn.Linear):
+    @property
+    def weight(self):
+        w_dequant = _dequantize_nf4(
+            self.weight_packed, self.scales, self.orig_shape, 
+            self.group_size, self.nf4_lut, self.scales.dtype
+        )
+        return nn.Parameter(w_dequant, requires_grad=False)
+
+    def forward(self, x):
+        # БАГФИКС: Обходим autograd.Function во время генерации (инференса)
+        if not torch.is_grad_enabled():
+            w_dequant = _dequantize_nf4(
+                self.weight_packed, self.scales, self.orig_shape, 
+                self.group_size, self.nf4_lut, self.scales.dtype
+            )
+            # Фикс несовпадения типов (Float32 vs BFloat16)
+            if w_dequant.dtype != x.dtype:
+                w_dequant = w_dequant.to(x.dtype)
+            return F.linear(x, w_dequant, self.bias)
+            
+        return DequantizeNF4Linear.apply(
+            x, self.weight_packed, self.scales, self.bias, 
+            self.orig_shape, self.group_size, self.nf4_lut, self.scales.dtype
+        )
 
 def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=42):
-    """
-    Универсальный роутер квантования базы: поддерживает FP8 (нативный) и FP4 (кастомный NF4).
-    Обеспечивает полную совместимость с Weight-Decomposed LoRA (DoRA).
-    """
     if quant_type == "none":
         return
 
     converted_count = 0
+    visited = set() # ЗАЩИТА: хранит id() обработанных модулей, чтобы не сжимать их дважды
 
-    # ==========================================
-    # ВЕТКА 1: FP8 (Native PyTorch float8_e4m3fn)
-    # ==========================================
     if quant_type == "fp8":
         if not hasattr(torch, "float8_e4m3fn"):
             print("⚠️ [Quantization] Your PyTorch version does not support float8_e4m3fn. Skipping.")
@@ -302,25 +326,43 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
 
         print(f"🪄 [Quantization] Quantizing frozen layers to FP8 (Stochastic Rounding)...")
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
-                # Используем твою функцию stochastic_rounding (она у тебя лежит выше в файле)
-                fp8_weight = stochastic_rounding(module.weight.data, torch.float8_e4m3fn, seed=seed)
+            # Достаем оригинальный слой из-под обертки PEFT, если она есть
+            if hasattr(module, 'base_layer') and isinstance(module.base_layer, nn.Linear):
+                target_module = module.base_layer
+            elif isinstance(module, nn.Linear):
+                target_module = module
+            else:
+                continue
+
+            # ЗАЩИТА от двойной обработки генератором
+            if id(target_module) in visited:
+                continue
+
+            # Убеждаемся, что мы не пытаемся сжать обучаемые веса (LoRA A/B и т.д.)
+            if hasattr(target_module, 'weight') and target_module.weight is not None and not target_module.weight.requires_grad:
+                if "lora_" in name or "lycoris" in target_module.__class__.__name__.lower() or "lora" in target_module.__class__.__name__.lower():
+                    continue
                 
-                module.weight_fp8 = nn.Parameter(fp8_weight, requires_grad=False)
-                module.compute_dtype = compute_dtype
+                visited.add(id(target_module))
                 
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(compute_dtype)
+                fp8_weight = stochastic_rounding(target_module.weight.data, torch.float8_e4m3fn, seed=seed)
+                target_module.weight_fp8 = nn.Parameter(fp8_weight, requires_grad=False)
+                target_module.compute_dtype = compute_dtype
+                
+                if target_module.bias is not None:
+                    target_module.bias.data = target_module.bias.data.to(compute_dtype)
                     
-                del module.weight # Удаляем толстый тензор
-                module.__class__ = QuantizedFP8Linear # Внедряем DoRA-совместимый класс
+                # Безопасное удаление оригинального 16-битного веса
+                if hasattr(target_module, 'weight') and 'weight' in target_module._parameters:
+                    del target_module._parameters['weight']
+                elif hasattr(target_module, 'weight'):
+                    delattr(target_module, 'weight')
+                    
+                target_module.__class__ = QuantizedFP8Linear 
                 converted_count += 1
                 
         print(f"✅ [Quantization] Successfully converted {converted_count} layers to FP8.")
 
-    # ==========================================
-    # ВЕТКА 2: FP4 (Наш кастомный NF4 Block-64)
-    # ==========================================
     elif quant_type == "fp4":
         print(f"🪄 [Quantization] Quantizing frozen layers to NF4 (Block-64, OOM-Safe)...")
         group_size = 64
@@ -333,12 +375,27 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
         ], dtype=compute_dtype)
 
         for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and not module.weight.requires_grad:
-                orig_shape = module.weight.shape
-                device = module.weight.device
+            if hasattr(module, 'base_layer') and isinstance(module.base_layer, nn.Linear):
+                target_module = module.base_layer
+            elif isinstance(module, nn.Linear):
+                target_module = module
+            else:
+                continue
+
+            if id(target_module) in visited:
+                continue
+
+            if hasattr(target_module, 'weight') and target_module.weight is not None and not target_module.weight.requires_grad:
+                if "lora_" in name or "lycoris" in target_module.__class__.__name__.lower() or "lora" in target_module.__class__.__name__.lower():
+                    continue
+
+                visited.add(id(target_module))
+
+                orig_shape = target_module.weight.shape
+                device = target_module.weight.device
                 
                 pad_len = (group_size - (orig_shape[1] % group_size)) % group_size
-                w_padded = module.weight.data.float() 
+                w_padded = target_module.weight.data.float() 
                 if pad_len > 0:
                     w_padded = F.pad(w_padded, (0, pad_len))
                     
@@ -367,17 +424,22 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
                 low = flat_indices[1::2]
                 packed_weights = (high | low).contiguous()
                 
-                module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
-                module.scales = nn.Parameter(scales, requires_grad=False) 
-                module.register_buffer("nf4_lut", NF4_LUT.to(device))
-                module.orig_shape = orig_shape
-                module.group_size = group_size
+                target_module.weight_packed = nn.Parameter(packed_weights, requires_grad=False)
+                target_module.scales = nn.Parameter(scales, requires_grad=False) 
+                target_module.register_buffer("nf4_lut", NF4_LUT.to(device))
+                target_module.orig_shape = orig_shape
+                target_module.group_size = group_size
                 
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(compute_dtype)
+                if target_module.bias is not None:
+                    target_module.bias.data = target_module.bias.data.to(compute_dtype)
                     
-                del module.weight 
-                module.__class__ = QuantizedNF4Linear # Внедряем DoRA-совместимый класс
+                # Безопасное удаление оригинального 16-битного веса
+                if hasattr(target_module, 'weight') and 'weight' in target_module._parameters:
+                    del target_module._parameters['weight']
+                elif hasattr(target_module, 'weight'):
+                    delattr(target_module, 'weight')
+                    
+                target_module.__class__ = QuantizedNF4Linear 
                 converted_count += 1
                 
         print(f"✅ [Quantization] Successfully converted {converted_count} layers to NF4 Block-64.")
@@ -386,19 +448,14 @@ def apply_quantization_base_model(model, compute_dtype, quant_type="none", seed=
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 # ======================================================================
-# BLOCKSWAP MANAGER
+# BLOCKSWAP MANAGER (ZeRO OFFLOAD)
 # ======================================================================
 class AdvancedBlockSwapManager:
-    """
-    True ZeRO-Offload Optimizer Manager.
-    Разгоняет GPU до максимума на момент шага оптимизатора, а затем 
-    принудительно сбрасывает кэш VRAM, возвращая состояния в RAM.
-    """
     def __init__(self, model: nn.Module, device: torch.device, offload_device: str = "cpu"):
         self.model = model
         self.device = device
         self.offload_device = torch.device(offload_device)
-        self.hook_handles = []
+        self.hook_handles =[]
         
         self.pinned_cpu_state = {}
         self.pinned_grad_state = {}
@@ -410,16 +467,16 @@ class AdvancedBlockSwapManager:
         
         self.load_events = {}
         self.compute_events = {}
-        self.offloaded_layers = []
+        self.offloaded_layers =[]
 
     def _find_transformer_layers(self) -> nn.ModuleList:
-        search_targets = ["layers", "h", "blocks", "transformer_blocks"]
+        search_targets =["layers", "h", "blocks", "transformer_blocks"]
         root = self.model
         if hasattr(root, "base_model"): root = root.base_model
         if hasattr(root, "model"): root = root.model
         if hasattr(root, "decoder"): root = root.decoder
 
-        queue = [root]
+        queue =[root]
         visited = set()
         while queue:
             current = queue.pop(0)
@@ -555,74 +612,50 @@ class AdvancedBlockSwapManager:
             self.hook_handles.append(layer.register_full_backward_hook(post_backward_hook))
 
     def prepare_for_optimizer(self, optimizer):
-        """Мгновенно забрасывает состояния на GPU для быстрого шага"""
         for i in range(len(self.offloaded_layers)):
             layer = self.offloaded_layers[i]
             layer_id = id(layer)
-            if self.is_loaded[layer_id]: continue
-            
+            # FIX: Only load parameters that require gradients to save VRAM
             for name, param in layer.named_parameters():
+                if not param.requires_grad: continue
                 if param.data.device.type == "cpu":
                     param.data = param.data.to(self.device, non_blocking=True)
                 if name in self.pinned_grad_state[layer_id] and param.grad is not None:
                     if param.grad.data.device.type == "cpu":
                         param.grad.data = param.grad.data.to(self.device, non_blocking=True)
                 
-                # Перенос состояний Prodigy
                 if param in optimizer.state:
                     for k, v in optimizer.state[param].items():
                         if isinstance(v, torch.Tensor) and v.device.type == "cpu":
                             optimizer.state[param][k] = v.to(self.device, non_blocking=True)
-                            
-            for name, buf in layer.named_buffers():
-                if buf.data.device.type == "cpu":
-                    buf.data = buf.data.to(self.device, non_blocking=True)
-            self.is_loaded[layer_id] = True
-            
-        # ЖДЕМ завершения копирования до запуска оптимизатора!
         torch.cuda.current_stream().synchronize()
 
     def cleanup_after_optimizer(self, optimizer):
-        """Мгновенно выгружает состояния в RAM и УБИВАЕТ кэш VRAM"""
         for i in range(len(self.offloaded_layers)):
             layer = self.offloaded_layers[i]
             layer_id = id(layer)
-            if not self.is_loaded[layer_id]: continue
-            
             for name, param in layer.named_parameters():
-                # Возврат весов
+                if not param.requires_grad: continue
                 if param.data.device.type != "cpu":
                     self.pinned_cpu_state[layer_id][name].copy_(param.data, non_blocking=True)
                     param.data = self.pinned_cpu_state[layer_id][name]
                 
-                # Возврат состояний Prodigy
                 if param in optimizer.state:
                     pid = id(param)
                     if pid not in self.pinned_opt_state:
                         self.pinned_opt_state[pid] = {}
-                        
                     for k, v in optimizer.state[param].items():
                         if isinstance(v, torch.Tensor) and v.device.type != "cpu":
                             if k not in self.pinned_opt_state[pid]:
                                 self.pinned_opt_state[pid][k] = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
                             self.pinned_opt_state[pid][k].copy_(v, non_blocking=True)
-                            optimizer.state[param][k] = self.pinned_opt_state[pid][k] # Разрыв связи с GPU-тензором
-
-            for name, buf in layer.named_buffers():
-                if buf.data.device.type != "cpu":
-                    self.pinned_cpu_state[layer_id][name].copy_(buf.data, non_blocking=True)
-                    buf.data = self.pinned_cpu_state[layer_id][name]
-            self.is_loaded[layer_id] = False
-            
-        # ЖДЕМ завершения выгрузки, чтобы не убить тензоры в полете
+                            optimizer.state[param][k] = self.pinned_opt_state[pid][k] 
         torch.cuda.current_stream().synchronize()
-        # ПРИНУДИТЕЛЬНО ОСВОБОЖДАЕМ ВИДЕОПАМЯТЬ! График упадет вниз.
         torch.cuda.empty_cache()
 
     def remove(self):
         for handle in self.hook_handles: handle.remove()
         self.hook_handles.clear()
-        self.prepare_for_optimizer(None) # Фейк загрузка перед удалением
         self.pinned_cpu_state.clear()
         self.pinned_grad_state.clear()
         self.pinned_opt_state.clear()
@@ -667,11 +700,9 @@ def _save_complete_model(trained_model_state, output_dir, source_model_dir, vari
             else:
                 merged_state[orig_key] = orig_val
 
-        # Встраивание Workflow и Prompt от ComfyUI
         metadata = {"format": "pt"}
         if extra_pnginfo and "workflow" in extra_pnginfo:
             metadata["workflow"] = json.dumps(extra_pnginfo["workflow"])
-            # Также сохраняем отдельным файлом в папку для наглядности
             try:
                 with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
                     json.dump(extra_pnginfo["workflow"], f, indent=2)
@@ -688,10 +719,12 @@ def _save_complete_model(trained_model_state, output_dir, source_model_dir, vari
         if os.path.exists(src_silence):
             shutil.copy2(src_silence, os.path.join(output_dir, "silence_latent.pt"))
             
-        code_files = ["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
+        code_files =["config.json", "configuration_acestep_v15.py", "apg_guidance.py"]
         if variant == "turbo": code_files.append("modeling_acestep_v15_turbo.py")
         elif variant == "base": code_files.append("modeling_acestep_v15_base.py")
-        elif variant == "sft": code_files.append("modeling_acestep_v15_sft.py")
+        elif variant == "sft": code_files.append("modeling_acestep_v15_base.py")
+        elif variant == "xl_turbo": code_files.append("modeling_acestep_v15_xl_turbo.py")
+        elif variant in ["xl_base", "xl_sft"]: code_files.append("modeling_acestep_v15_xl_base.py")
         
         for f in code_files:
             src = os.path.join(source_model_dir, f)
@@ -726,18 +759,14 @@ class FullFinetuneModuleV2(torch.nn.Module):
         self.model = model 
         self.force_input_grads_for_checkpointing = False
 
-        # Разморозка DiT Декодера (Основная часть)
         for param in self.model.decoder.parameters():
             param.requires_grad = True
             
-        # Умная разморозка Энкодеров
         if self.encoder_train_mode != "none" and hasattr(self.model, "encoder") and self.model.encoder is not None:
             if self.encoder_train_mode == "all":
-                # ВНИМАНИЕ: Жрет огромное количество памяти.
                 for param in self.model.encoder.parameters():
                     param.requires_grad = True
             elif self.encoder_train_mode == "projectors_only":
-                # Размораживаем ТОЛЬКО проекционные слои (minimal VRAM footprint)
                 for param in self.model.encoder.parameters():
                     param.requires_grad = False
                 for name, param in self.model.encoder.named_parameters():
@@ -772,7 +801,6 @@ class FullFinetuneModuleV2(torch.nn.Module):
             context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
             bsz = target_latents.shape[0]
 
-            # Если мы обучаем энкодер (или его проекторы), нам нужно прогнать сырые тексты через него
             if self.encoder_train_mode != "none" and "text_hidden_states" in batch and batch["text_hidden_states"].dim() > 1:
                 ths = batch["text_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
                 tmask = batch["text_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
@@ -783,23 +811,18 @@ class FullFinetuneModuleV2(torch.nn.Module):
                 ra_mask = torch.zeros(bsz, device=self.device, dtype=torch.long)
                 
                 encoder_hidden_states, encoder_attention_mask = self.model.encoder(
-                    text_hidden_states=ths,
-                    text_attention_mask=tmask,
-                    lyric_hidden_states=lhs,
-                    lyric_attention_mask=lmask,
+                    text_hidden_states=ths, text_attention_mask=tmask,
+                    lyric_hidden_states=lhs, lyric_attention_mask=lmask,
                     refer_audio_acoustic_hidden_states_packed=ra_hid,
                     refer_audio_order_mask=ra_mask
                 )
+                del ths, tmask, lhs, lmask, ra_hid, ra_mask
             else:
-                # Если энкодер заморожен, используем закэшированные в датасете препроцессированные состояния
                 encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
                 encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
-                
-                if self.encoder_train_mode != "none":
-                    print("⚠️ WARNING: Preprocessed dataset missing raw text/lyric tensors! Encoders skipped. Reprocess the dataset.")
 
             if self._null_cond_emb is not None and self.cfg_ratio > 0.0:
-                encoder_hidden_states = apply_cfg_dropout(
+                encoder_hidden_states = ts.apply_cfg_dropout(
                     encoder_hidden_states, self._null_cond_emb, cfg_ratio=self.cfg_ratio
                 )
 
@@ -824,16 +847,21 @@ class FullFinetuneModuleV2(torch.nn.Module):
             )
 
             flow = x1 - x0
-            unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
-            loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+            # Упрощенный расчет MSE для экономии памяти
+            diff = decoder_outputs[0] - flow
+            loss_per_sample = diff.pow(2).reshape(bsz, -1).mean(dim=1)
 
-            metadata = batch.get("metadata", [])
+            metadata = batch.get("metadata",[])
             weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
             for i in range(bsz):
                 meta = metadata[i] if i < len(metadata) else {}
                 if meta.get("is_reg", False): weights[i] = CURRENT_REG_WEIGHT
 
             diffusion_loss = (loss_per_sample * weights).mean()
+
+        # Explicit cleanup to release heavy tensors from graph immediately
+        del target_latents, attention_mask, encoder_hidden_states, encoder_attention_mask, context_latents
+        del x1, x0, t, r, t_, xt, decoder_outputs, flow, diff, loss_per_sample, weights
 
         return diffusion_loss.float()
 
@@ -854,7 +882,7 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         bsz = target_latents.shape[0]
 
         if self._null_cond_emb is not None and self._cfg_ratio > 0.0:
-            encoder_hidden_states = apply_cfg_dropout(encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio)
+            encoder_hidden_states = ts.apply_cfg_dropout(encoder_hidden_states, self._null_cond_emb, cfg_ratio=self._cfg_ratio)
 
         x1 = torch.randn_like(target_latents)
         x0 = target_latents
@@ -875,10 +903,10 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
             encoder_attention_mask=encoder_attention_mask, context_latents=context_latents
         )
         flow = x1 - x0
-        unreduced_loss = F.mse_loss(decoder_outputs[0], flow, reduction='none')
-        loss_per_sample = unreduced_loss.reshape(bsz, -1).mean(dim=1)
+        diff = decoder_outputs[0] - flow
+        loss_per_sample = diff.pow(2).reshape(bsz, -1).mean(dim=1)
 
-        metadata = batch.get("metadata", [])
+        metadata = batch.get("metadata",[])
         weights = torch.ones(bsz, device=self.device, dtype=self.dtype)
         for i in range(bsz):
             meta = metadata[i] if i < len(metadata) else {}
@@ -888,6 +916,11 @@ def custom_training_step_lora(self, batch: dict) -> torch.Tensor:
         unweighted_loss = loss_per_sample.mean()
 
     self.training_losses.append(unweighted_loss.item())
+
+    # Explicit cleanup
+    del target_latents, attention_mask, encoder_hidden_states, encoder_attention_mask, context_latents
+    del x1, x0, t, r, t_, xt, decoder_outputs, flow, diff, loss_per_sample, weights
+    
     return diffusion_loss.float()
 
 try: FixedLoRAModule.training_step = custom_training_step_lora
@@ -915,7 +948,7 @@ class ACEStepDatasetConfig:
                 "save_start": ("INT", {"default": 0, "min": 0}),
                 "save_loss_limit": ("FLOAT", {"default": 0.0, "min": 0.0}),
                 "save_final": ("BOOLEAN", {"default": False}),
-                "save_state": ("BOOLEAN", {"default": False, "tooltip": "Сохранять training_state.pt (весит много, нужен только для возобновления обучения)"}),
+                "save_state": ("BOOLEAN", {"default": False, "label_on": "Yes", "label_off": "No", "tooltip": "Сохранять training_state.pt (optimizer, scheduler) для возобновления тренировки. Включите только если планируете продолжать тренировку. Экономит ~50-200 МБ на чекпоинт."}),
             },
             "optional": {
                 "reg_data_source": ("STRING", {"default": ""}),
@@ -932,7 +965,7 @@ class ACEStepModelConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "dropout": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -942,7 +975,7 @@ class ACEStepModelConfig:
                 "inf_steps": ("INT", {"default": 8, "min": 1}),
                 "shift": ("FLOAT", {"default": 3.0, "min": 0.0, "step": 0.1}),
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "use_dora": ("BOOLEAN", {"default": True, "tooltip": "Критично для FP4. Отделяет обучение магнитуды вектора от направления."}),
+                "use_dora": ("BOOLEAN", {"default": True, "tooltip": "DoRA improves quality but costs VRAM if base_quantization is used."}),
             }
         }
     RETURN_TYPES = ("ACESTEP_MODEL",)
@@ -957,7 +990,7 @@ class ACEStepLoKRConfig:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "linear_dim": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "linear_alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "factor": ("INT", {"default": -1, "min": -1, "max": 256}),
@@ -1054,7 +1087,7 @@ class ACEStepProdigyPlusConfig:
     FUNCTION = "get_config"
     CATEGORY = "ACE-Step/Optimizers"
     def get_config(self, **kwargs):
-        opt_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k not in ["scheduler", "learning_rate", "weight_decay", "warmup_steps", "max_grad_norm"]}
+        opt_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k not in["scheduler", "learning_rate", "weight_decay", "warmup_steps", "max_grad_norm"]}
         if opt_kwargs.get("beta3", -1.0) < 0: opt_kwargs["beta3"] = None
         kwargs["optimizer"] = "prodigy_plus"
         kwargs["optimizer_kwargs"] = opt_kwargs
@@ -1121,15 +1154,15 @@ class ACEStepPreviewConfig:
             if not clean_source or not os.path.exists(clean_source):
                 indices_str = f"⚠️ Data source not found:\n{clean_source}"
             else:
-                basenames = []
+                basenames =[]
                 if clean_source.lower().endswith('.json'):
                     try:
                         with open(clean_source, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                            samples_list = data.get("samples", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                            samples_list = data.get("samples",[]) if isinstance(data, dict) else (data if isinstance(data, list) else[])
                             for item in samples_list:
                                 if isinstance(item, dict):
-                                    path_key = next((k for k in ["audio_path", "audio", "path", "file", "filename"] if k in item), None)
+                                    path_key = next((k for k in["audio_path", "audio", "path", "file", "filename"] if k in item), None)
                                     if path_key and item[path_key]:
                                         basenames.append(os.path.basename(item[path_key]))
                     except Exception as e:
@@ -1149,7 +1182,7 @@ class ACEStepPreviewConfig:
                     indices_str = f"⚠️ No valid audio files found"
                 else:
                     pt_names = sorted(list(set([os.path.splitext(b)[0] + ".pt" for b in basenames])))
-                    lines = [f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
+                    lines =[f"🔮 Predicted Training Order (Files: {len(pt_names)})", "="*60]
                     for idx, pt in enumerate(pt_names): lines.append(f"[{idx}] ➔ {pt}")
                     indices_str = "\n".join(lines)
         return (kwargs, indices_str)
@@ -1356,7 +1389,7 @@ class ACEStepLoRAResize:
             U, S, Vh = self.perform_svd(W, device)
             
             target_rank = min(self.calculate_new_rank(S, dynamic_method, dynamic_param, new_rank), old_r)
-            if dynamic_method in ["sv_fro", "sv_ratio"]: rank_pattern[base_key.replace("base_model.model.", "").rstrip(".")] = target_rank
+            if dynamic_method in["sv_fro", "sv_ratio"]: rank_pattern[base_key.replace("base_model.model.", "").rstrip(".")] = target_rank
 
             U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
@@ -1366,7 +1399,7 @@ class ACEStepLoRAResize:
             
         import copy
         new_config = copy.deepcopy(config)
-        new_config["peft_type"] = "LORA" # ФИКС: Гарантируем наличие этого ключа для PEFT
+        new_config["peft_type"] = "LORA" 
         
         if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
@@ -1444,7 +1477,7 @@ class ACEStepTrainer:
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
-        if saved_epochs is None: saved_epochs = []
+        if saved_epochs is None: saved_epochs =[]
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
@@ -1465,14 +1498,14 @@ class ACEStepTrainer:
         last_ema = emas[-1] if emas else 0.0
         last_lr = lrs[-1] if lrs else 0.0
         
-        title_lines = [
+        title_lines =[
             f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
             f"Time: {elapsed_str} (ETA: {eta_str})",
             f"Speed: {step_time_str} | {epoch_time_str}"
         ]
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
         lns = ln1 + ln2 + ln3
-        labs = [l.get_label() for l in lns]
+        labs =[l.get_label() for l in lns]
         ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
         
@@ -1505,17 +1538,26 @@ class ACEStepTrainer:
             CURRENT_REG_WEIGHT = reg_weight
 
             os.makedirs(output_dir, exist_ok=True)
+            
+            # === СОХРАНЯЕМ WORKFLOW СРАЗУ В НАЧАЛЕ ТРЕНИРОВКИ ===
+            print(f"🔍 [Workflow] extra_pnginfo keys: {list(extra_pnginfo.keys()) if extra_pnginfo else 'None'}")
             if extra_pnginfo and "workflow" in extra_pnginfo:
+                workflow_path = os.path.join(output_dir, "workflow.json")
+                print(f"💾 [Workflow] Сохранение workflow в {workflow_path}")
                 try:
-                    with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
-                        json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except: pass
+                    with open(workflow_path, "w", encoding="utf-8") as f:
+                        json.dump(extra_pnginfo["workflow"], f, indent=2, ensure_ascii=False)
+                    print(f"✅ [Workflow] Workflow успешно сохранён!")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сохранения workflow: {e}")
+            else:
+                print("⚠️ [Workflow] Workflow данные не найдены в extra_pnginfo")
 
             dataset_name = "default_dataset"
             if clean_source:
                 dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
-            
+
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
             gpu_info = detect_gpu("auto", "auto") if detect_gpu else None
             device = gpu_info.device if gpu_info else "cuda"
@@ -1583,6 +1625,9 @@ class ACEStepTrainer:
                     use_dora=model_config.get("use_dora", True)
                 )
 
+            if base_quantization in ["fp4", "fp8"] and model_config.get("use_dora", True):
+                print("\n⚠️ [VRAM WARNING] 'use_dora=True' combined with FP4/FP8 quantization forces PEFT to materialize 16-bit base weights during the forward pass! This significantly reduces VRAM savings. Disable 'use_dora' for maximum memory efficiency.\n")
+
             prev_cfg = preview_config if preview_config is not None else {}
             
             train_cfg = TrainingConfigV2(
@@ -1606,16 +1651,19 @@ class ACEStepTrainer:
             )
             train_cfg.save_state = dataset_config.get("save_state", True)
             train_cfg.save_final_model = dataset_config.get("save_final", False)
+            
+            # Информируем о режиме сохранения training_state
+            if train_cfg.save_state:
+                print("💾 [Save State] ✅ Сохранение training_state.pt ВКЛЮЧЕНО (можно возобновить тренировку)")
+            else:
+                print("💾 [Save State] ⏭️ Сохранение training_state.pt ОТКЛЮЧЕНО (экономия места, только адаптеры)")
 
             print(f"🧠[Phase 2] Loading {model_config['model_variant']} model on {device} ({precision})...")
             model = load_decoder_for_training(checkpoint_dir=checkpoint_dir, variant=model_config["model_variant"], device=device, precision=precision)
 
-            target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
-            apply_quantization_base_model(model, target_dtype, base_quantization, seed)
-
             if vram_cleanup:
                 print(f"🧹[System] Aggressive VRAM Cleanup...")
-                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
+                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer", "music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"]
                 for attr in to_kill:
                     if hasattr(model, attr):
                         m = getattr(model, attr)
@@ -1639,6 +1687,14 @@ class ACEStepTrainer:
             print("\n🔥 Starting Training Loop...")
             trainer = FixedLoRATrainer(model, adapter_cfg, train_cfg)
             trainer.main_tensor_dir = main_tensor_dir
+
+            # === ВСТРАИВАЕМ WORKFLOW В SAFETENSORS ===
+            if extra_pnginfo and "workflow" in extra_pnginfo:
+                try:
+                    trainer.workflow_json = json.dumps(extra_pnginfo["workflow"], ensure_ascii=False)
+                    print("✅ [Workflow] Workflow JSON передан тренеру для встраивания в safetensors")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сериализации workflow: {e}")
             
             import acestep.training.data_module as dm_module
             original_setup = dm_module.PreprocessedDataModule.setup
@@ -1677,8 +1733,8 @@ class ACEStepTrainer:
             training_state = {"should_stop": False}
             start_time = time.time()
 
-            epoch_history, loss_history, ema_history, lr_history = [], [], [], []
-            ema_loss, ema_alpha, saved_epochs = None, 0.1, []
+            epoch_history, loss_history, ema_history, lr_history = [], [], [],[]
+            ema_loss, ema_alpha, saved_epochs = None, 0.1,[]
             elapsed_str, eta_str, step_time_str, epoch_time_str = "00:00:00", "00:00:00", "0s/it", "0s/ep"
 
             def fmt_time(secs):
@@ -1686,8 +1742,17 @@ class ACEStepTrainer:
                 h, m = divmod(m, 60)
                 return f"{h:02d}:{m:02d}:{s:02d}"
 
+            is_first_yield = True
+
             try:
                 for update in trainer.train(training_state):
+                    # В этот момент trainer.module уже создан и PEFT внедрил LoRA адаптеры!
+                    if is_first_yield and trainer.module is not None:
+                        print("🪄 [Phase 3] Applying VRAM optimizations (FP8/NF4) to wrapped base layers...")
+                        target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+                        apply_quantization_base_model(trainer.module.model, target_dtype, base_quantization, seed)
+                        is_first_yield = False
+
                     if mm.processing_interrupted():
                         print("\n🛑 Training Interrupted by User via ComfyUI!")
                         training_state["should_stop"] = True
@@ -1732,6 +1797,10 @@ class ACEStepTrainer:
                                     saved_epochs, node_id=node_id_str
                                 )
                             except Exception: pass
+                            
+                    elif update.kind == "epoch":
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                     if update.msg:
                         if not (("Step" in update.msg and "Loss" in update.msg) or ("Epoch" in update.msg and "Loss" in update.msg)):
@@ -1764,7 +1833,7 @@ class ACEStepFinetuneTrainer:
         return {
             "required": {
                 "dataset_config": ("ACESTEP_DATASET",),
-                "model_variant": (["turbo", "base", "sft"], {"default": "turbo"}),
+                "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
@@ -1820,7 +1889,7 @@ class ACEStepFinetuneTrainer:
         return True
 
     def process_loss_graph(self, epochs, losses, emas, lrs, elapsed_str="", eta_str="", step_time_str="", epoch_time_str="", saved_epochs=None, node_id=None, output_dir=None):
-        if saved_epochs is None: saved_epochs = []
+        if saved_epochs is None: saved_epochs =[]
         fig = Figure(figsize=(4.8, 4.2), dpi=100, facecolor='#2b2b2b')
         ax = fig.add_subplot(111)
         ax.set_facecolor('#2b2b2b')
@@ -1842,14 +1911,14 @@ class ACEStepFinetuneTrainer:
         last_ema = emas[-1] if emas else 0.0
         last_lr = lrs[-1] if lrs else 0.0
         
-        title_lines = [
+        title_lines =[
             f"Loss: {last_loss:.4f} | EMA: {last_ema:.4f} | LR: {last_lr:.2e}",
             f"Time: {elapsed_str} (ETA: {eta_str})",
             f"Speed: {step_time_str} | {epoch_time_str}"
         ]
         ax.set_title("\n".join(title_lines), color='#e0e0e0', fontsize=9, pad=8)
         lns = ln1 + ln2 + ln3
-        labs = [l.get_label() for l in lns]
+        labs =[l.get_label() for l in lns]
         ax.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, facecolor='#2b2b2b', edgecolor='#444444', labelcolor='#e0e0e0', fontsize=8)
         fig.subplots_adjust(bottom=0.25, top=0.82, left=0.12, right=0.88)
         
@@ -1879,7 +1948,7 @@ class ACEStepFinetuneTrainer:
             
             target_idx = preview_config.get("sample_idx", 0)
             pt_files = sorted(glob.glob(os.path.join(main_tensor_dir, "*.pt")))
-            pt_files = [f for f in pt_files if not f.endswith("manifest.json")]
+            pt_files =[f for f in pt_files if not f.endswith("manifest.json")]
             
             caption, lyrics, tag, pos = "Music", "[Instrumental]", "", "prepend"
             ds_bpm, ds_key, ds_ts = "N/A", "N/A", "N/A"
@@ -2070,20 +2139,28 @@ class ACEStepFinetuneTrainer:
                     print("⚠️ Expect OOM on 16GB GPU. Use AdamW8bit or Adafactor, or set to 'projectors_only'.")
 
             os.makedirs(output_dir, exist_ok=True)
+            
+            # === СОХРАНЯЕМ WORKFLOW СРАЗУ В НАЧАЛЕ ТРЕНИРОВКИ ===
+            print(f"🔍 [Workflow] extra_pnginfo keys: {list(extra_pnginfo.keys()) if extra_pnginfo else 'None'}")
             if extra_pnginfo and "workflow" in extra_pnginfo:
-                print(f"💾 Saving workflow to {output_dir}/workflow.json")
+                workflow_path = os.path.join(output_dir, "workflow.json")
+                print(f"💾 [Workflow] Сохранение workflow в {workflow_path}")
                 try:
-                    with open(os.path.join(output_dir, "workflow.json"), "w", encoding="utf-8") as f:
-                        json.dump(extra_pnginfo["workflow"], f, indent=2)
-                except: pass
+                    with open(workflow_path, "w", encoding="utf-8") as f:
+                        json.dump(extra_pnginfo["workflow"], f, indent=2, ensure_ascii=False)
+                    print(f"✅ [Workflow] Workflow успешно сохранён!")
+                except Exception as e:
+                    print(f"⚠️ [Workflow] Ошибка сохранения workflow: {e}")
+            else:
+                print("⚠️ [Workflow] Workflow данные не найдены в extra_pnginfo")
 
             dataset_name = "default_dataset"
             if clean_source:
                 dataset_name = os.path.splitext(os.path.basename(os.path.normpath(clean_source)))[0]
                 dataset_name = re.sub(r'[\\/*?:"<>|]', "", dataset_name).replace(" ", "_")
-            
+
             main_tensor_dir = os.path.join(tensor_root, dataset_name)
-            
+
             gpu_info = None
             try:
                 from acestep.training_v2.gpu_utils import detect_gpu
@@ -2168,6 +2245,13 @@ class ACEStepFinetuneTrainer:
                 model_variant=model_variant,
                 dataset_dir=main_tensor_dir
             )
+            
+            # Информируем о режиме сохранения training_state
+            finetune_save_state = dataset_config.get("save_state", False)
+            if finetune_save_state:
+                print("💾 [Save State] ✅ Сохранение training_state.pt ВКЛЮЧЕНО (можно возобновить тренировку)")
+            else:
+                print("💾 [Save State] ⏭️ Сохранение training_state.pt ОТКЛЮЧЕНО (экономия места, только адаптеры)")
 
             print(f"🧠[Phase 2] Loading {model_variant} model on {device} ({precision})...")
             from acestep.training_v2.model_loader import load_decoder_for_training
@@ -2175,7 +2259,7 @@ class ACEStepFinetuneTrainer:
 
             if vram_cleanup or offload_enc:
                 print(f"🧹[System] Optimizing VRAM Usage (Cleanup/Offload)...")
-                to_kill = ["vae", "text_encoder", "tokenizer", "detokenizer"]
+                to_kill =["vae", "text_encoder", "tokenizer", "detokenizer"]
                 if encoder_train_mode == "none":
                     to_kill.extend(["music_encoder", "lyric_encoder", "timbre_encoder", "condition_projection"])
                 
@@ -2218,11 +2302,10 @@ class ACEStepFinetuneTrainer:
 
             module = FullFinetuneModuleV2(model, training_cfg, device, precision, encoder_train_mode, train_null_emb)
             
-            # Применение FP4/FP8 Quantization для замороженных базовых слоев (если вы включили эту фичу)
             target_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
             apply_quantization_base_model(module.model, target_dtype, base_quantization, seed)
 
-            trainable_params = [p for p in module.parameters() if p.requires_grad]
+            trainable_params =[p for p in module.parameters() if p.requires_grad]
             print(f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters")
 
             import acestep.training.data_module as dm_module
@@ -2260,10 +2343,9 @@ class ACEStepFinetuneTrainer:
 
             from acestep.training_v2.optim import build_optimizer, build_scheduler
 
-            # Защита от квантизационного шума
-            if base_quantization in ["fp4", "fp8"]:
+            if base_quantization in["fp4", "fp8"]:
                 training_cfg.optimizer_kwargs["eps"] = 1e-6
-                training_cfg.max_grad_norm = 0.5 # Более жесткий клиппинг
+                training_cfg.max_grad_norm = 0.5 
 
             optimizer = build_optimizer(
                 params=trainable_params, optimizer_type=training_cfg.optimizer_type,
@@ -2285,12 +2367,11 @@ class ACEStepFinetuneTrainer:
                 lr=training_cfg.learning_rate, optimizer_type=training_cfg.optimizer_type
             )
 
-            # Переменные истории обучения
-            epoch_history, loss_history, ema_history, lr_history = [], [], [], []
-            ema_loss, ema_alpha, saved_epochs = None, 0.1, []
+            epoch_history, loss_history, ema_history, lr_history = [], [], [],[]
+            ema_loss, ema_alpha, saved_epochs = None, 0.1,[]
             
             # ==============================================================
-            # БЛОК RESUME: ЗАГРУЗКА STATE И ВЕСОВ
+            # БЛОК RESUME
             # ==============================================================
             start_epoch = 0
             global_step = 0
@@ -2301,7 +2382,6 @@ class ACEStepFinetuneTrainer:
                 model_path = os.path.join(resume_from, "model.safetensors")
                 state_path = os.path.join(resume_from, "training_state.pt")
                 
-                # Загрузка весов
                 if os.path.exists(model_path):
                     from safetensors.torch import load_file
                     state_dict = load_file(model_path)
@@ -2310,7 +2390,6 @@ class ACEStepFinetuneTrainer:
                 else:
                     print("⚠️ [Resume] Файл model.safetensors не найден!")
 
-                # Загрузка состояния (Optim, LRs, Steps, Graphs)
                 if os.path.exists(state_path):
                     state = torch.load(state_path, map_location="cpu", weights_only=False)
                     start_epoch = state.get("epoch", 0)
@@ -2323,7 +2402,6 @@ class ACEStepFinetuneTrainer:
                         scheduler.load_state_dict(state["scheduler_state_dict"])
                         print("⏱️ [Resume] Состояние шедулера загружено.")
                     
-                    # Восстановление графиков
                     loss_history = state.get("loss_history", loss_history)
                     ema_history = state.get("ema_history", ema_history)
                     lr_history = state.get("lr_history", lr_history)
@@ -2337,7 +2415,6 @@ class ACEStepFinetuneTrainer:
             # ==============================================================
 
             pbar = ProgressBar(total_steps_approx)
-            # Перематываем pbar до текущего global_step
             if global_step > 0: pbar.update(global_step)
             
             start_time = time.time()
@@ -2354,7 +2431,6 @@ class ACEStepFinetuneTrainer:
             module.train()
 
             try:
-                # ВАЖНО: Цикл теперь начинается с start_epoch
                 for epoch in range(start_epoch, training_cfg.max_epochs):
                     epoch_loss = 0.0
                     num_updates = 0
@@ -2440,7 +2516,9 @@ class ACEStepFinetuneTrainer:
 
                     if mm.processing_interrupted(): break
 
-                    # ==== ЛОГИКА SAVE LOSS THRESHOLD И СТАРТОВОЙ ЭПОХИ ====
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     should_save = (epoch + 1) % training_cfg.save_every_n_epochs == 0
                     
                     if should_save and (epoch + 1) < training_cfg.save_start_epoch:
@@ -2455,12 +2533,10 @@ class ACEStepFinetuneTrainer:
 
                     if should_save:
                         ckpt_dir = os.path.join(output_dir, "checkpoints", f"epoch_{epoch+1}")
-                        
-                        # 1. Сохранение весов (слитых с базой)
+
                         _save_complete_model(module.model.state_dict(), ckpt_dir, source_model_dir, model_variant, extra_pnginfo, prompt)
-                        
-                        # 2. СОХРАНЕНИЕ РАБОЧЕГО СОСТОЯНИЯ (Для Resume)
-                        if dataset_config.get("save_state", True):
+
+                        if finetune_save_state:
                             state_save = {
                                 "epoch": epoch + 1,
                                 "global_step": global_step,
@@ -2481,8 +2557,6 @@ class ACEStepFinetuneTrainer:
                             last_ep = epoch_history[-1]
                             if not saved_epochs or abs(saved_epochs[-1] - last_ep) > 0.05:
                                 saved_epochs.append(last_ep)
-                                
-                        print(f"💾 Checkpoint and training state saved at epoch {epoch+1}")
 
                         if preview_config and preview_config.get("gen_preview", False):
                             self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
@@ -2515,7 +2589,7 @@ class ACEStepLoRAExtractor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo)"}),
+                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo, acestep-v15-xl-base и т.д.)"}),
                 "finetuned_model_path": ("STRING", {"default": "", "placeholder": "Путь к папке файнтюна"}),
                 "output_path": ("STRING", {"default": "./extracted_lora"}),
                 "rank": ("INT", {"default": 32, "min": 1}),
@@ -2534,7 +2608,7 @@ class ACEStepLoRAExtractor:
 
     def _resolve_model_path(self, path):
         if os.path.isfile(path): return path
-        for name in ["model.safetensors", "model_state_dict.pt", "model.bin"]:
+        for name in["model.safetensors", "model_state_dict.pt", "model.bin"]:
             p = os.path.join(path, name)
             if os.path.exists(p): return p
         raise FileNotFoundError(f"Не найден файл модели (model.safetensors) в {path}")
@@ -2559,7 +2633,7 @@ class ACEStepLoRAExtractor:
         elif precision == "bf16": save_dtype = torch.bfloat16
 
         scale_factor = rank / alpha if alpha > 0 else 1.0
-        valid_keys = [k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
+        valid_keys =[k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
 
         from comfy.utils import ProgressBar
         pbar = ProgressBar(len(valid_keys))
@@ -2590,7 +2664,7 @@ class ACEStepLoRAExtractor:
 
             target_rank = min(target_rank, rank, len(S))
             layer_name = key.replace("decoder.", "").replace(".weight", "")
-            if dynamic_method in ["sv_fro", "sv_ratio"]: rank_pattern[layer_name] = target_rank
+            if dynamic_method in["sv_fro", "sv_ratio"]: rank_pattern[layer_name] = target_rank
 
             U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
@@ -2604,7 +2678,6 @@ class ACEStepLoRAExtractor:
 
         os.makedirs(out_path, exist_ok=True)
         
-        # ФИКС: Обязательно указываем peft_type
         config = {
             "peft_type": "LORA",
             "r": rank, 

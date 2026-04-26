@@ -12,6 +12,8 @@ import comfy.utils
 import comfy.model_management as mm
 import gc
 import re
+import random
+import numpy as np
 
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -110,7 +112,7 @@ if not hasattr(mm, "_original_unload_all_models_acestep"):
 # ============================================================================
 def get_available_acestep_models():
     checkpoints_dir = os.path.join(ACESTEP_MODELS_DIR, "checkpoints")
-    models =["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft"] # Дефолтные
+    models =["acestep-v15-turbo", "acestep-v15-base", "acestep-v15-sft", "acestep-v15-xl-base", "acestep-v15-xl-turbo", "acestep-v15-xl-sft"] # Дефолтные
     if os.path.exists(checkpoints_dir):
         for d in os.listdir(checkpoints_dir):
             if os.path.isdir(os.path.join(checkpoints_dir, d)) and d not in models:
@@ -128,6 +130,7 @@ class AceStepModelLoader:
                 "lm_model_path": (["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-4B"], {"default": "acestep-5Hz-lm-1.7B"}),
                 "lm_backend": (["vllm", "pt", "mlx"], {"default": "vllm"}),
                 "use_flash_attention": ("BOOLEAN", {"default": True}),
+                "quantization": (["none", "fp8_weight_only", "w8a8_dynamic", "int8_weight_only", "nvfp4"], {"default": "none", "tooltip": "NVFP4: Экспериментальная 4-битная float квантизация. FP8/INT8/W8A8: Стандартные методы."}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -140,8 +143,10 @@ class AceStepModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "ACE-Step"
 
-    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, offload_to_cpu, custom_model_path=""):
+    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, quantization, offload_to_cpu, custom_model_path=""):
         print(f"[ACE-Step] Инициализация. Целевая папка моделей: {ACESTEP_MODELS_DIR}")
+        if quantization and quantization != "none":
+            print(f"[ACE-Step] 🪄 Квантизация модели: {quantization}")
         
         cleanup_all_acestep()
         
@@ -165,6 +170,7 @@ class AceStepModelLoader:
             device=device,
             use_flash_attention=use_flash_attention,
             compile_model=False,
+            quantization=quantization if quantization != "none" else None,
             offload_to_cpu=offload_to_cpu,
             offload_dit_to_cpu=offload_to_cpu
         )
@@ -198,6 +204,134 @@ class AceStepModelLoader:
         GLOBAL_ACESTEP_HANDLERS.append((dit_handler, llm_handler if llm_handler.llm_initialized else None))
 
         return ({"dit_handler": dit_handler, "llm_handler": llm_handler if llm_handler.llm_initialized else None, "active_adapters": {}},)
+
+# ============================================================================
+# FP8 КВАНТИЗАЦИЯ СО STOCHASTIC ROUNDING
+# ============================================================================
+def _calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
+    mantissa_scaled = torch.where(
+        normal_mask,
+        (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
+        (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS)))
+    )
+    mantissa_scaled += torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator)
+    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+def _manual_stochastic_round_to_float8(x, dtype, generator=None):
+    if dtype == torch.float8_e4m3fn:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7
+    elif dtype == getattr(torch, "float8_e5m2", None):
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 5, 2, 15
+    else:
+        raise ValueError("Unsupported dtype")
+
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
+        0, 2**EXPONENT_BITS - 1
+    )
+
+    normal_mask = ~(exponent == 0)
+    abs_x[:] = _calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator)
+
+    sign *= torch.where(
+        normal_mask,
+        (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
+        (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x
+    )
+
+    inf = torch.finfo(dtype)
+    torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
+    return sign
+
+def _stochastic_rounding_fp8(value, dtype, seed=0):
+    """Stochastic rounding для FP8 с использованием генератора случайных чисел."""
+    if dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        return value.to(dtype=dtype)
+    if dtype in [getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)]:
+        generator = torch.Generator(device=value.device)
+        generator.manual_seed(seed)
+        output = torch.empty_like(value, dtype=dtype)
+        num_slices = max(1, int(value.numel() / (4096 * 4096)))
+        slice_size = max(1, round(value.shape[0] / num_slices))
+        for i in range(0, value.shape[0], slice_size):
+            output[i:i+slice_size].copy_(_manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator))
+        return output
+    return value.to(dtype=dtype)
+
+class _QuantizedFP8Linear(torch.nn.Linear):
+    """DoRA-совместимая обертка для FP8. Возвращает BF16 веса для инициализации LoRA."""
+    @property
+    def weight(self):
+        return torch.nn.Parameter(self.weight_fp8.to(self.compute_dtype), requires_grad=False)
+
+    def forward(self, x):
+        w_dequant = self.weight_fp8.to(x.dtype)
+        return torch.nn.functional.linear(x, w_dequant, self.bias)
+
+class AceStepModelQuantizer:
+    """
+    Применяет FP8 квантизацию со stochastic rounding к уже загруженной модели.
+    Полезна для экономии VRAM при тренировке LoRA/DoRA.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("ACESTEP_MODEL",),
+                "quant_type": (["fp8", "none"], {"default": "fp8", "tooltip": "FP8 со stochastic rounding для точности"}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Сид для stochastic rounding"}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "quantize"
+    CATEGORY = "ACE-Step"
+
+    def quantize(self, model, quant_type, seed):
+        if quant_type == "none":
+            print("[ACE-Step Quantizer] ⏭️ Квантизация пропущена.")
+            return (model,)
+
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("[ACE-Step Quantizer] ❌ Ваша версия PyTorch не поддерживает float8_e4m3fn.")
+
+        dit_handler = model["dit_handler"]
+        decoder = getattr(dit_handler.model, "decoder", None)
+        
+        if decoder is None:
+            raise RuntimeError("[ACE-Step Quantizer] ❌ Не найден decoder в модели.")
+
+        print(f"\n[ACE-Step Quantizer] 🪄 Квантизация замороженных слоев в FP8 (Stochastic Rounding)...")
+        converted_count = 0
+
+        for name, module in decoder.named_modules():
+            if isinstance(module, torch.nn.Linear) and not module.weight.requires_grad:
+                # Применяем stochastic rounding
+                fp8_weight = _stochastic_rounding_fp8(module.weight.data, torch.float8_e4m3fn, seed=seed)
+
+                module.weight_fp8 = torch.nn.Parameter(fp8_weight, requires_grad=False)
+                module.compute_dtype = torch.bfloat16
+
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(torch.bfloat16)
+
+                del module.weight  # Удаляем BF16 тензор для экономии памяти
+                module.__class__ = _QuantizedFP8Linear
+                converted_count += 1
+
+        print(f"[ACE-Step Quantizer] ✅ Успешно конвертировано {converted_count} слоев в FP8.")
+        print(f"[ACE-Step Quantizer] 💾 Экономия VRAM: ~{converted_count * 0.5:.1f} МБ (приблизительно)")
+
+        # Обновляем состояние квантизации в handler
+        dit_handler.quantization = "fp8_weight_only"
+
+        return (model,)
 
 # ============================================================================
 # 2. Загрузчик LoRA
@@ -694,7 +828,6 @@ class AceStepLMConfig:
                 "lm_cfg_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 5.0, "step": 0.1}),
                 "lm_top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "lm_top_k": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
-                "audio_cover_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Сила аудио-кодов / Cover strength"}),
                 "lm_negative_prompt": ("STRING", {"default": "NO USER INPUT", "multiline": True}),
                 "use_cot_metas": ("BOOLEAN", {"default": True, "tooltip": "Генерировать недостающие метаданные (BPM, тональность) через LLM"}),
                 "use_cot_caption": ("BOOLEAN", {"default": True, "tooltip": "Разрешить LLM переписывать caption во время генерации (если не запрещено в самом генераторе)"}),
@@ -708,14 +841,13 @@ class AceStepLMConfig:
     FUNCTION = "create_config"
     CATEGORY = "ACE-Step"
 
-    def create_config(self, lm_temperature, lm_cfg_scale, lm_top_p, lm_top_k, audio_cover_strength, 
+    def create_config(self, lm_temperature, lm_cfg_scale, lm_top_p, lm_top_k, 
                       lm_negative_prompt, use_cot_metas, use_cot_caption, use_cot_language, allow_lm_batch):
         return ({
             "lm_temperature": lm_temperature,
             "lm_cfg_scale": lm_cfg_scale,
             "lm_top_p": lm_top_p,
             "lm_top_k": lm_top_k,
-            "audio_cover_strength": audio_cover_strength,
             "lm_negative_prompt": lm_negative_prompt,
             "use_cot_metas": use_cot_metas,
             "use_cot_caption": use_cot_caption,
@@ -812,6 +944,75 @@ class AceStepPromptEnhancer:
         return (final_caption, final_lyrics, final_bpm, final_key, final_ts, final_lang)
 
 # ============================================================================
+# Настройки для режима Cover (Ремикс / Перепевка)
+# ============================================================================
+class AceStepCoverConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_audio": ("AUDIO", {"tooltip": "Исходное аудио, из которого будет сделан кавер"}),
+                "audio_cover_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "1.0 = максимально близко к исходнику, меньше = больше креатива/изменений ритма."}),
+                "cover_noise_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0.0 = чистый звук, 1.0 = звук ближе к оригиналу с сохранением исходного тембра."}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_EDIT_CONFIG",)
+    RETURN_NAMES = ("edit_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Modes"
+
+    def create_config(self, source_audio, audio_cover_strength, cover_noise_strength):
+        return ({
+            "task_type": "cover",
+            "source_audio": source_audio,
+            "audio_cover_strength": audio_cover_strength,
+            "cover_noise_strength": cover_noise_strength,
+            "repainting_start": 0.0,
+            "repainting_end": -1.0,
+            "repaint_mode": "balanced",
+            "repaint_strength": 0.5,
+        },)
+
+
+# ============================================================================
+# Настройки для режимов Repaint / Complete / Lego
+# ============================================================================
+class AceStepRepaintConfig:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "task_type": (["repaint", "complete", "lego"], {"default": "repaint", "tooltip": "Repaint: Замена куска. Complete: Продление трека. Lego: Добавление инструмента поверх."}),
+                "source_audio": ("AUDIO", {"tooltip": "Исходное аудио, которое будем редактировать"}),
+                "edit_start_sec": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 0.1, "tooltip": "Время начала редактирования (в секундах)"}),
+                "edit_end_sec": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "step": 0.1, "tooltip": "Время окончания. -1 означает 'редактировать до конца трека'"}),
+                "repaint_mode": (["balanced", "conservative", "aggressive"], {"default": "balanced", "tooltip": "Conservative = сохраняет максимум оригинала на стыках."}),
+                "repaint_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Интенсивность перерисовки (только для режима 'balanced')"}),
+            }
+        }
+
+    RETURN_TYPES = ("ACESTEP_EDIT_CONFIG",)
+    RETURN_NAMES = ("edit_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "ACE-Step/Modes"
+
+    def create_config(self, task_type, source_audio, edit_start_sec, edit_end_sec, repaint_mode, repaint_strength):
+        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
+             raise ValueError(f"[ACE-Step Repaint] ОШИБКА: Время окончания ({edit_end_sec}s) должно быть больше времени начала ({edit_start_sec}s).")
+             
+        return ({
+            "task_type": task_type,
+            "source_audio": source_audio,
+            "repainting_start": edit_start_sec,
+            "repainting_end": edit_end_sec,
+            "repaint_mode": repaint_mode,
+            "repaint_strength": repaint_strength,
+            "audio_cover_strength": 1.0, # Не используется в repaint
+            "cover_noise_strength": 0.0, # Не используется в repaint
+        },)
+    
+# ============================================================================
 # 5. Генератор Музыки
 # ============================================================================
 class AceStepMusicGenerator:
@@ -820,24 +1021,23 @@ class AceStepMusicGenerator:
         return {
             "required": {
                 "model": ("ACESTEP_MODEL",),
-                "task_type": (["text2music", "cover", "repaint"], {"default": "text2music"}),
                 "caption": ("STRING", {"multiline": True, "default": "piano solo"}),
                 "lyrics": ("STRING", {"multiline": True, "default": "[Instrumental]"}),
-                "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0}),
-                "inference_steps": ("INT", {"default": 8}),
-                "guidance_scale": ("FLOAT", {"default": 7.0}),
-                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1, "tooltip": "Смещение таймстепов (Timestep shift factor)"}),
-                "thinking": ("BOOLEAN", {"default": True, "tooltip": "Генерация аудио-кодов через LLM"}),
+                "duration": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 600.0, "tooltip": "Длительность (-1 для авто-определения)"}),
+                "inference_steps": ("INT", {"default": 8, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 15.0, "step": 0.1}),
+                "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "thinking": ("BOOLEAN", {"default": True, "tooltip": "Использовать LLM для рассуждений (CoT)"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
                 "merge_loras": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "reference_audio": ("AUDIO",),
-                "source_audio": ("AUDIO",),
+                "edit_config": ("ACESTEP_EDIT_CONFIG", {"tooltip": "Подключите сюда ноду Cover Config или Repaint Config для активации этих режимов."}),
+                "reference_audio": ("AUDIO", {"tooltip": "РЕФЕРЕНС: Аудио для переноса стиля и общего звучания (работает во всех режимах)"}),
                 "vocal_language": (["unknown", "en", "ja", "zh", "es", "de", "fr", "pt", "ru", "it", "nl", "pl", "tr", "vi", "cs", "fa", "id", "ko", "uk", "hu", "ar", "sv", "ro", "el"], {"default": "unknown"}),
-                "bpm": ("INT", {"default": 0}),
-                "key_scale": ([""] + [f"{root} {quality}" for quality in ["major", "minor"] for root in ["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]], {"default": ""}),
+                "bpm": ("INT", {"default": 0, "tooltip": "0 = Авто"}),
+                "key_scale": ([""] +[f"{root} {quality}" for quality in ["major", "minor"] for root in["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]], {"default": ""}),
                 "time_signature": (['', '2', '3', '4', '6'], {"default": ""}),
                 "lm_config": ("ACESTEP_LM_CONFIG",),
             }
@@ -993,8 +1193,7 @@ class AceStepMusicGenerator:
                 # Если запрошенных активных адаптеров нет (все веса 0.0)
                 if not is_lokr and hasattr(decoder, "disable_adapter_layers"):
                     decoder.disable_adapter_layers()
-                    # ФИКС "ПРИЗРАЧНОЙ ЛОРЫ": Принудительно сбрасываем масштаб (scale) всех загруженных PEFT,
-                    # так как disable_adapter_layers иногда пропускает остаточные веса.
+                    # ФИКС "ПРИЗРАЧНОЙ ЛОРЫ": Принудительно сбрасываем масштаб (scale) всех загруженных PEFT
                     for name in loaded_adapters:
                         try: dit_handler.set_lora_scale(name, 0.0)
                         except: pass
@@ -1010,11 +1209,53 @@ class AceStepMusicGenerator:
                             
                 dit_handler.use_lora = False
 
-    def generate(self, model, task_type, caption, lyrics, duration, inference_steps, 
+    def generate(self, model, caption, lyrics, duration, inference_steps, 
                  guidance_scale, shift, thinking, seed, unload_unused_loras, merge_loras, 
-                 reference_audio=None, source_audio=None, vocal_language="unknown", 
-                 bpm=0, key_scale="", time_signature="", lm_config=None):
+                 edit_config=None, reference_audio=None, 
+                 vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
         
+        # === 1. ПРИНУДИТЕЛЬНАЯ ФИКСАЦИЯ ВСЕХ СИДОВ ===
+        if seed != -1:
+            numpy_seed = seed % (2**32)
+
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            random.seed(seed)
+            np.random.seed(numpy_seed)
+            # Отключаем бенчмарк cudnn для строгой детерминированности (если поддерживается)
+            # torch.backends.cudnn.deterministic = True
+            # torch.backends.cudnn.benchmark = False
+        
+        # Распаковка режима из edit_config (если не подключен, то базовый text2music)
+        task_type = "text2music"
+        source_audio = None
+        edit_start_sec = 0.0
+        edit_end_sec = -1.0
+        repaint_mode = "balanced"
+        repaint_strength = 0.5
+        audio_cover_strength = 1.0
+        cover_noise_strength = 0.0
+
+        if edit_config is not None:
+            task_type = edit_config.get("task_type", "text2music")
+            source_audio = edit_config.get("source_audio")
+            edit_start_sec = edit_config.get("repainting_start", 0.0)
+            edit_end_sec = edit_config.get("repainting_end", -1.0)
+            repaint_mode = edit_config.get("repaint_mode", "balanced")
+            repaint_strength = edit_config.get("repaint_strength", 0.5)
+            audio_cover_strength = edit_config.get("audio_cover_strength", 1.0)
+            cover_noise_strength = edit_config.get("cover_noise_strength", 0.0)
+
+        # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
+        requires_source = ["cover", "repaint", "complete", "lego"]
+        if task_type in requires_source and source_audio is None:
+            raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
+        
+        # ЗАЩИТА: Проверка валидности времени редактирования
+        if edit_end_sec != -1.0 and edit_end_sec <= edit_start_sec:
+             raise ValueError(f"[ACE-Step] ОШИБКА: Время окончания (edit_end_sec) должно быть больше времени начала (edit_start_sec) или равно -1.0 (до конца трека).")
+
         dit_handler = model["dit_handler"]
         llm_handler = model["llm_handler"]
         active_adapters = model.get("active_adapters", {})
@@ -1022,20 +1263,18 @@ class AceStepMusicGenerator:
         self._sync_loras(dit_handler, active_adapters, unload_unused_loras)
 
         is_merged = False
+        is_quantized = dit_handler.quantization is not None and dit_handler.quantization != "none"
+        
         if merge_loras:
-            # =================================================================
-            # ОПТИМИЗАЦИЯ VRAM: Слияние LoRA с базовой моделью "на лету"
-            # Это убирает накладные расходы на VRAM во время forward pass
-            # =================================================================
-            decoder = getattr(dit_handler.model, "decoder", None)
-            if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
-                try:
-                    print("[ACE-Step] Оптимизация VRAM: Временное слияние (merge) LoRA...")
-                    decoder.merge_adapter()
-                    is_merged = True
-                except Exception as e:
-                    print(f"[ACE-Step] Предупреждение: не удалось выполнить merge_adapter: {e}")
-            # =================================================================
+            if is_quantized:
+                print("[ACE-Step] ℹ️ Слияние отключено: модель квантована.")
+            else:
+                decoder = getattr(dit_handler.model, "decoder", None)
+                if decoder is not None and hasattr(decoder, "merge_adapter") and getattr(dit_handler, "use_lora", False):
+                    try:
+                        decoder.merge_adapter()
+                        is_merged = True
+                    except Exception: pass
 
         if thinking and llm_handler is None:
             thinking = False
@@ -1043,12 +1282,11 @@ class AceStepMusicGenerator:
         ref_path = self._save_comfy_audio_to_temp(reference_audio)
         src_path = self._save_comfy_audio_to_temp(source_audio)
 
-        # Вытаскиваем параметры LLM (включая параметры CoT)
+        # Вытаскиваем параметры LLM
         lm_temp = 0.85
         lm_cfg = 2.0
         lm_tk = 0
         lm_tp = 0.9
-        cover_str = 1.0
         lm_neg_prompt = "NO USER INPUT"
         use_cot_metas = True
         use_cot_caption = True
@@ -1060,7 +1298,6 @@ class AceStepMusicGenerator:
             lm_cfg = lm_config.get("lm_cfg_scale", 2.0)
             lm_tk = lm_config.get("lm_top_k", 0)
             lm_tp = lm_config.get("lm_top_p", 0.9)
-            cover_str = lm_config.get("audio_cover_strength", 1.0)
             lm_neg_prompt = lm_config.get("lm_negative_prompt", "NO USER INPUT")
             use_cot_metas = lm_config.get("use_cot_metas", True)
             use_cot_caption = lm_config.get("use_cot_caption", True)
@@ -1070,48 +1307,50 @@ class AceStepMusicGenerator:
         params = GenerationParams(
             task_type=task_type, caption=caption, lyrics=lyrics,
             bpm=bpm if bpm > 0 else None, keyscale=key_scale, timesignature=time_signature,
-            duration=duration, vocal_language=vocal_language,
+            duration=duration if duration > 0 else None, vocal_language=vocal_language,
             inference_steps=inference_steps, guidance_scale=guidance_scale,
             shift=shift, seed=seed,
             thinking=thinking, reference_audio=ref_path,
-            src_audio=src_path if task_type != "text2music" else None,
+            src_audio=src_path, # Для text2music src_path будет None
             use_cot_metas=use_cot_metas, 
             use_cot_caption=use_cot_caption, 
             use_cot_language=use_cot_language,
-            audio_cover_strength=cover_str,
             lm_temperature=lm_temp, lm_cfg_scale=lm_cfg, lm_top_k=lm_tk, 
-            lm_top_p=lm_tp, lm_negative_prompt=lm_neg_prompt
+            lm_top_p=lm_tp, lm_negative_prompt=lm_neg_prompt,
+            
+            audio_cover_strength=audio_cover_strength,
+            cover_noise_strength=cover_noise_strength,
+            repainting_start=edit_start_sec,
+            repainting_end=edit_end_sec if edit_end_sec >= 0 else -1.0,
+            repaint_mode=repaint_mode,
+            repaint_strength=repaint_strength,
         )
 
         config = GenerationConfig(
             batch_size=1, 
             use_random_seed=(seed == -1), 
+            seeds=[seed] if seed != -1 else None,
             audio_format="wav",
             allow_lm_batch=allow_lm_batch
         )
 
-        # ==========================================
-        # ПРОГРЕСС БАР COMFYUI
-        # ==========================================
         pbar = comfy.utils.ProgressBar(100)
         last_percent = 0
 
         def progress_callback(value, desc=None, *args, **kwargs):
             nonlocal last_percent
-            if isinstance(value, str):
-                # print(f"[ACE-Step] {value}")
-                return
-                
+            
+            import comfy.model_management as mm
+            mm.throw_exception_if_processing_interrupted()
+            
+            if isinstance(value, str): return
             if isinstance(value, (int, float)):
                 current_percent = min(100, max(0, int(value * 100)))
                 if current_percent > last_percent:
                     pbar.update(current_percent - last_percent)
                     last_percent = current_percent
-                    
-            if desc:
-                pass # print(f"[ACE-Step Progress] {desc} ({last_percent}%)")
 
-        print("[ACE-Step] Начинаем генерацию...")
+        print(f"[ACE-Step] Начинаем генерацию. Режим: {task_type.upper()}, Seed: {seed}")
         try:
             result = generate_music(
                 dit_handler=dit_handler, 
@@ -1123,6 +1362,11 @@ class AceStepMusicGenerator:
             )
             
             if not result.success:
+                # Если движок перехватил наше прерывание, пробрасываем его обратно в ComfyUI
+                if "InterruptProcessingException" in str(result.error):
+                    print("\n[ACE-Step] 🛑 Генерация прервана пользователем.\n")
+                    import comfy.model_management as mm
+                    raise mm.InterruptProcessingException()
                 raise RuntimeError(f"Generation Failed: {result.error}")
 
             if last_percent < 100:
@@ -1134,17 +1378,12 @@ class AceStepMusicGenerator:
             return ({"waveform": output_audio_tensor.unsqueeze(0), "sample_rate": output_sample_rate},)
 
         finally:
-
-            # =================================================================
-            # ВОЗВРАТ СОСТОЯНИЯ: Отменяем слияние после генерации
-            # =================================================================
             if is_merged and hasattr(decoder, "unmerge_adapter"):
                 try:
                     print("[ACE-Step] Отмена слияния (unmerge) LoRA...")
                     decoder.unmerge_adapter()
                 except Exception as e:
                     print(f"[ACE-Step] Ошибка при unmerge_adapter: {e}")
-            # =================================================================
 
             if ref_path and os.path.exists(ref_path): os.remove(ref_path)
             if src_path and os.path.exists(src_path): os.remove(src_path)
@@ -1155,6 +1394,8 @@ NODE_CLASS_MAPPINGS = {
     "AceStepLoraBaker": AceStepLoraBaker,
     "AceStepLMConfig": AceStepLMConfig,
     "AceStepPromptEnhancer": AceStepPromptEnhancer,
+    "AceStepCoverConfig": AceStepCoverConfig,
+    "AceStepRepaintConfig": AceStepRepaintConfig,
     "AceStepMusicGenerator": AceStepMusicGenerator,
     "AceStepLoraAnalyzer": AceStepLoraAnalyzer,
     "AceStepAdvancedLoraLoader": AceStepAdvancedLoraLoader
@@ -1166,6 +1407,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AceStepLoraBaker": "ACE-Step LoRA Baker 🍳",
     "AceStepLMConfig": "ACE-Step LM Config ⚙️",
     "AceStepPromptEnhancer": "ACE-Step Prompt Enhancer ✍️",
+    "AceStepCoverConfig": "ACE-Step Cover/Remix Config 🎤",
+    "AceStepRepaintConfig": "ACE-Step Repaint/Extend Config 🎨",
     "AceStepMusicGenerator": "ACE-Step Music Generator 🎵",
     "AceStepLoraAnalyzer": "ACE-Step LoRA Analyzer 🔬",
     "AceStepAdvancedLoraLoader": "ACE-Step Advanced LoRA Loader 🎛️"
