@@ -139,12 +139,29 @@ class PreprocessedTensorDataset(Dataset):
         tensor_path = self.valid_paths[idx]
         data = torch.load(tensor_path, map_location='cpu', weights_only=True)
         
+        # ДИНАМИЧЕСКИЙ ФИКС ЛИШНИХ ИЗМЕРЕНИЙ ДЛЯ СТАРЫХ ДАТАСЕТОВ
+        t_hs = data.get("text_hidden_states", torch.zeros(1))
+        if t_hs.dim() == 3: t_hs = t_hs.squeeze(0)
+            
+        t_mask = data.get("text_attention_mask", torch.zeros(1))
+        if t_mask.dim() == 2: t_mask = t_mask.squeeze(0)
+            
+        l_hs = data.get("lyric_hidden_states", torch.zeros(1))
+        if l_hs.dim() == 3: l_hs = l_hs.squeeze(0)
+            
+        l_mask = data.get("lyric_attention_mask", torch.zeros(1))
+        if l_mask.dim() == 2: l_mask = l_mask.squeeze(0)
+
         return {
             "target_latents": data["target_latents"],  # [T, 64]
             "attention_mask": data["attention_mask"],  # [T]
             "encoder_hidden_states": data["encoder_hidden_states"],  # [L, D]
             "encoder_attention_mask": data["encoder_attention_mask"],  # [L]
             "context_latents": data["context_latents"],  # [T, 65]
+            "text_hidden_states": t_hs,
+            "text_attention_mask": t_mask,
+            "lyric_hidden_states": l_hs,
+            "lyric_attention_mask": l_mask,
             "metadata": data.get("metadata", {}),
         }
 
@@ -207,7 +224,7 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             eam = torch.cat([eam, pad], dim=0)
         encoder_attention_masks.append(eam)
     
-    return {
+    result = {
         "target_latents": torch.stack(target_latents),  # [B, T, 64]
         "attention_mask": torch.stack(attention_masks),  # [B, T]
         "encoder_hidden_states": torch.stack(encoder_hidden_states),  # [B, L, D]
@@ -215,6 +232,44 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "context_latents": torch.stack(context_latents),  # [B, T, 65]
         "metadata": [s["metadata"] for s in batch],
     }
+
+    # ПАДДИНГ ТЕКСТОВ И ЛИРИКИ ДЛЯ ОБУЧЕНИЯ ЭНКОДЕРОВ
+    if "text_hidden_states" in batch[0] and batch[0]["text_hidden_states"].dim() > 1:
+        max_text_len = max(s["text_hidden_states"].shape[0] for s in batch)
+        max_lyric_len = max(s["lyric_hidden_states"].shape[0] for s in batch)
+        
+        t_hs, t_mask, l_hs, l_mask = [], [], [], []
+        for s in batch:
+            ths = s["text_hidden_states"]
+            if ths.shape[0] < max_text_len:
+                pad = ths.new_zeros(max_text_len - ths.shape[0], ths.shape[1])
+                ths = torch.cat([ths, pad], dim=0)
+            t_hs.append(ths)
+            
+            tm = s["text_attention_mask"]
+            if tm.shape[0] < max_text_len:
+                pad = tm.new_zeros(max_text_len - tm.shape[0])
+                tm = torch.cat([tm, pad], dim=0)
+            t_mask.append(tm)
+            
+            lhs = s["lyric_hidden_states"]
+            if lhs.shape[0] < max_lyric_len:
+                pad = lhs.new_zeros(max_lyric_len - lhs.shape[0], lhs.shape[1])
+                lhs = torch.cat([lhs, pad], dim=0)
+            l_hs.append(lhs)
+            
+            lm = s["lyric_attention_mask"]
+            if lm.shape[0] < max_lyric_len:
+                pad = lm.new_zeros(max_lyric_len - lm.shape[0])
+                lm = torch.cat([lm, pad], dim=0)
+            l_mask.append(lm)
+            
+        result["text_hidden_states"] = torch.stack(t_hs)
+        result["text_attention_mask"] = torch.stack(t_mask)
+        result["lyric_hidden_states"] = torch.stack(l_hs)
+        result["lyric_attention_mask"] = torch.stack(l_mask)
+    
+    return result
 
 
 class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else object):

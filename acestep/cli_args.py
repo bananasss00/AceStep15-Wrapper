@@ -8,6 +8,8 @@ _QUANTIZATION_ALIASES = {
     "int8_weight_only": "int8_weight_only",
     "fp8_weight_only": "fp8_weight_only",
     "w8a8_dynamic": "w8a8_dynamic",
+    "nvfp4": "nvfp4",
+    "nvfp4_weight_only": "nvfp4",
 }
 _NONE_ALIASES = {"", "none", "null"}
 

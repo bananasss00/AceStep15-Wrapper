@@ -2,6 +2,8 @@
 
 import json
 import os
+import glob
+import torch
 from typing import Any
 
 from loguru import logger
@@ -9,6 +11,14 @@ from loguru import logger
 from acestep.constants import DEBUG_MODEL_LOADING
 from acestep.debug_utils import debug_log
 from acestep.training.configs import LoKRConfig
+
+from peft.utils.save_and_load import set_peft_model_state_dict
+
+# Понадобится для чтения safetensors в память
+try:
+    from safetensors.torch import load_file as load_safetensors
+except ImportError:
+    load_safetensors = None
 
 LOKR_WEIGHTS_FILENAME = "lokr_weights.safetensors"
 REQUIRED_PEFT_CONFIG_KEYS = ("peft_type",)
@@ -179,6 +189,18 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
     lycoris_net.apply_to()
     decoder._lycoris_net = lycoris_net
     lycoris_net.load_weights(weights_path)
+    
+    # --- ФИКС ТИПА ДАННЫХ И УСТРОЙСТВА ---
+    try:
+        # Получаем тип данных и устройство базовой модели
+        target_device = next(decoder.parameters()).device
+        target_dtype = next(decoder.parameters()).dtype
+        # Принудительно конвертируем веса LoKr под базовую модель
+        lycoris_net.to(device=target_device, dtype=target_dtype)
+        logger.info(f"LyCORIS weights casted to {target_dtype} on {target_device}")
+    except Exception as e:
+        logger.warning(f"Failed to cast LyCORIS weights: {e}")
+
     return lycoris_net
 
 
@@ -188,7 +210,7 @@ def _default_adapter_name_from_path(lora_path: str) -> str:
     return name if name else "default"
 
 
-def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
+def add_lora(self, lora_path: str, adapter_name: str | None = None, ignore_bias: bool = False) -> str:
     """Load a LoRA adapter into the decoder under the given name.
 
     If the decoder is not yet a PeftModel, wraps it and loads the first adapter.
@@ -197,15 +219,46 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
     if self.model is None:
         return "❌ Model not initialized. Please initialize service first."
 
-    if self.quantization is not None:
-        return (
-            "❌ LoRA loading is not supported on quantized models. "
-            f"Current quantization: {self.quantization}. "
-            "Please re-initialize the service with quantization disabled, then try loading the LoRA adapter again."
-        )
+    # if self.quantization is not None:
+    #     return (
+    #         "❌ LoRA loading is not supported on quantized models. "
+    #         f"Current quantization: {self.quantization}. "
+    #         "Please re-initialize the service with quantization disabled, then try loading the LoRA adapter again."
+    #     )
 
     if not lora_path or not lora_path.strip():
         return "❌ Please provide a LoRA path."
+
+    try:
+        import peft.tuners.lora.model as peft_model
+        import peft.tuners.lora.torchao as peft_torchao
+        import inspect
+        
+        # 1. Патчим диспетчер (ошибка 'get_apply_tensor_subclass')
+        if hasattr(peft_model, "dispatch_torchao") and not getattr(peft_model.dispatch_torchao, "_is_patched", False):
+            orig_dispatch = peft_model.dispatch_torchao
+            
+            def patched_dispatch(target, adpt_name, **kwargs):
+                if hasattr(peft_torchao, "TorchaoLoraLinear"):
+                    sig = inspect.signature(peft_torchao.TorchaoLoraLinear.__init__)
+                    if 'get_apply_tensor_subclass' in sig.parameters and 'get_apply_tensor_subclass' not in kwargs:
+                        kwargs['get_apply_tensor_subclass'] = lambda *args, **kw: lambda x: x
+                return orig_dispatch(target, adpt_name, **kwargs)
+            
+            patched_dispatch._is_patched = True
+            peft_model.dispatch_torchao = patched_dispatch
+            if hasattr(peft_torchao, "dispatch_torchao"):
+                peft_torchao.dispatch_torchao = patched_dispatch
+            
+        # 2. СНИМАЕМ ИСКУССТВЕННЫЙ БЛОК НА FP8 (ошибка 'only supports int8')
+        if hasattr(peft_torchao, "TorchaoLoraLinear") and not getattr(peft_torchao.TorchaoLoraLinear, "_fp8_patched", False):
+            # Подменяем функцию проверки типов на "пустышку", чтобы она ничего не блокировала
+            peft_torchao.TorchaoLoraLinear._check_dtype_supported = lambda self: None
+            peft_torchao.TorchaoLoraLinear._fp8_patched = True
+            logger.info("Applied PEFT+TorchAO hotfix: FP8 support unlocked!")
+            
+    except Exception as e:
+        logger.warning(f"Failed to apply PEFT hotfix: {e}")
 
     lora_path = lora_path.strip()
     if not os.path.exists(lora_path):
@@ -224,11 +277,12 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
             return config_error
 
     try:
-        from peft import PeftModel
+        from peft import PeftModel, PeftConfig
     except ImportError:
         if lokr_weights_path is None:
             return "❌ PEFT library not installed. Please install with: pip install peft"
         PeftModel = None  # type: ignore[assignment]
+        PeftConfig = None # type: ignore[assignment]
 
     effective_name = adapter_name.strip() if isinstance(adapter_name, str) and adapter_name.strip() else _default_adapter_name_from_path(lora_path)
     _active_loras = getattr(self, "_active_loras", None)
@@ -236,12 +290,131 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
         self._active_loras = {}
         _active_loras = self._active_loras
     if effective_name in _active_loras:
-        return f"❌ Adapter name already in use: {effective_name}. Use a different name or remove it first."
+        return f"✅ Adapter '{effective_name}' already loaded."
+
+    decoder = self.model.decoder
+
+    # --- ЗАЩИТА ОТ "ПРИЗРАЧНОГО ЭФФЕКТА" И КОНФЛИКТОВ ---
+    # 1. Если сейчас активен LoKr, а мы грузим ЛЮБУЮ новую лору (PEFT или LoKr), 
+    # мы ОБЯЗАНЫ полностью выгрузить LoKr, иначе его скрытые хуки останутся в модели.
+    if getattr(decoder, "_lycoris_net", None) is not None:
+        logger.info("LoKr adapter is active. Unloading it to prevent ghost effects...")
+        self.unload_lora()
+        decoder = self.model.decoder
+        _active_loras = getattr(self, "_active_loras", {})
+
+    is_peft = PeftModel is not None and isinstance(decoder, PeftModel)
+
+    # 2. Если мы грузим LoKr, а модель сейчас PEFT, 
+    # мы ОБЯЗАНЫ выгрузить PEFT, т.к. LyCORIS нельзя вешать поверх PEFT-оболочки.
+    if lokr_weights_path is not None and is_peft:
+        logger.info("PEFT adapter is active, but requested LoKr. Unloading PEFT...")
+        self.unload_lora()
+        decoder = self.model.decoder
+        is_peft = False
+        _active_loras = getattr(self, "_active_loras", {})
+
+    # --- ЛОГИКА IN-MEMORY FILTERING ---
+    # ВАЖНО: Применяем игнорирование bias ТОЛЬКО если это не LoKr
+    if ignore_bias and lokr_weights_path is None:
+        try:
+            logger.info(f"Loading LoRA '{effective_name}' with in-memory bias filtering...")
+            
+            config = PeftConfig.from_pretrained(lora_path)
+            if hasattr(config, 'bias'):
+                config.bias = "none"
+            
+            state_dict = None
+            if load_safetensors:
+                st_files = glob.glob(os.path.join(lora_path, "*.safetensors"))
+                if st_files:
+                    state_dict = load_safetensors(st_files[0])
+            if state_dict is None:
+                bin_files = glob.glob(os.path.join(lora_path, "*.bin"))
+                if bin_files:
+                    state_dict = torch.load(bin_files[0], map_location="cpu")
+            if state_dict is None:
+                return "❌ Could not find weights (.safetensors or .bin) in LoRA path."
+
+            clean_state_dict = {k: v for k, v in state_dict.items() if "bias" not in k}
+            removed_count = len(state_dict) - len(clean_state_dict)
+            if removed_count > 0:
+                logger.info(f"Filtered {removed_count} bias keys from state_dict.")
+
+            if not is_peft:
+                if self._base_decoder is None:
+                    if hasattr(self, "_memory_allocated"):
+                        mem_before = self._memory_allocated() / (1024**3)
+                        logger.info(f"VRAM before LoRA load: {mem_before:.2f}GB")
+                    try:
+                        base_sd = decoder.state_dict()
+                        if not base_sd:
+                            raise ValueError("state_dict is empty - cannot backup decoder")
+                        
+                        self._base_decoder = {}
+                        for k, v in base_sd.items():
+                            try:
+                                self._base_decoder[k] = v.detach().cpu().clone()
+                            except Exception:
+                                # Fallback для квантованных тензоров (FP8/torchao), 
+                                # которые не поддерживают .clone()
+                                self._base_decoder[k] = v
+                                
+                    except Exception as e:
+                        logger.error(f"Failed to create state_dict backup: {e}")
+                        raise
+                    backup_size_mb = sum(v.numel() * v.element_size() for v in self._base_decoder.values()) / (1024**2)
+                    logger.info(f"Base decoder state_dict backed up to CPU ({backup_size_mb:.1f}MB)")
+
+                if hasattr(decoder, "peft_config"):
+                    del decoder.peft_config
+                self.model.decoder = PeftModel(decoder, config, adapter_name=effective_name)
+                self._adapter_type = "lora"
+            else:
+                self.model.decoder.add_adapter(effective_name, config)
+            
+            incompatible = set_peft_model_state_dict(self.model.decoder, clean_state_dict, adapter_name=effective_name)
+            
+            self._recursive_to_device(self.model.decoder, self.device, self.dtype)
+            self.model.decoder.eval()
+            
+            if hasattr(self, "_memory_allocated"):
+                mem_after = self._memory_allocated() / (1024**3)
+                logger.info(f"VRAM after LoRA load: {mem_after:.2f}GB")
+
+            self.lora_loaded = True
+            self.use_lora = True
+            self._active_loras[effective_name] = 1.0
+            
+            self._ensure_lora_registry()
+            self._lora_active_adapter = None
+            target_count, adapters = self._rebuild_lora_registry(lora_path=lora_path)
+            
+            if effective_name in (getattr(self._lora_service, "registry", {}) or {}):
+                self._lora_service.set_active_adapter(effective_name)
+                self._lora_active_adapter = effective_name
+            if hasattr(self.model.decoder, "set_adapter"):
+                try:
+                    self.model.decoder.set_adapter(effective_name)
+                except Exception:
+                    pass
+            
+            logger.info(
+                f"LoRA adapter '{effective_name}' loaded from {lora_path} (RAM filtered) "
+                f"(adapters={adapters}, targets={target_count})"
+            )
+            debug_log(
+                lambda: f"LoRA registry snapshot: {self._debug_lora_registry_snapshot()}",
+                mode=DEBUG_MODEL_LOADING,
+                prefix="lora",
+            )
+            return f"✅ LoRA '{effective_name}' loaded from {lora_path} (RAM filtered)"
+
+        except Exception as e:
+            logger.exception("In-memory LoRA load failed")
+            return f"❌ In-memory load failed: {e}"
 
     try:
-        decoder = self.model.decoder
-        is_peft = PeftModel is not None and isinstance(decoder, PeftModel)
-
         if not is_peft:
             # First LoRA: backup base once, then wrap with PEFT
             if self._base_decoder is None:
@@ -252,7 +425,15 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
                     state_dict = decoder.state_dict()
                     if not state_dict:
                         raise ValueError("state_dict is empty - cannot backup decoder")
-                    self._base_decoder = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+                    
+                    self._base_decoder = {}
+                    for k, v in state_dict.items():
+                        try:
+                            self._base_decoder[k] = v.detach().cpu().clone()
+                        except Exception:
+                            # Fallback для квантованных тензоров
+                            self._base_decoder[k] = v
+                            
                 except Exception as e:
                     logger.error(f"Failed to create state_dict backup: {e}")
                     raise
@@ -266,6 +447,8 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
                 self._adapter_type = "lokr"
             else:
                 logger.info(f"Loading LoRA adapter from {lora_path} as '{effective_name}'")
+                if hasattr(decoder, "peft_config"):
+                    del decoder.peft_config
                 self.model.decoder = PeftModel.from_pretrained(
                     decoder, lora_path, adapter_name=effective_name, is_trainable=False
                 )
@@ -278,7 +461,7 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
             self.model.decoder.load_adapter(lora_path, adapter_name=effective_name)
             self._adapter_type = "lora"
 
-        self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+        self._recursive_to_device(self.model.decoder, self.device, self.dtype)
         self.model.decoder.eval()
 
         if hasattr(self, "_memory_allocated"):
@@ -342,6 +525,13 @@ def remove_lora(self, adapter_name: str) -> str:
     if adapter_name not in _active_loras:
         return f"❌ Unknown adapter: {adapter_name}. Loaded: {list(_active_loras.keys())}"
 
+    # --- ИСПРАВЛЕНИЕ LOKR ---
+    # LyCORIS не умеет удалять слои "по имени", как это делает PEFT. 
+    # Поэтому мы производим полное отключение хуков и возврат базовой модели.
+    if getattr(self, "_adapter_type", None) == "lokr":
+        logger.info(f"Removing LoKr adapter '{adapter_name}' by completely unloading...")
+        return self.unload_lora()
+
     try:
         from peft import PeftModel
     except ImportError:
@@ -389,12 +579,13 @@ def remove_lora(self, adapter_name: str) -> str:
                 mem_before = self._memory_allocated() / (1024**3)
                 logger.info(f"VRAM before LoRA unload: {mem_before:.2f}GB")
             self.model.decoder = decoder.get_base_model()
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+            self._recursive_to_device(self.model.decoder, self.device, self.dtype)
             self.model.decoder.eval()
             self.lora_loaded = False
             self.use_lora = False
@@ -458,6 +649,7 @@ def unload_lora(self) -> str:
             else:
                 logger.warning("Decoder has _lycoris_net but no restore() method; continuing with state_dict restore")
             self.model.decoder._lycoris_net = None
+            del lycoris_net
 
         try:
             from peft import PeftModel
@@ -465,22 +657,35 @@ def unload_lora(self) -> str:
             PeftModel = None  # type: ignore[assignment]
 
         if PeftModel is not None and isinstance(self.model.decoder, PeftModel):
-            logger.info("Extracting base model from PEFT wrapper")
-            self.model.decoder = self.model.decoder.get_base_model()
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            logger.info("Unloading PEFT wrapper completely")
+            # .unload() полностью удаляет слои LoRA и возвращает чистую модель
+            self.model.decoder = self.model.decoder.unload()
+            
+            # CRITICAL FIX: Explicitly remove peft_config from the base model instance.
+            # Even after unload(), the base model might retain this attribute, which causes
+            # "ValueError: LoraModel supports only 1 adapter with bias" upon reloading.
+            if hasattr(self.model.decoder, "peft_config"):
+                del self.model.decoder.peft_config
+            if hasattr(self.model.decoder, "_peft_config"):
+                del self.model.decoder._peft_config
+
+            logger.info("Restoring base decoder state from backup")
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
         else:
             logger.info("Restoring base decoder from state_dict backup")
-            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            with torch.inference_mode():
+                load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
             if load_result.missing_keys:
                 logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
             if load_result.unexpected_keys:
                 logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
 
-        self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+        self._recursive_to_device(self.model.decoder, self.device, self.dtype)
         self.model.decoder.eval()
 
         self.lora_loaded = False

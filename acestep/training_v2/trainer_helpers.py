@@ -142,12 +142,17 @@ def offload_non_decoder(model: nn.Module) -> int:
 # ---------------------------------------------------------------------------
 
 
-def save_adapter_flat(trainer: Any, output_dir: str) -> None:
+def save_adapter_flat(trainer: Any, output_dir: str, workflow_json: Optional[str] = None) -> None:
     """Save adapter weights directly into *output_dir* (no nesting).
 
     Writes ``adapter_config.json`` and ``adapter_model.safetensors``
     (or LoKR equivalent) directly into *output_dir* so that
     inference tools can point straight at this directory.
+    
+    Args:
+        trainer: The trainer instance
+        output_dir: Directory to save adapter weights
+        workflow_json: Optional JSON string of the ComfyUI workflow to embed in safetensors metadata
     """
     module = trainer.module
     assert module is not None
@@ -165,6 +170,8 @@ def save_adapter_flat(trainer: Any, output_dir: str) -> None:
                 "attached to the training module.  Cannot save weights."
             )
         lokr_meta = {"lokr_config": module.adapter_config.to_dict()}
+        if workflow_json:
+            lokr_meta["workflow"] = workflow_json
         save_lokr_weights(module.lycoris_net, output_dir, metadata=lokr_meta)
     else:
         # Access the decoder directly (PeftModel after LoRA injection,
@@ -176,9 +183,47 @@ def save_adapter_flat(trainer: Any, output_dir: str) -> None:
         # Strip Fabric wrappers only (_forward_module chain).
         while hasattr(raw_decoder, "_forward_module"):
             raw_decoder = raw_decoder._forward_module
+        
         if hasattr(raw_decoder, "save_pretrained"):
-            raw_decoder.save_pretrained(output_dir)
-            logger.info("[OK] LoRA adapter saved to %s", output_dir)
+            # === СОХРАНЯЕМ СРАЗУ С WORKFLOW В METADATA ===
+            if workflow_json:
+                from safetensors.torch import save_file as st_save_file
+                
+                # Получаем state_dict адаптера напрямую (без записи на диск)
+                adapter_state_dict = raw_decoder.state_dict()
+                
+                # Сохраняем safetensors с workflow в metadata сразу
+                safetensors_path = os.path.join(output_dir, "adapter_model.safetensors")
+                metadata = {"workflow": workflow_json}
+                st_save_file(adapter_state_dict, safetensors_path, metadata=metadata)
+                
+                # Сохраняем adapter_config.json (нужен для PEFT)
+                config_path = os.path.join(output_dir, "adapter_config.json")
+                peft_config = getattr(raw_decoder, "peft_config", {})
+                if peft_config:
+                    # PeftModel хранит конфиг в словаре по ключам адаптеров
+                    for key, cfg in peft_config.items():
+                        if hasattr(cfg, "to_dict"):
+                            config_dict = cfg.to_dict()
+                            break
+                    else:
+                        config_dict = {"base_model_name_or_path": ""}
+                else:
+                    config_dict = {"base_model_name_or_path": ""}
+                
+                # Добавляем workflow в config для совместимости
+                config_dict["workflow"] = workflow_json
+                
+                import json as _json
+                with open(config_path, "w", encoding="utf-8") as f:
+                    _json.dump(config_dict, f, indent=2, ensure_ascii=False)
+                
+                logger.info("[OK] LoRA adapter saved to %s (with workflow metadata)", output_dir)
+                print(f"💾 [Workflow] Workflow встроен в adapter_model.safetensors сразу ({len(workflow_json)} байт)")
+            else:
+                # Без workflow — используем стандартный PEFT метод
+                raw_decoder.save_pretrained(output_dir)
+                logger.info("[OK] LoRA adapter saved to %s", output_dir)
         else:
             # Fallback for non-PEFT models
             save_lora_weights(module.model, output_dir)
@@ -199,7 +244,18 @@ def save_checkpoint(
     users can point inference tools directly at any checkpoint.
     ``training_state.pt`` is saved alongside for resume support.
     """
-    save_adapter_flat(trainer, ckpt_dir)
+    save_adapter_flat(trainer, ckpt_dir, getattr(trainer, 'workflow_json', None))
+
+    # Проверяем, нужно ли сохранять training_state
+    save_state = getattr(trainer.training_config, "save_state", True)
+    if not save_state:
+        logger.info(
+            "Training checkpoint saved to %s (epoch %d, step %d) - training_state skipped to save disk I/O",
+            ckpt_dir,
+            epoch,
+            global_step,
+        )
+        return
 
     # Save optimizer / scheduler / progress for resume
     training_state = {
@@ -236,7 +292,7 @@ def save_checkpoint(
 
 def save_final(trainer: Any, output_dir: str) -> None:
     """Save final adapter weights (inference-ready, no training state)."""
-    save_adapter_flat(trainer, output_dir)
+    save_adapter_flat(trainer, output_dir, getattr(trainer, 'workflow_json', None))
     verify_saved_adapter(output_dir)
 
 

@@ -432,6 +432,12 @@ def _pass2_heavy(
                 base_name = tmp_path.name.replace(".tmp.pt", ".pt")
                 final_path = out_path / base_name
                 meta = data["metadata"]
+
+                t_hs = data.get("text_hidden_states", torch.zeros(1))
+                t_mask = data.get("text_attention_mask", torch.zeros(1))
+                l_hs = data.get("lyric_hidden_states", torch.zeros(1))
+                l_mask = data.get("lyric_attention_mask", torch.zeros(1))
+
                 torch.save(
                     {
                         "target_latents": data["target_latents"],
@@ -439,6 +445,10 @@ def _pass2_heavy(
                         "encoder_hidden_states": encoder_hs.squeeze(0).cpu(),
                         "encoder_attention_mask": encoder_mask.squeeze(0).cpu(),
                         "context_latents": context_latents.squeeze(0).cpu(),
+                        "text_hidden_states": t_hs.squeeze(0).cpu() if t_hs.dim() == 3 else t_hs.cpu(),
+                        "text_attention_mask": t_mask.squeeze(0).cpu() if t_mask.dim() == 2 else t_mask.cpu(),
+                        "lyric_hidden_states": l_hs.squeeze(0).cpu() if l_hs.dim() == 3 else l_hs.cpu(),
+                        "lyric_attention_mask": l_mask.squeeze(0).cpu() if l_mask.dim() == 2 else l_mask.cpu(),
                         "metadata": meta,
                     },
                     final_path,
