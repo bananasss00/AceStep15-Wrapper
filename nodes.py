@@ -119,12 +119,22 @@ def get_available_acestep_models():
                 models.append(d)
     return models
 
+def get_available_vae_variants():
+    try:
+        from acestep.model_downloader import list_available_vae_variants
+        variants = list_available_vae_variants()
+        if variants: return variants
+    except Exception:
+        pass
+    return["official", "scragvae"]
+
 class AceStepModelLoader:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "config_path": (get_available_acestep_models(), {"default": "acestep-v15-turbo"}),
+                "vae_checkpoint": (get_available_vae_variants(), {"default": "official"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "init_llm": ("BOOLEAN", {"default": True, "label_on": "Yes", "label_off": "No"}),
                 "lm_model_path": (["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-4B"], {"default": "acestep-5Hz-lm-1.7B"}),
@@ -143,7 +153,7 @@ class AceStepModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "ACE-Step"
 
-    def load_model(self, config_path, device, init_llm, lm_model_path, lm_backend, use_flash_attention, quantization, offload_to_cpu, custom_model_path=""):
+    def load_model(self, config_path, vae_checkpoint, device, init_llm, lm_model_path, lm_backend, use_flash_attention, quantization, offload_to_cpu, custom_model_path=""):
         print(f"[ACE-Step] Инициализация. Целевая папка моделей: {ACESTEP_MODELS_DIR}")
         if quantization and quantization != "none":
             print(f"[ACE-Step] 🪄 Квантизация модели: {quantization}")
@@ -172,7 +182,8 @@ class AceStepModelLoader:
             compile_model=False,
             quantization=quantization if quantization != "none" else None,
             offload_to_cpu=offload_to_cpu,
-            offload_dit_to_cpu=offload_to_cpu
+            offload_dit_to_cpu=offload_to_cpu,
+            vae_checkpoint=vae_checkpoint
         )
         
         # Сохраняем имя (или кастомный путь) для ноды Baker (чтобы она знала, с чем мерджить)
@@ -1031,6 +1042,11 @@ class AceStepMusicGenerator:
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
                 "merge_loras": ("BOOLEAN", {"default": True}),
+                "dcw_enabled": ("BOOLEAN", {"default": True, "tooltip": "Enable Differential Correction in Wavelet domain"}),
+                "dcw_mode": (["low", "high", "double", "pix"], {"default": "double"}),
+                "dcw_scaler": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.1, "step": 0.001}),
+                "dcw_high_scaler": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 0.1, "step": 0.001}),
+                "dcw_wavelet": (["haar", "db2", "db4", "sym4", "sym8", "coif2"], {"default": "haar"}),
             },
             "optional": {
                 "edit_config": ("ACESTEP_EDIT_CONFIG", {"tooltip": "Подключите сюда ноду Cover Config или Repaint Config для активации этих режимов."}),
@@ -1211,6 +1227,7 @@ class AceStepMusicGenerator:
 
     def generate(self, model, caption, lyrics, duration, inference_steps, 
                  guidance_scale, shift, thinking, seed, unload_unused_loras, merge_loras, 
+                 dcw_enabled=True, dcw_mode="double", dcw_scaler=0.05, dcw_high_scaler=0.02, dcw_wavelet="haar",
                  edit_config=None, reference_audio=None, 
                  vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
         
@@ -1223,9 +1240,6 @@ class AceStepMusicGenerator:
                 torch.cuda.manual_seed_all(seed)
             random.seed(seed)
             np.random.seed(numpy_seed)
-            # Отключаем бенчмарк cudnn для строгой детерминированности (если поддерживается)
-            # torch.backends.cudnn.deterministic = True
-            # torch.backends.cudnn.benchmark = False
         
         # Распаковка режима из edit_config (если не подключен, то базовый text2music)
         task_type = "text2music"
@@ -1248,7 +1262,7 @@ class AceStepMusicGenerator:
             cover_noise_strength = edit_config.get("cover_noise_strength", 0.0)
 
         # ЗАЩИТА: Проверка наличия исходного аудио для зависимых режимов
-        requires_source = ["cover", "repaint", "complete", "lego"]
+        requires_source =["cover", "repaint", "complete", "lego"]
         if task_type in requires_source and source_audio is None:
             raise ValueError(f"[ACE-Step] ОШИБКА: Режим '{task_type}' требует подключения 'source_audio'! Пожалуйста, передайте исходное аудио в ноду.")
         
@@ -1311,7 +1325,7 @@ class AceStepMusicGenerator:
             inference_steps=inference_steps, guidance_scale=guidance_scale,
             shift=shift, seed=seed,
             thinking=thinking, reference_audio=ref_path,
-            src_audio=src_path, # Для text2music src_path будет None
+            src_audio=src_path, 
             use_cot_metas=use_cot_metas, 
             use_cot_caption=use_cot_caption, 
             use_cot_language=use_cot_language,
@@ -1324,6 +1338,12 @@ class AceStepMusicGenerator:
             repainting_end=edit_end_sec if edit_end_sec >= 0 else -1.0,
             repaint_mode=repaint_mode,
             repaint_strength=repaint_strength,
+            
+            dcw_enabled=dcw_enabled,
+            dcw_mode=dcw_mode,
+            dcw_scaler=dcw_scaler,
+            dcw_high_scaler=dcw_high_scaler,
+            dcw_wavelet=dcw_wavelet,
         )
 
         config = GenerationConfig(
