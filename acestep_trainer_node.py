@@ -1644,6 +1644,7 @@ class ACEStepTrainer:
                 gradient_checkpointing=grad_ckpt, offload_encoder=offload_enc, cfg_ratio=model_config["cfg_ratio"],
                 device=device, precision=precision, dataset_dir=main_tensor_dir,
                 checkpoint_dir=checkpoint_dir, model_variant=model_config["model_variant"], 
+                vae_variant=model_config.get("vae_variant", "official"),
                 num_workers=0 if os.name == 'nt' else 4, log_every=1, log_heavy_every=10000, 
                 weight_decay=optimizer_config["weight_decay"], max_grad_norm=optimizer_config["max_grad_norm"],
                 warmup_steps=optimizer_config["warmup_steps"], save_start_epoch=dataset_config["save_start"], 
@@ -2251,6 +2252,7 @@ class ACEStepFinetuneTrainer:
                 cfg_ratio=cfg_ratio,
                 checkpoint_dir=checkpoint_dir,
                 model_variant=model_variant,
+                vae_variant=vae_variant,
                 dataset_dir=main_tensor_dir
             )
             

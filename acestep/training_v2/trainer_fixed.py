@@ -415,7 +415,8 @@ class FixedLoRATrainer:
                     torch.cuda.synchronize()
             
             # Load VAE to GPU
-            vae = load_vae(cfg.checkpoint_dir, device=device, precision=cfg.precision, vae_variant=cfg.vae_variant)
+            vae_variant = getattr(cfg, "vae_variant", "official")
+            vae = load_vae(cfg.checkpoint_dir, device=device, precision=cfg.precision, vae_variant=vae_variant)
 
             # Wrapper for tiled decoding
             class VaeInferenceWrapper(VaeDecodeMixin, VaeDecodeChunksMixin, MemoryUtilsMixin):
