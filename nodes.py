@@ -1038,6 +1038,10 @@ class AceStepMusicGenerator:
                 "inference_steps": ("INT", {"default": 8, "min": 1, "max": 200}),
                 "guidance_scale": ("FLOAT", {"default": 7.0, "min": 1.0, "max": 15.0, "step": 0.1}),
                 "shift": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "infer_method": (["ode", "sde"], {"default": "ode"}),
+                "sampler_mode": (["euler", "heun"], {"default": "euler"}),
+                "velocity_norm_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 50.0, "step": 0.1, "tooltip": "Лимит скорости. Спасает от мусора при DCW"}),
+                "velocity_ema_factor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "thinking": ("BOOLEAN", {"default": True, "tooltip": "Использовать LLM для рассуждений (CoT)"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
                 "unload_unused_loras": ("BOOLEAN", {"default": True}),
@@ -1226,7 +1230,8 @@ class AceStepMusicGenerator:
                 dit_handler.use_lora = False
 
     def generate(self, model, caption, lyrics, duration, inference_steps, 
-                 guidance_scale, shift, thinking, seed, unload_unused_loras, merge_loras, 
+                 guidance_scale, shift, infer_method, sampler_mode, velocity_norm_threshold, velocity_ema_factor,
+                 thinking, seed, unload_unused_loras, merge_loras, 
                  dcw_enabled=True, dcw_mode="double", dcw_scaler=0.05, dcw_high_scaler=0.02, dcw_wavelet="haar",
                  edit_config=None, reference_audio=None, 
                  vocal_language="unknown", bpm=0, key_scale="", time_signature="", lm_config=None):
@@ -1324,6 +1329,10 @@ class AceStepMusicGenerator:
             duration=duration if duration > 0 else None, vocal_language=vocal_language,
             inference_steps=inference_steps, guidance_scale=guidance_scale,
             shift=shift, seed=seed,
+            infer_method=infer_method,
+            sampler_mode=sampler_mode,
+            velocity_norm_threshold=velocity_norm_threshold,
+            velocity_ema_factor=velocity_ema_factor,
             thinking=thinking, reference_audio=ref_path,
             src_audio=src_path, 
             use_cot_metas=use_cot_metas, 
