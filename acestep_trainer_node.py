@@ -966,6 +966,7 @@ class ACEStepModelConfig:
         return {
             "required": {
                 "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
+                "vae_variant": (["official", "scragvae"], {"default": "official"}),
                 "rank": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "dropout": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -991,6 +992,7 @@ class ACEStepLoKRConfig:
         return {
             "required": {
                 "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
+                "vae_variant": (["official", "scragvae"], {"default": "official"}),
                 "linear_dim": ("INT", {"default": 64, "min": 1, "max": 1024}),
                 "linear_alpha": ("INT", {"default": 128, "min": 1, "max": 2048}),
                 "factor": ("INT", {"default": -1, "min": -1, "max": 256}),
@@ -1262,6 +1264,7 @@ class ACEStepEstimator:
                         output_dir=final_tensor_dir,
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
+                        vae_variant=model_config.get("vae_variant", "official"),
                         max_duration=dataset_config["max_duration"],
                         device=gpu_info.device if gpu_info else "cuda",
                         precision=gpu_info.precision if gpu_info else "bf16",
@@ -1573,6 +1576,7 @@ class ACEStepTrainer:
                     output_dir=main_tensor_dir,
                     checkpoint_dir=checkpoint_dir,
                     variant=model_config["model_variant"],
+                    vae_variant=model_config.get("vae_variant", "official"),
                     max_duration=dataset_config["max_duration"],
                     device=device,
                     precision=precision,
@@ -1596,6 +1600,7 @@ class ACEStepTrainer:
                         output_dir=reg_tensor_dir,
                         checkpoint_dir=checkpoint_dir,
                         variant=model_config["model_variant"],
+                        vae_variant=model_config.get("vae_variant", "official"),
                         max_duration=dataset_config["max_duration"],
                         device=device,
                         precision=precision,
@@ -1834,6 +1839,7 @@ class ACEStepFinetuneTrainer:
             "required": {
                 "dataset_config": ("ACESTEP_DATASET",),
                 "model_variant": (["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"], {"default": "turbo"}),
+                "vae_variant": (["official", "scragvae"], {"default": "official"}),
                 "cfg_ratio": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "optimizer_config": ("ACESTEP_OPTIMIZER",),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
@@ -1933,7 +1939,7 @@ class ACEStepFinetuneTrainer:
             except Exception as e: print(f"⚠️ Failed to save graph to disk: {e}")
         fig.clf()
 
-    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, main_tensor_dir, offload_enc=False, vram_cleanup=False, encoder_train_mode="none"):
+    def generate_preview(self, model, preview_config, checkpoint_dir, output_dir, step, device, precision, variant, vae_variant, main_tensor_dir, offload_enc=False, vram_cleanup=False, encoder_train_mode="none"):
         if not preview_config.get("gen_preview", False): return
             
         print(f"[LOG] 🎵 Generating preview (Step: {step})...")
@@ -2047,7 +2053,7 @@ class ACEStepFinetuneTrainer:
                 model.to("cpu")
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-            vae = load_vae(checkpoint_dir, device=device, precision=precision)
+            vae = load_vae(checkpoint_dir, device=device, precision=precision, vae_variant=vae_variant)
             class VaeInferenceWrapper(VaeDecodeMixin, VaeDecodeChunksMixin, MemoryUtilsMixin):
                 def __init__(self, vae_model, device_name):
                     self.vae = vae_model
@@ -2115,7 +2121,7 @@ class ACEStepFinetuneTrainer:
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     @torch.inference_mode(False)
-    def train_finetune(self, dataset_config, model_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, encoder_train_mode, train_null_emb, base_quantization, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def train_finetune(self, dataset_config, model_variant, vae_variant, cfg_ratio, optimizer_config, seed, grad_ckpt, offload_enc, vram_cleanup, block_swap_ratio, encoder_train_mode, train_null_emb, base_quantization, preview_config=None, unique_id=None, prompt=None, extra_pnginfo=None):
         global CURRENT_REG_WEIGHT
 
         with torch.enable_grad():
@@ -2183,6 +2189,7 @@ class ACEStepFinetuneTrainer:
                         output_dir=main_tensor_dir,
                         checkpoint_dir=checkpoint_dir,
                         variant=model_variant,
+                        vae_variant=vae_variant,
                         max_duration=dataset_config["max_duration"],
                         device=device,
                         precision=precision,
@@ -2208,6 +2215,7 @@ class ACEStepFinetuneTrainer:
                         output_dir=reg_tensor_dir,
                         checkpoint_dir=checkpoint_dir,
                         variant=model_variant,
+                        vae_variant=vae_variant,
                         max_duration=dataset_config["max_duration"],
                         device=device,
                         precision=precision,
@@ -2559,7 +2567,7 @@ class ACEStepFinetuneTrainer:
                                 saved_epochs.append(last_ep)
 
                         if preview_config and preview_config.get("gen_preview", False):
-                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
+                            self.generate_preview(model, preview_config, checkpoint_dir, output_dir, epoch + 1, device, precision, model_variant, vae_variant, main_tensor_dir, offload_enc, vram_cleanup, encoder_train_mode)
 
             finally:
                 dm_module.PreprocessedDataModule.setup = original_setup

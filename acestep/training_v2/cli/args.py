@@ -185,6 +185,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
             "Used to condition timestep sampling. Auto-detected for official models."
         ),
     )
+    g.add_argument(
+        "--vae-variant",
+        type=str,
+        default="official",
+        help="VAE variant to use (e.g. official, scragvae)",
+    )
 
 
 def _add_device_args(parser: argparse.ArgumentParser) -> None:

@@ -193,6 +193,7 @@ def load_preprocessing_models(
     variant: str = "turbo",
     device: str = "cpu",
     precision: str = "bf16",
+    vae_variant: str = "official",
 ) -> Dict[str, Any]:
     """Load only models needed for the preprocessing phase.
 
@@ -216,7 +217,8 @@ def load_preprocessing_models(
     result["model"] = model
 
     # 2. VAE
-    vae_path = ckpt / "vae"
+    from acestep.model_downloader import resolve_vae_path
+    vae_path = resolve_vae_path(checkpoint_dir, vae_variant)
     if vae_path.is_dir():
         vae = AutoencoderOobleck.from_pretrained(str(vae_path))
         vae = vae.to(device=device, dtype=dtype)
@@ -272,6 +274,7 @@ def load_vae(
     checkpoint_dir: str | Path,
     device: str = "cpu",
     precision: str = "bf16",
+    vae_variant: str = "official",
 ) -> Any:
     """Load only the VAE (``AutoencoderOobleck``).
 
@@ -279,8 +282,9 @@ def load_vae(
     if the ``vae/`` directory is missing.
     """
     from diffusers.models import AutoencoderOobleck
+    from acestep.model_downloader import resolve_vae_path
 
-    vae_path = Path(checkpoint_dir) / "vae"
+    vae_path = resolve_vae_path(checkpoint_dir, vae_variant)
     if not vae_path.is_dir():
         raise FileNotFoundError(f"VAE directory not found: {vae_path}")
 

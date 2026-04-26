@@ -55,6 +55,7 @@ def preprocess_audio_files(
     precision: str = "auto",
     progress_callback: Optional[Callable] = None,
     cancel_check: Optional[Callable] = None,
+    vae_variant: str = "official",
 ) -> Dict[str, Any]:
     """Preprocess audio files into .pt tensor format (two-pass pipeline).
 
@@ -123,6 +124,7 @@ def preprocess_audio_files(
         out_path=out_path,
         checkpoint_dir=checkpoint_dir,
         variant=variant,
+        vae_variant=vae_variant,
         device=dev,
         precision=prec,
         max_duration=max_duration,
@@ -170,6 +172,7 @@ def _pass1_light(
     out_path: Path,
     checkpoint_dir: str,
     variant: str,
+    vae_variant: str,
     device: str,
     precision: str,
     max_duration: float,
@@ -200,7 +203,7 @@ def _pass1_light(
     dtype = _resolve_dtype(precision)
 
     logger.info("[Side-Step] Pass 1/2: Loading VAE + Text Encoder ...")
-    vae = load_vae(checkpoint_dir, device, precision)
+    vae = load_vae(checkpoint_dir, device, precision, vae_variant=vae_variant)
     tokenizer, text_enc = load_text_encoder(checkpoint_dir, device, precision)
     silence_latent = load_silence_latent(
         checkpoint_dir, device, precision, variant=variant

@@ -163,6 +163,9 @@ class TrainingConfigV2(TrainingConfig):
     model_variant: str = "turbo"
     """Model variant: 'turbo', 'base', or 'sft'."""
 
+    vae_variant: str = "official"
+    """VAE variant: 'official', 'scragvae', etc."""
+
     checkpoint_dir: str = "./checkpoints"
     """Path to checkpoints root directory."""
 
@@ -286,6 +289,7 @@ class TrainingConfigV2(TrainingConfig):
                 "timestep_sigma": self.timestep_sigma,
                 "data_proportion": self.data_proportion,
                 "model_variant": self.model_variant,
+                "vae_variant": self.vae_variant,
                 "checkpoint_dir": self.checkpoint_dir,
                 "dataset_dir": self.dataset_dir,
                 "device": self.device,

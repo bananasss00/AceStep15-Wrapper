@@ -162,6 +162,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[AdapterConfig, TrainingConf
         timestep_sigma=timestep_sigma,
         data_proportion=data_proportion,
         model_variant=args.model_variant,
+        vae_variant=getattr(args, "vae_variant", "official"),
         checkpoint_dir=args.checkpoint_dir,
         dataset_dir=args.dataset_dir,
         device=gpu_info.device,
