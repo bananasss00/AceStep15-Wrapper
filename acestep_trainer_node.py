@@ -1304,11 +1304,32 @@ class ACEStepLoRAResize:
             "required": {
                 "input_path": ("STRING", {"default": ""}),
                 "output_path": ("STRING", {"default": ""}),
-                "new_rank": ("INT", {"default": 32, "min": 1}),
-                "dynamic_method": (["None", "sv_ratio", "sv_fro", "safe"], {"default": "None"}),
-                "dynamic_param": ("FLOAT", {"default": 0.9, "step": 0.05}),
-                "precision": (["float32", "fp16", "bf16"], {"default": "float32"}),
-                "device": (["cuda", "cpu"], {"default": "cuda"}),
+                "new_rank": ("INT", {
+                    "default": 32, 
+                    "min": -1, 
+                    "tooltip": "Целевой ранк после ресайза. «-1» сохраняет оригинальный ранк слоя (полезно для изменения метода без смены ранка или при использовании динамического ранка). Меньшие значения экономят память."
+                }),
+                "decomposition_method": (["SVD", "rSVD", "energy_rSVD"], {
+                    "default": "rSVD", 
+                    "tooltip": "Метод сингулярного разложения. SVD — полное (медленно, точно). rSVD — рандомизированное (быстро, почти точно). energy_rSVD — удаляет слабые компоненты перед rSVD (очень быстро, рекомендуется для больших моделей/DiT)."
+                }),
+                "dynamic_method": (["None", "sv_ratio", "sv_fro", "safe"], {
+                    "default": "None", 
+                    "tooltip": "Автоматический (динамический) выбор ранка на основе важности сингулярных чисел. Наиболее точно работает вместе с методом SVD."
+                }),
+                "dynamic_param": ("FLOAT", {
+                    "default": 0.9, 
+                    "step": 0.05, 
+                    "tooltip": "Порог для динамического метода (например, доля сохраняемой энергии). Варьируется от 0.0 до 1.0."
+                }),
+                "precision": (["float32", "fp16", "bf16"], {
+                    "default": "float32", 
+                    "tooltip": "Формат, в котором будут сохранены новые веса (float32 безопаснее всего)."
+                }),
+                "device": (["cuda", "cpu"], {
+                    "default": "cuda", 
+                    "tooltip": "Устройство для вычислений."
+                }),
             }
         }
     RETURN_TYPES = ("STRING",)
@@ -1316,13 +1337,60 @@ class ACEStepLoRAResize:
     FUNCTION = "resize"
     CATEGORY = "ACE-Step/Tools"
 
-    def perform_svd(self, weights: torch.Tensor, device: str):
-        w_float = weights.to(device).float()
-        try: U, S, Vh = torch.linalg.svd(w_float, full_matrices=False)
-        except Exception as e:
-            print(f"Error during SVD: {e}. Falling back to CPU.")
-            U, S, Vh = torch.linalg.svd(w_float.cpu(), full_matrices=False)
-        return U, S, Vh
+    def get_decomposition(self, W, up, down, method, target_rank, device):
+        if method == "SVD":
+            try:
+                U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            except Exception as e:
+                print(f"⚠️ Error during SVD: {e}. Falling back to CPU SVD.")
+                U, S, Vh = torch.linalg.svd(W.cpu(), full_matrices=False)
+                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+            return U, S, Vh
+            
+        elif method == "rSVD":
+            q = min(target_rank + 4, min(W.shape))
+            try:
+                U, S, V = torch.svd_lowrank(W, q=q, niter=2)
+                return U, S, V.T
+            except Exception as e:
+                print(f"⚠️ Error during rSVD: {e}. Falling back to CPU SVD.")
+                U, S, Vh = torch.linalg.svd(W.cpu(), full_matrices=False)
+                return U.to(device), S.to(device), Vh.to(device)
+                
+        elif method == "energy_rSVD":
+            r0 = down.shape[0]
+            if target_rank >= r0:
+                # Если ранк увеличивается или равен, энергия не обрезается, применяем обычный rSVD
+                q = min(target_rank + 4, min(W.shape))
+                try:
+                    U, S, V = torch.svd_lowrank(W, q=q, niter=2)
+                    return U, S, V.T
+                except Exception as e:
+                    U, S, Vh = torch.linalg.svd(W.cpu(), full_matrices=False)
+                    return U.to(device), S.to(device), Vh.to(device)
+            
+            # Energy Pruning Phase
+            up_norm = torch.norm(up, dim=0)
+            down_norm = torch.norm(down, dim=1)
+            energy = up_norm * down_norm
+            
+            # Сохраняем с небольшим запасом для финального rSVD
+            k = min(int(target_rank * 1.5), r0)
+            idx = torch.topk(energy, k, largest=True).indices
+            idx, _ = torch.sort(idx)
+            
+            up_k = up[:, idx]
+            down_k = down[idx, :]
+            Wk = up_k @ down_k
+            
+            # Refinement Phase
+            q = min(target_rank + 2, min(Wk.shape))
+            try:
+                U, S, V = torch.svd_lowrank(Wk, q=q, niter=2)
+                return U, S, V.T
+            except Exception as e:
+                U, S, Vh = torch.linalg.svd(W.cpu(), full_matrices=False)
+                return U.to(device), S.to(device), Vh.to(device)
 
     def calculate_new_rank(self, S: torch.Tensor, method: str, param: float, fixed_rank: int) -> int:
         if method == "None" or method == "safe": return min(fixed_rank, len(S))
@@ -1335,9 +1403,9 @@ class ACEStepLoRAResize:
             return keep_indices[0].item() + 1 if len(keep_indices) > 0 else len(S)
         return fixed_rank
 
-    def resize(self, input_path, output_path, new_rank, dynamic_method, dynamic_param, precision, device):
+    def resize(self, input_path, output_path, new_rank, decomposition_method, dynamic_method, dynamic_param, precision, device):
         print(f"\n" + "="*60)
-        print(f"📉 LoRA Resize Started")
+        print(f"📉 LoRA Resize Started ({decomposition_method})")
         print(f"="*60)
         
         in_path = input_path.strip('"')
@@ -1379,6 +1447,8 @@ class ACEStepLoRAResize:
 
         new_state_dict = {}
         rank_pattern = {}
+        
+        from comfy.utils import ProgressBar
         pbar = ProgressBar(len(pairs))
         print(f"🚀 Processing {len(pairs)} layers...")
         
@@ -1387,12 +1457,20 @@ class ACEStepLoRAResize:
             if 'A' not in mats or 'B' not in mats:
                 for k, v in mats.items(): new_state_dict[f"{base_key}lora_{k}.weight"] = v.to(save_dtype)
                 continue
-
-            W = (mats['B'].to(device) @ mats['A'].to(device)) * scaling_factor
-            U, S, Vh = self.perform_svd(W, device)
             
-            target_rank = min(self.calculate_new_rank(S, dynamic_method, dynamic_param, new_rank), old_r)
-            if dynamic_method in["sv_fro", "sv_ratio"]: rank_pattern[base_key.replace("base_model.model.", "").rstrip(".")] = target_rank
+            down = mats['A'].to(device).float()
+            up_scaled = (mats['B'].to(device).float() * scaling_factor)
+            
+            W = up_scaled @ down
+            
+            layer_target_rank = new_rank if new_rank != -1 else old_r
+            
+            U, S, Vh = self.get_decomposition(W, up_scaled, down, decomposition_method, layer_target_rank, device)
+            
+            target_rank = min(self.calculate_new_rank(S, dynamic_method, dynamic_param, layer_target_rank), len(S))
+            
+            if dynamic_method in["sv_fro", "sv_ratio"]: 
+                rank_pattern[base_key.replace("base_model.model.", "").rstrip(".")] = target_rank
 
             U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
@@ -1404,14 +1482,14 @@ class ACEStepLoRAResize:
         new_config = copy.deepcopy(config)
         new_config["peft_type"] = "LORA" 
         
-        if dynamic_method in ["sv_fro", "sv_ratio"] and rank_pattern:
+        if dynamic_method in["sv_fro", "sv_ratio"] and rank_pattern:
             new_config["rank_pattern"] = rank_pattern
             new_config["alpha_pattern"] = rank_pattern 
             new_config["r"] = max(rank_pattern.values()) 
             new_config["lora_alpha"] = new_config["r"]
         else:
-            new_config["r"] = new_rank
-            new_config["lora_alpha"] = new_rank
+            new_config["r"] = new_rank if new_rank != -1 else old_r
+            new_config["lora_alpha"] = new_config["r"]
             new_config.pop("rank_pattern", None)
             new_config.pop("alpha_pattern", None)
 
@@ -1420,6 +1498,7 @@ class ACEStepLoRAResize:
         else: torch.save(new_state_dict, os.path.join(out_path, "adapter_model.bin"))
 
         print(f"✅ Resize complete! Saved to {out_path}")
+        import comfy.model_management as mm
         mm.soft_empty_cache()
         return (out_path,)
 
@@ -2599,16 +2678,38 @@ class ACEStepLoRAExtractor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo, acestep-v15-xl-base и т.д.)"}),
+                "base_model_path": ("STRING", {"default": "", "placeholder": "Путь к базовой папке (acestep-v15-turbo, и т.д.)"}),
                 "finetuned_model_path": ("STRING", {"default": "", "placeholder": "Путь к папке файнтюна"}),
                 "output_path": ("STRING", {"default": "./extracted_lora"}),
-                "rank": ("INT", {"default": 32, "min": 1}),
-                "alpha": ("INT", {"default": 32, "min": 1}),
+                "rank": ("INT", {
+                    "default": 32, 
+                    "min": -1, 
+                    "tooltip": "Ранк создаваемой LoRA. «-1» означает использование полного ранка слоя (создаст огромный файл, рекомендуется только вместе с динамическим выбором ранка)."
+                }),
+                "alpha": ("INT", {
+                    "default": 32, 
+                    "min": 1, 
+                    "tooltip": "Альфа параметр для LoRA (определяет силу обучения)."
+                }),
                 "target_modules": ("STRING", {"default": "q_proj k_proj v_proj o_proj", "multiline": True}),
-                "dynamic_method": (["None", "sv_ratio", "sv_fro", "safe"], {"default": "None"}),
-                "dynamic_param": ("FLOAT", {"default": 0.9, "step": 0.05}),
-                "precision": (["float32", "fp16", "bf16"], {"default": "float32"}),
-                "device": (["cuda", "cpu"], {"default": "cuda"}),
+                "decomposition_method": (["SVD", "rSVD"], {
+                    "default": "rSVD", 
+                    "tooltip": "Метод извлечения матриц. SVD — точное сингулярное разложение (медленно). rSVD — рандомизированное разложение (работает значительно быстрее)."
+                }),
+                "dynamic_method": (["None", "sv_ratio", "sv_fro", "safe"], {
+                    "default": "None", 
+                    "tooltip": "Автоматический выбор финального ранка слоя на основе сингулярных чисел."
+                }),
+                "dynamic_param": ("FLOAT", {
+                    "default": 0.9, 
+                    "step": 0.05, 
+                    "tooltip": "Порог для динамического метода. Варьируется от 0.0 до 1.0."
+                }),
+                "precision": (["float32", "fp16", "bf16"], {
+                    "default": "float32", 
+                    "tooltip": "Точность для сохранения весов извлеченной LoRA."
+                }),
+                "device": (["cuda", "cpu"], {"default": "cuda", "tooltip": "Устройство для вычислений."}),
             }
         }
     RETURN_TYPES = ("STRING",)
@@ -2623,9 +2724,9 @@ class ACEStepLoRAExtractor:
             if os.path.exists(p): return p
         raise FileNotFoundError(f"Не найден файл модели (model.safetensors) в {path}")
 
-    def extract(self, base_model_path, finetuned_model_path, output_path, rank, alpha, target_modules, dynamic_method, dynamic_param, precision, device):
+    def extract(self, base_model_path, finetuned_model_path, output_path, rank, alpha, target_modules, decomposition_method, dynamic_method, dynamic_param, precision, device):
         print(f"\n" + "="*60)
-        print(f"🧬 LoRA Extractor Started")
+        print(f"🧬 LoRA Extractor Started ({decomposition_method})")
         print(f"="*60)
         base_file = self._resolve_model_path(base_model_path.strip('"'))
         ft_file = self._resolve_model_path(finetuned_model_path.strip('"'))
@@ -2642,7 +2743,10 @@ class ACEStepLoRAExtractor:
         if precision == "fp16": save_dtype = torch.float16
         elif precision == "bf16": save_dtype = torch.bfloat16
 
-        scale_factor = rank / alpha if alpha > 0 else 1.0
+        scale_factor = rank / alpha if (alpha > 0 and rank > 0) else 1.0
+        if rank == -1 and alpha > 0: 
+            scale_factor = 1.0 / alpha 
+            
         valid_keys =[k for k in base_sd.keys() if k in ft_sd and any(t in k for t in targets) and base_sd[k].shape == ft_sd[k].shape and base_sd[k].ndim == 2 and k.startswith("decoder.")]
 
         from comfy.utils import ProgressBar
@@ -2657,13 +2761,27 @@ class ACEStepLoRAExtractor:
 
             if torch.allclose(delta_W, torch.zeros_like(delta_W), atol=1e-6): continue
             M = delta_W * scale_factor
+            
+            layer_target_rank = rank if rank != -1 else min(M.shape)
 
-            try: U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-            except Exception:
-                U, S, Vh = torch.linalg.svd(M.cpu(), full_matrices=False)
-                U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+            if decomposition_method == "SVD":
+                try: 
+                    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+                except Exception as e:
+                    print(f"⚠️ SVD failed: {e}. Falling back to CPU SVD.")
+                    U, S, Vh = torch.linalg.svd(M.cpu(), full_matrices=False)
+                    U, S, Vh = U.to(device), S.to(device), Vh.to(device)
+            else: # rSVD
+                q = min(layer_target_rank + 4, min(M.shape))
+                try:
+                    U, S, V = torch.svd_lowrank(M, q=q, niter=2)
+                    Vh = V.T
+                except Exception as e:
+                    print(f"⚠️ rSVD failed: {e}. Falling back to CPU SVD.")
+                    U, S, Vh = torch.linalg.svd(M.cpu(), full_matrices=False)
+                    U, S, Vh = U.to(device), S.to(device), Vh.to(device)
 
-            target_rank = min(rank, len(S))
+            target_rank = min(layer_target_rank, len(S))
             if dynamic_method == "sv_ratio":
                 keep_indices = torch.nonzero(S >= S[0] * dynamic_param).flatten()
                 target_rank = keep_indices[-1].item() + 1 if len(keep_indices) > 0 else 1
@@ -2671,10 +2789,14 @@ class ACEStepLoRAExtractor:
                 S_sq = S.pow(2)
                 keep_indices = torch.nonzero(torch.cumsum(S_sq, dim=0) >= dynamic_param * torch.sum(S_sq)).flatten()
                 target_rank = keep_indices[0].item() + 1 if len(keep_indices) > 0 else len(S)
+            elif dynamic_method == "safe":
+                target_rank = min(layer_target_rank, len(S))
 
-            target_rank = min(target_rank, rank, len(S))
+            target_rank = min(target_rank, layer_target_rank, len(S))
+            
             layer_name = key.replace("decoder.", "").replace(".weight", "")
-            if dynamic_method in["sv_fro", "sv_ratio"]: rank_pattern[layer_name] = target_rank
+            if dynamic_method in ["sv_fro", "sv_ratio"]: 
+                rank_pattern[layer_name] = target_rank
 
             U_r, S_r, Vh_r = U[:, :target_rank], S[:target_rank], Vh[:target_rank, :]
             sqrt_S = torch.sqrt(S_r)
@@ -2690,7 +2812,7 @@ class ACEStepLoRAExtractor:
         
         config = {
             "peft_type": "LORA",
-            "r": rank, 
+            "r": rank if rank != -1 else "DYNAMIC", 
             "lora_alpha": alpha, 
             "lora_dropout": 0.0,
             "target_modules": targets, 
@@ -2704,9 +2826,14 @@ class ACEStepLoRAExtractor:
             config["rank_pattern"] = rank_pattern
             config["alpha_pattern"] = rank_pattern 
             config["r"] = max(rank_pattern.values()) if rank_pattern else rank
+            if config["r"] == -1: config["r"] = 32 # Fallback
             config["lora_alpha"] = config["r"]
             avg_rank = sum(rank_pattern.values()) / len(rank_pattern) if rank_pattern else rank
             print(f"📊 Extracted with dynamic rank. Avg Rank: {avg_rank:.2f}")
+        else:
+            # Если использовался -1, берем максимальный ранк из всех слоев
+            config["r"] = max([tensor.shape[0] for key, tensor in new_state_dict.items() if "lora_B" in key]) if rank == -1 else rank
+            config["lora_alpha"] = alpha
 
         with open(os.path.join(out_path, "adapter_config.json"), 'w') as f: 
             json.dump(config, f, indent=2)
@@ -2714,6 +2841,7 @@ class ACEStepLoRAExtractor:
         save_file(new_state_dict, os.path.join(out_path, "adapter_model.safetensors"))
 
         print(f"✅ Extraction complete! Saved to {out_path}")
+        import comfy.model_management as mm
         mm.soft_empty_cache()
         return (out_path,)
     
