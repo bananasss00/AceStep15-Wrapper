@@ -32,3 +32,4 @@ safetensors>=0.4.0
 
 pytorch_wavelets
 PyWavelets
+git+https://github.com/arcee-ai/mergekit.git#egg=mergekit
