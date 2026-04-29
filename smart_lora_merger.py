@@ -124,7 +124,6 @@ def execute_pure_pytorch_merge(w_list, strengths, method_name, density, global_s
         if len(w_list) != 2: return execute_pure_pytorch_merge(w_list, strengths, "linear", density, global_scale)
         t = strengths[1] / (strengths[0] + strengths[1] + 1e-8)
         slerped = slerp(t, w_list[0], w_list[1])
-        # Восстанавливаем оригинальную магнитуду (смешанную линейно)
         mag0 = torch.norm(w_list[0])
         mag1 = torch.norm(w_list[1])
         target_mag = (1.0 - t) * mag0 + t * mag1
@@ -186,13 +185,13 @@ class AceStepSmartLoraMerger:
             "required": {
                 "model": ("ACESTEP_MODEL",),
                 "lora_stack": ("LORA_STACK",),
-                "merge_method": (["linear", "concat (Lossless)", "slerp", "linear_slerp", "dare_ties", "ties"], {"default": "linear", "tooltip": "Для звука лучше всего Linear, Concat или Slerp."}),
-                "target_rank": ("INT", {"default": 128, "min": 8, "max": 512, "step": 8}),
+                "merge_method": (["concat (Lossless)", "linear", "slerp", "linear_slerp", "dare_ties", "ties"], {"default": "concat (Lossless)", "tooltip": "Concat: Идеально для музыки. Склеивает без потерь и шума. Остальные методы - математические."}),
+                "target_rank": ("INT", {"default": 128, "min": 8, "max": 512, "step": 8, "tooltip": "Игнорируется в режиме concat. В остальных: Ранг сжатия (SVD)."}),
                 "density": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Только для DARE/TIES. Для аудио ставьте 0.95 - 1.0!"}),
                 "svd_method": (["rSVD", "energy_rSVD"], {"default": "rSVD"}),
-                "ignore_bias": ("BOOLEAN", {"default": True, "tooltip": "Спасает от гула."}),
+                "ignore_bias": ("BOOLEAN", {"default": True, "tooltip": "Игнорировать смещения (Bias). Спасает от гула."}),
                 "global_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Общий множитель Лоры."}),
-                "normalize_magnitudes": ("BOOLEAN", {"default": True, "tooltip": "Мягкое выравнивание силы Лор (без перегрузок)."}),
+                "normalize_magnitudes": ("BOOLEAN", {"default": True, "tooltip": "Автоматически уравнивает силу лор, чтобы ни одна не 'съела' другую."}),
             }
         }
 
@@ -249,12 +248,16 @@ class AceStepSmartLoraMerger:
 
         def process_layer(base_key):
             try:
-                # РЕЖИМ 1: CONCAT
+                # -------------------------------------------------------------
+                # РЕЖИМ 1: CONCAT (Без потерь, Идеально для аудио)
+                # -------------------------------------------------------------
                 if merge_method == "concat (Lossless)":
                     A_tensors =[]
                     B_tensors =[]
                     orig_dtype = torch.float32
+                    layer_norms =[]
                     
+                    # Сбор данных и вычисление изначальной силы (Norm)
                     for item in loaded_sds:
                         sd = item["sd"]
                         A = sd.get(f"{base_key}.lora_A.weight")
@@ -267,23 +270,57 @@ class AceStepSmartLoraMerger:
                             A_gpu = A.cuda().float()
                             B_gpu = B.cuda().float()
                             
-                            B_scaled = B_gpu * item["scale"] * item["strength"] * global_scale
-                            A_tensors.append(A_gpu)
-                            B_tensors.append(B_scaled)
+                            # Считаем силу матрицы ДО нормализации
+                            W = (B_gpu @ A_gpu) * item["scale"]
+                            current_norm = torch.norm(W).item()
+                            layer_norms.append(current_norm)
+                            norms_log[item["name"]].append(current_norm)
                             
-                    if not A_tensors: return base_key, None, None, None, 0
+                            A_tensors.append(A_gpu)
+                            B_tensors.append(B_gpu)
+                        else:
+                            layer_norms.append(0.0)
+                            A_tensors.append(None)
+                            B_tensors.append(None)
+                            
+                    valid_A = []
+                    valid_B =[]
+                    
+                    # ИСПРАВЛЕНИЕ: Выравнивание силы матриц перед Concat
+                    active_norms =[n for n in layer_norms if n > 0]
+                    target_norm = sum(active_norms) / len(active_norms) if active_norms else 1.0
+
+                    for i, item in enumerate(loaded_sds):
+                        if A_tensors[i] is not None:
+                            A_gpu = A_tensors[i]
+                            B_gpu = B_tensors[i]
+                            
+                            mult = 1.0
+                            if normalize_magnitudes and len(active_norms) > 1:
+                                raw_multiplier = target_norm / (layer_norms[i] + 1e-8)
+                                # Мягкая нормализация: не даем усилить больше чем в 1.5 раза или приглушить сильнее 0.7
+                                mult = max(0.7, min(1.5, raw_multiplier))
+                            
+                            # Применяем все коэффициенты к матрице B
+                            B_scaled = B_gpu * item["scale"] * item["strength"] * global_scale * mult
+                            valid_A.append(A_gpu)
+                            valid_B.append(B_scaled)
+                            
+                    if not valid_A: return base_key, None, None, None, 0
                         
-                    A_merged = torch.cat(A_tensors, dim=0).cpu().to(orig_dtype)
-                    B_merged = torch.cat(B_tensors, dim=1).cpu().to(orig_dtype)
+                    A_merged = torch.cat(valid_A, dim=0).cpu().to(orig_dtype)
+                    B_merged = torch.cat(valid_B, dim=1).cpu().to(orig_dtype)
                     return base_key, A_merged, B_merged, orig_dtype, A_merged.shape[0]
 
-                # РЕЖИМ 2: SVD-based
+                # -------------------------------------------------------------
+                # РЕЖИМ 2: Классический (SVD + Linear/SLERP)
+                # -------------------------------------------------------------
                 W_list =[]
                 valid_strengths =[]
                 orig_dtype = torch.float32
                 layer_norms =[]
                 
-                for item in loaded_sds:
+                for idx, item in enumerate(loaded_sds):
                     sd = item["sd"]
                     A = sd.get(f"{base_key}.lora_A.weight")
                     if A is None: A = sd.get(f"{base_key}.lora_down.weight")
@@ -305,15 +342,10 @@ class AceStepSmartLoraMerger:
                         
                 if not W_list: return base_key, None, None, None, 0
 
-                # ====================================================
-                # SOFT NORMALIZATION (Мягкая нормализация магнитуд)
-                # ====================================================
                 if normalize_magnitudes and len(W_list) > 1:
                     target_norm = sum(layer_norms) / len(layer_norms)
                     for i in range(len(W_list)):
                         raw_multiplier = target_norm / (layer_norms[i] + 1e-8)
-                        # Защита от перегрузки: мы не разрешаем умножать матрицу больше чем в 1.5 раза
-                        # и не разрешаем приглушать её больше чем в 0.7 раза (на 30%).
                         clamped_mult = max(0.7, min(1.5, raw_multiplier))
                         W_list[i] = W_list[i] * clamped_mult
 
@@ -340,8 +372,8 @@ class AceStepSmartLoraMerger:
 
         torch.cuda.empty_cache()
 
-        if loaded_sds and merge_method != "concat (Lossless)":
-            print("\n[Smart Lora Merger] 📊 Сила Лоры до нормализации:")
+        if loaded_sds:
+            print("\n[Smart Lora Merger] 📊 Сила Лоры (Средняя Норма) до нормализации:")
             for name, n_list in norms_log.items():
                 if n_list: print(f"   - {name}: {sum(n_list)/len(n_list):.2f}")
 
