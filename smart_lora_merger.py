@@ -3,12 +3,11 @@ import json
 import torch
 import hashlib
 import folder_paths
-import tempfile
 import comfy.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from safetensors.torch import load_file, save_file
 import acestep.core.generation.handler.lora.lifecycle as lora_lifecycle
+from safetensors.torch import load_file, save_file
 
 # ============================================================================
 # Вспомогательные функции (Алгоритмы SVD)
@@ -96,7 +95,7 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
 
         if method_name in["dare_ties", "ties", "della"]:
             base_ref = ModelReference(model=ModelPath(path="base"))
-            tensors[base_ref] = torch.zeros_like(w_list[0]) # Инициализация на том же устройстве (GPU)
+            tensors[base_ref] = torch.zeros_like(w_list[0]) # Инициализация на GPU
             param_map[base_ref] = ImmutableMap({"weight": 0.0, "density": 1.0})
             tensor_params = ImmutableMap(param_map)
 
@@ -148,7 +147,7 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
         traceback.print_exc()
         print(f"⚠️ Ошибка mergekit (переключаемся на Linear): {e}")
 
-    # Fallback на Linear / Task Arithmetic
+    # Fallback на Linear
     res = torch.zeros_like(w_list[0])
     for w, s in zip(w_list, strengths):
         res += w * s
@@ -264,7 +263,7 @@ class AceStepSmartLoraMerger:
         merged_state_dict = {}
         pbar = comfy.utils.ProgressBar(len(base_keys))
         
-        # === Многопоточная обработка матриц на GPU для ускорения (x4-x8 раз быстрее) ===
+        # Многопоточная обработка матриц на GPU
         def process_layer(base_key):
             try:
                 W_list = []
@@ -284,7 +283,7 @@ class AceStepSmartLoraMerger:
                     
                     if A is not None and B is not None:
                         orig_dtype = A.dtype
-                        # Перемещаем тензоры на GPU для сверхбыстрого перемножения
+                        # Вычисления переводим на GPU для сверхбыстрого SVD
                         A_gpu = A.cuda().float()
                         B_gpu = B.cuda().float()
                         
@@ -300,20 +299,20 @@ class AceStepSmartLoraMerger:
                 else:
                     W_merged = execute_mergekit_task(W_list, valid_strengths, merge_method, density)
 
-                # Факторизация (SVD работает в разы быстрее на CUDA)
+                # SVD факторизация
                 if svd_method == "energy_rSVD":
                     A_merged, B_merged = apply_energy_rsvd(W_merged, target_rank)
                 else:
                     A_merged, B_merged = apply_rsvd(W_merged, target_rank)
 
-                # Выгружаем результаты в RAM для экономии VRAM
+                # Выгружаем результат в RAM
                 return base_key, A_merged.cpu().to(orig_dtype), B_merged.cpu().to(orig_dtype), orig_dtype
                 
             except Exception as e:
                 print(f"[Smart Lora Merger] Ошибка в слое {base_key}: {e}")
                 return base_key, None, None, None
 
-        # Запускаем ThreadPool. Оптимально 4 воркера, чтобы не выбить OOM в VRAM.
+        # Оптимально 4 воркера для баланса между VRAM и CPU/GPU утилизацией
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {executor.submit(process_layer, key): key for key in base_keys}
             for future in as_completed(futures):
@@ -323,10 +322,9 @@ class AceStepSmartLoraMerger:
                     merged_state_dict[f"{base_key}.lora_B.weight"] = B_merged
                 pbar.update(1)
 
-        # Очищаем GPU после тяжелой SVD факторизации
         torch.cuda.empty_cache()
 
-        # Обработка bias'ов и других независимых слоев линейным сложением
+        # Обработка bias'ов и других независимых слоев
         other_keys = set()
         for item in loaded_sds:
             for k in item["sd"].keys():
@@ -350,7 +348,9 @@ class AceStepSmartLoraMerger:
 
         print(f"[Smart Lora Merger] ✅ Тензоры успешно слиты! Итоговый размер словаря: {len(merged_state_dict)}")
 
-        # 5. Инъекция в ACE-Step Model
+        # ==============================================================================
+        # МАГИЯ IN-MEMORY ПАТЧИНГА (Унифицировано с AceStepAdvancedLoraLoader)
+        # ==============================================================================
         dit_handler = model["dit_handler"]
         hash_str = hashlib.md5(str(merged_state_dict.keys()).encode()).hexdigest()[:8]
         adapter_name = f"smart_merged_{merge_method}_{hash_str}"
@@ -358,35 +358,44 @@ class AceStepSmartLoraMerger:
         orig_load_st = lora_lifecycle.load_safetensors
         orig_torch_load = torch.load
 
-        def hooked_load_st(path, *args, **kwargs):
+        # Динамически перехватываем парсинг конфига PEFT, чтобы прокинуть измененный ранг и таргеты!
+        try:
+            import peft
+            orig_from_pretrained = peft.PeftConfig.from_pretrained
+        except ImportError:
+            orig_from_pretrained = None
+
+        target_modules = list(set([k.split('.')[-3] for k in merged_state_dict.keys() if "lora_A" in k or "lora_down" in k]))
+
+        # Функция-хук для PEFT Config
+        def hooked_from_pretrained(pretrained_model_name_or_path, **kwargs):
+            cfg = orig_from_pretrained(pretrained_model_name_or_path, **kwargs)
+            cfg.r = target_rank
+            cfg.lora_alpha = target_rank # Scale уже запечен в тензоры
+            cfg.target_modules = target_modules
+            return cfg
+
+        def hooked_load_st(path, *args, **kwargs_st):
             return merged_state_dict
             
-        def hooked_torch_load(path, *args, **kwargs):
+        def hooked_torch_load(path, *args, **kwargs_torch):
             return merged_state_dict
 
         lora_lifecycle.load_safetensors = hooked_load_st
         torch.load = hooked_torch_load
+        
+        if orig_from_pretrained:
+            peft.PeftConfig.from_pretrained = hooked_from_pretrained
 
-        tmp_dir = tempfile.mkdtemp()
         try:
-            target_modules = list(set([k.split('.')[-3] for k in merged_state_dict.keys() if "lora_A" in k or "lora_down" in k]))
+            # Берем путь от первой лоры в стеке. Там УЖЕ есть реальный файл .safetensors, 
+            # так что `glob.glob` внутри загрузчика ACE-Step пройдет проверку без фейковых файлов.
+            # А перехваченный PeftConfig подменит данные перед инициализацией матриц.
+            dummy_path = lora_stack[0]["path"]
             
-            with open(os.path.join(tmp_dir, "adapter_config.json"), "w") as f:
-                json.dump({
-                    "peft_type": "LORA",
-                    "r": target_rank,
-                    "lora_alpha": target_rank,
-                    "target_modules": target_modules
-                }, f)
-
-            # ФИКС ИНЪЕКЦИИ: Создаем пустой фейковый файл safetensors, чтобы загрузчик ACE-Step 
-            # прошел проверку glob.glob и дернул перехваченный load_safetensors
-            with open(os.path.join(tmp_dir, "adapter_model.safetensors"), "wb") as f:
-                f.write(b"dummy")
-
-            # Вызываем штатный загрузчик
-            load_msg = dit_handler.add_lora(tmp_dir, adapter_name=adapter_name, ignore_bias=True)
+            load_msg = dit_handler.add_lora(dummy_path, adapter_name=adapter_name, ignore_bias=True)
             
+            # Принудительная активация, чтобы избежать KeyError
             decoder = getattr(dit_handler.model, "decoder", None)
             if decoder is not None and hasattr(decoder, "set_adapter"):
                 try: decoder.set_adapter(adapter_name)
@@ -396,13 +405,17 @@ class AceStepSmartLoraMerger:
                 print(f"[Smart Lora Merger] ❌ Ошибка инъекции: {load_msg}")
             else:
                 new_active = model["active_adapters"].copy()
-                new_active[adapter_name] = 1.0 # Сила 1.0 (уже запечена)
+                new_active[adapter_name] = 1.0
                 model = model.copy()
                 model["active_adapters"] = new_active
                 print(f"[Smart Lora Merger] ✨ In-Memory инъекция '{adapter_name}' выполнена успешно!")
+                
         finally:
+            # Возвращаем все оригинальные функции на родину
             lora_lifecycle.load_safetensors = orig_load_st
             torch.load = orig_torch_load
+            if orig_from_pretrained:
+                peft.PeftConfig.from_pretrained = orig_from_pretrained
 
         return (model, merged_state_dict)
 
@@ -435,7 +448,6 @@ class AceStepSaveMergedLora:
         save_path = os.path.join(output_dir, file_name)
         os.makedirs(save_path, exist_ok=True)
 
-        # Динамический подсчет ранга и таргетов
         sample_tensor = next((v for k, v in merged_tensors.items() if "lora_A" in k), None)
         rank = sample_tensor.shape[1] if sample_tensor is not None else 64
         target_modules = list(set([k.split('.')[-3] for k in merged_tensors.keys() if "lora_A" in k or "lora_down" in k]))
@@ -459,7 +471,7 @@ class AceStepSaveMergedLora:
 
 
 # ============================================================================
-# Регистрация нод (с красивыми иконками!)
+# Регистрация нод
 # ============================================================================
 NODE_CLASS_MAPPINGS = {
     "AceStepLoraStackEntry": AceStepLoraStackEntry,
