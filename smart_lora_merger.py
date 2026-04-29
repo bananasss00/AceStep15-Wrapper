@@ -57,12 +57,10 @@ def apply_energy_rsvd(W: torch.Tensor, new_dim: int, energy_keep_ratio: float = 
         down_new = torch.cat([down_new, pad_down], dim=0)
     return down_new, up_new
 
-
 # ============================================================================
-# АЛГОРИТМЫ СЛИЯНИЯ (ЧИСТЫЙ PYTORCH, БЕЗ ЗАВИСИМОСТЕЙ)
+# АЛГОРИТМЫ СЛИЯНИЯ (ЧИСТЫЙ PYTORCH)
 # ============================================================================
 def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
-    """Сферическая линейная интерполяция между двумя тензорами"""
     v0_flat = v0.flatten()
     v1_flat = v1.flatten()
     
@@ -76,7 +74,6 @@ def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
         
     theta_0 = torch.acos(torch.clamp(dot, -1.0, 1.0))
     sin_theta_0 = torch.sin(theta_0)
-    
     theta_t = theta_0 * t
     sin_theta_t = torch.sin(theta_t)
     
@@ -85,35 +82,23 @@ def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
     return s0 * v0 + s1 * v1
 
 def drop_and_rescale(tensor, density, method="random"):
-    """Удаление слабых/случайных весов и рескейлинг оставшихся (основа DARE/TIES)"""
-    if density >= 1.0:
-        return tensor
-        
+    if density >= 1.0: return tensor
     if method == "random":
-        # DARE: Случайный дропаут весов
         mask = torch.rand_like(tensor) < density
     else:
-        # TIES: Удаление слабейших по амплитуде
         k = max(1, int(tensor.numel() * density))
         threshold = torch.topk(tensor.abs().flatten(), k).values[-1]
         mask = tensor.abs() >= threshold
-        
     return (tensor * mask) / density
 
 def ties_consensus_merge(tensors, strengths):
-    """Вычисляет знак консенсуса и усредняет только согласные веса (TIES)"""
-    stacked = torch.stack(tensors)
-    signs = torch.sign(stacked)
-    
-    # 1. Считаем взвешенный консенсус знаков
     sum_signs = torch.zeros_like(tensors[0])
     for t, s in zip(tensors, strengths):
         sum_signs += torch.sign(t) * s
     
     consensus_sign = torch.sign(sum_signs)
-    consensus_sign[consensus_sign == 0] = 1.0 # Дефолтный знак при ничьей
+    consensus_sign[consensus_sign == 0] = 1.0 
     
-    # 2. Оставляем только те веса, знак которых совпадает с консенсусом
     merged = torch.zeros_like(tensors[0])
     weight_sum = torch.zeros_like(tensors[0])
     
@@ -124,48 +109,42 @@ def ties_consensus_merge(tensors, strengths):
         
     return merged / (weight_sum + 1e-8)
 
-
 def execute_pure_pytorch_merge(w_list, strengths, method_name, density, global_scale):
-    """Единая точка входа для продвинутых математических алгоритмов мержа"""
-    
-    # 1. Linear (Обычное взвешенное сложение)
     if method_name == "linear":
         res = torch.zeros_like(w_list[0])
-        for w, s in zip(w_list, strengths):
-            res += w * s
+        for w, s in zip(w_list, strengths): res += w * s
         return res * global_scale
 
-    # 2. SLERP (Сферическая интерполяция)
     if method_name == "slerp":
-        if len(w_list) != 2:
-            print("⚠️ SLERP требует строго 2 LoRA! Переключаемся на Linear.")
-            return execute_pure_pytorch_merge(w_list, strengths, "linear", density, global_scale)
+        if len(w_list) != 2: return execute_pure_pytorch_merge(w_list, strengths, "linear", density, global_scale)
         t = strengths[1] / (strengths[0] + strengths[1] + 1e-8)
         return slerp(t, w_list[0], w_list[1]) * global_scale
 
-    # 3. TIES / DARE / DELLA
-    if method_name in ["dare_ties", "ties", "della"]:
+    if method_name == "linear_slerp":
+        if len(w_list) != 2: return execute_pure_pytorch_merge(w_list, strengths, "linear", density, global_scale)
+        t = strengths[1] / (strengths[0] + strengths[1] + 1e-8)
+        slerped = slerp(t, w_list[0], w_list[1])
+        # Восстанавливаем оригинальную магнитуду (смешанную линейно)
+        mag0 = torch.norm(w_list[0])
+        mag1 = torch.norm(w_list[1])
+        target_mag = (1.0 - t) * mag0 + t * mag1
+        current_mag = torch.norm(slerped) + 1e-8
+        return (slerped * (target_mag / current_mag)) * global_scale
+
+    if method_name in["dare_ties", "ties", "della"]:
         processed_tensors =[]
         for w in w_list:
-            if method_name == "ties":
-                # TIES обнуляет самые слабые веса (по модулю)
-                pt = drop_and_rescale(w, density, method="magnitude")
-            else: # dare_ties или della
-                # DARE обнуляет веса случайно, сохраняя общую статистику
-                pt = drop_and_rescale(w, density, method="random")
+            if method_name == "ties": pt = drop_and_rescale(w, density, method="magnitude")
+            else: pt = drop_and_rescale(w, density, method="random")
             processed_tensors.append(pt)
         
         if method_name == "della":
-            # DELLA = DARE Dropout + обычное Linear слияние
             res = torch.zeros_like(w_list[0])
-            for w, s in zip(processed_tensors, strengths):
-                res += w * s
+            for w, s in zip(processed_tensors, strengths): res += w * s
         else:
-            # DARE-TIES и TIES = Dropout + Сохранение только весов, согласных по знаку
             res = ties_consensus_merge(processed_tensors, strengths)
             
         return res * global_scale
-
 
 # ============================================================================
 # 1. Нода: AceStep Lora Stack Entry
@@ -197,7 +176,6 @@ class AceStepLoraStackEntry:
             stack.append({"path": final_path, "strength": strength})
         return (stack,)
 
-
 # ============================================================================
 # 2. Нода: AceStep Smart Lora Merger
 # ============================================================================
@@ -208,13 +186,13 @@ class AceStepSmartLoraMerger:
             "required": {
                 "model": ("ACESTEP_MODEL",),
                 "lora_stack": ("LORA_STACK",),
-                "merge_method": (["concat (Lossless)", "linear", "dare_ties", "ties", "della", "slerp"], {"default": "concat (Lossless)", "tooltip": "Concat: Идеально для музыки. Склеивает без потерь и шума. Остальные методы - математические."}),
-                "target_rank": ("INT", {"default": 128, "min": 8, "max": 512, "step": 8, "tooltip": "Игнорируется в режиме concat. В остальных: Ранг сжатия (SVD)."}),
-                "density": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Доля сохраняемых весов для DARE/TIES. (1.0 = выключить обнуление)"}),
+                "merge_method": (["linear", "concat (Lossless)", "slerp", "linear_slerp", "dare_ties", "ties"], {"default": "linear", "tooltip": "Для звука лучше всего Linear, Concat или Slerp."}),
+                "target_rank": ("INT", {"default": 128, "min": 8, "max": 512, "step": 8}),
+                "density": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Только для DARE/TIES. Для аудио ставьте 0.95 - 1.0!"}),
                 "svd_method": (["rSVD", "energy_rSVD"], {"default": "rSVD"}),
-                "ignore_bias": ("BOOLEAN", {"default": True, "tooltip": "Игнорировать смещения (Bias). Спасает от гула."}),
+                "ignore_bias": ("BOOLEAN", {"default": True, "tooltip": "Спасает от гула."}),
                 "global_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05, "tooltip": "Общий множитель Лоры."}),
-                "normalize_magnitudes": ("BOOLEAN", {"default": True, "tooltip": "Автоматически уравнивает силу лор, чтобы ни одна не 'съела' другую."}),
+                "normalize_magnitudes": ("BOOLEAN", {"default": True, "tooltip": "Мягкое выравнивание силы Лор (без перегрузок)."}),
             }
         }
 
@@ -235,16 +213,14 @@ class AceStepSmartLoraMerger:
         return None
 
     def smart_merge(self, model, lora_stack, merge_method, target_rank, density, svd_method, ignore_bias, global_scale, normalize_magnitudes):
-        if not lora_stack:
-            return (model, {})
+        if not lora_stack: return (model, {})
 
-        print(f"\n[Smart Lora Merger] 🧠 Слияние: {len(lora_stack)} LoRA | Метод: {merge_method} (Pure PyTorch)")
+        print(f"\n[Smart Lora Merger] 🧠 Слияние: {len(lora_stack)} LoRA | Метод: {merge_method}")
         
         loaded_sds =[]
         for lora in lora_stack:
             sd = self._load_lora_weights(lora["path"])
-            if sd is None:
-                raise FileNotFoundError(f"Не удалось загрузить веса из: {lora['path']}")
+            if sd is None: raise FileNotFoundError(f"Не удалось загрузить веса из: {lora['path']}")
             
             scale = 1.0
             config_path = os.path.join(os.path.dirname(lora["path"]) if os.path.isfile(lora["path"]) else lora["path"], "adapter_config.json")
@@ -273,9 +249,7 @@ class AceStepSmartLoraMerger:
 
         def process_layer(base_key):
             try:
-                # -------------------------------------------------------------
-                # РЕЖИМ 1: CONCAT (Без потерь, Идеально для аудио)
-                # -------------------------------------------------------------
+                # РЕЖИМ 1: CONCAT
                 if merge_method == "concat (Lossless)":
                     A_tensors =[]
                     B_tensors =[]
@@ -297,23 +271,19 @@ class AceStepSmartLoraMerger:
                             A_tensors.append(A_gpu)
                             B_tensors.append(B_scaled)
                             
-                    if not A_tensors:
-                        return base_key, None, None, None, 0
+                    if not A_tensors: return base_key, None, None, None, 0
                         
                     A_merged = torch.cat(A_tensors, dim=0).cpu().to(orig_dtype)
                     B_merged = torch.cat(B_tensors, dim=1).cpu().to(orig_dtype)
-                    new_r = A_merged.shape[0]
-                    return base_key, A_merged, B_merged, orig_dtype, new_r
+                    return base_key, A_merged, B_merged, orig_dtype, A_merged.shape[0]
 
-                # -------------------------------------------------------------
-                # РЕЖИМ 2: Классический (SVD + TIES/SLERP/Linear)
-                # -------------------------------------------------------------
+                # РЕЖИМ 2: SVD-based
                 W_list =[]
                 valid_strengths =[]
                 orig_dtype = torch.float32
                 layer_norms =[]
                 
-                for idx, item in enumerate(loaded_sds):
+                for item in loaded_sds:
                     sd = item["sd"]
                     A = sd.get(f"{base_key}.lora_A.weight")
                     if A is None: A = sd.get(f"{base_key}.lora_down.weight")
@@ -326,7 +296,6 @@ class AceStepSmartLoraMerger:
                         B_gpu = B.cuda().float()
                         
                         W = (B_gpu @ A_gpu) * item["scale"]
-                        
                         current_norm = torch.norm(W).item()
                         layer_norms.append(current_norm)
                         norms_log[item["name"]].append(current_norm)
@@ -334,19 +303,22 @@ class AceStepSmartLoraMerger:
                         W_list.append(W)
                         valid_strengths.append(item["strength"])
                         
-                if not W_list:
-                    return base_key, None, None, None, 0
+                if not W_list: return base_key, None, None, None, 0
 
-                # Выравнивание Магнитуд (чтобы одна Лора не съела другую)
+                # ====================================================
+                # SOFT NORMALIZATION (Мягкая нормализация магнитуд)
+                # ====================================================
                 if normalize_magnitudes and len(W_list) > 1:
                     target_norm = sum(layer_norms) / len(layer_norms)
                     for i in range(len(W_list)):
-                        W_list[i] = W_list[i] * (target_norm / (layer_norms[i] + 1e-8))
+                        raw_multiplier = target_norm / (layer_norms[i] + 1e-8)
+                        # Защита от перегрузки: мы не разрешаем умножать матрицу больше чем в 1.5 раза
+                        # и не разрешаем приглушать её больше чем в 0.7 раза (на 30%).
+                        clamped_mult = max(0.7, min(1.5, raw_multiplier))
+                        W_list[i] = W_list[i] * clamped_mult
 
-                # Слияние чистым PyTorch-алгоритмом
                 W_merged = execute_pure_pytorch_merge(W_list, valid_strengths, merge_method, density, global_scale)
 
-                # Факторизация
                 if svd_method == "energy_rSVD": A_merged, B_merged = apply_energy_rsvd(W_merged, target_rank)
                 else: A_merged, B_merged = apply_rsvd(W_merged, target_rank)
 
@@ -363,19 +335,15 @@ class AceStepSmartLoraMerger:
                 if A_merged is not None:
                     merged_state_dict[f"{base_key}.lora_A.weight"] = A_merged
                     merged_state_dict[f"{base_key}.lora_B.weight"] = B_merged
-                    if new_r > final_rank:
-                        final_rank = new_r
+                    if new_r > final_rank: final_rank = new_r
                 pbar.update(1)
 
         torch.cuda.empty_cache()
 
-        # Вывод аналитики по энергии
         if loaded_sds and merge_method != "concat (Lossless)":
-            print("\n[Smart Lora Merger] 📊 Средняя норма матриц (Сила) до нормализации:")
+            print("\n[Smart Lora Merger] 📊 Сила Лоры до нормализации:")
             for name, n_list in norms_log.items():
-                if n_list:
-                    avg_norm = sum(n_list)/len(n_list)
-                    print(f"   - {name}: {avg_norm:.2f}")
+                if n_list: print(f"   - {name}: {sum(n_list)/len(n_list):.2f}")
 
         # Обработка bias'ов
         if not ignore_bias:
