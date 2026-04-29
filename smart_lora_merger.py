@@ -3,6 +3,7 @@ import json
 import torch
 import hashlib
 import folder_paths
+import tempfile
 import comfy.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,7 +14,6 @@ from safetensors.torch import load_file, save_file
 # Вспомогательные функции (Алгоритмы SVD)
 # ============================================================================
 def apply_rsvd(W: torch.Tensor, new_dim: int, niter: int = 2, oversample: int = 4):
-    """Быстрый рандомизированный SVD для сжатия развернутых весов (W) обратно в LoRA A и B"""
     rank = min(new_dim, min(W.shape))
     q = min(rank + oversample, min(W.shape))
 
@@ -28,7 +28,6 @@ def apply_rsvd(W: torch.Tensor, new_dim: int, niter: int = 2, oversample: int = 
     up_new = U * S_sqrt.unsqueeze(0)            # lora_B (out_features, rank)
     down_new = (V * S_sqrt.unsqueeze(0)).T      # lora_A (rank, in_features)
     
-    # Добиваем нулями, если ранг урезался из-за маленькой матрицы
     if new_dim > up_new.shape[1]:
         pad_up = torch.zeros((up_new.shape[0], new_dim - up_new.shape[1]), dtype=W.dtype, device=W.device)
         pad_down = torch.zeros((new_dim - down_new.shape[0], down_new.shape[1]), dtype=W.dtype, device=W.device)
@@ -38,13 +37,11 @@ def apply_rsvd(W: torch.Tensor, new_dim: int, niter: int = 2, oversample: int = 
     return down_new, up_new
 
 def apply_energy_rsvd(W: torch.Tensor, new_dim: int, energy_keep_ratio: float = 1.5, niter: int = 1, oversample: int = 2):
-    """Продвинутый SVD, который сперва отсекает 'шумовую' энергию перед факторизацией"""
     rank = min(new_dim, min(W.shape))
     q = min(rank + oversample, min(W.shape))
     
     U, S, V = torch.svd_lowrank(W, q=q, niter=niter)
     
-    # Отсечение на основе энергии (оставляем 95% значимых признаков)
     energy = torch.cumsum(S, dim=0) / torch.sum(S)
     target_idx = torch.searchsorted(energy, 0.95).item() + 1
     
@@ -67,12 +64,10 @@ def apply_energy_rsvd(W: torch.Tensor, new_dim: int, energy_keep_ratio: float = 
         
     return down_new, up_new
 
-
 # ============================================================================
 # Ядро мержа с использованием Mergekit
 # ============================================================================
 def execute_mergekit_task(w_list, strengths, method_name, density):
-    """Выполняет мерж плотных тензоров с использованием алгоритмов MergeKit."""
     try:
         from mergekit.architecture import WeightInfo
         from mergekit.common import ModelReference, ModelPath, ImmutableMap
@@ -82,9 +77,7 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
         from mergekit.merge_methods import REGISTERED_MERGE_METHODS
         from mergekit.sparsify import RescaleNorm
         
-        # Подготавливаем референсы
         refs =[ModelReference(model=ModelPath(path=f"lora_{i}")) for i in range(len(w_list))]
-        # Важно: Оставляем тензоры на GPU для быстрых вычислений внутри mergekit
         tensors = {refs[i]: w_list[i] for i in range(len(w_list))}
         
         param_map = {}
@@ -95,7 +88,7 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
 
         if method_name in["dare_ties", "ties", "della"]:
             base_ref = ModelReference(model=ModelPath(path="base"))
-            tensors[base_ref] = torch.zeros_like(w_list[0]) # Инициализация на GPU
+            tensors[base_ref] = torch.zeros_like(w_list[0]) 
             param_map[base_ref] = ImmutableMap({"weight": 0.0, "density": 1.0})
             tensor_params = ImmutableMap(param_map)
 
@@ -103,7 +96,6 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
             mode = mode_map[method_name]
             method = REGISTERED_MERGE_METHODS[mode]
             
-            # Pydantic-обертка для GatherTensors
             all_refs = refs +[base_ref]
             weight_info_map = {ref: weight_info for ref in all_refs}
             gather_tensors = GatherTensors(weight_info=ImmutableMap(weight_info_map))
@@ -147,12 +139,10 @@ def execute_mergekit_task(w_list, strengths, method_name, density):
         traceback.print_exc()
         print(f"⚠️ Ошибка mergekit (переключаемся на Linear): {e}")
 
-    # Fallback на Linear
     res = torch.zeros_like(w_list[0])
     for w, s in zip(w_list, strengths):
         res += w * s
     return res
-
 
 # ============================================================================
 # 1. Нода: AceStep Lora Stack Entry
@@ -190,7 +180,6 @@ class AceStepLoraStackEntry:
             
         return (stack,)
 
-
 # ============================================================================
 # 2. Нода: AceStep Smart Lora Merger
 # ============================================================================
@@ -201,10 +190,11 @@ class AceStepSmartLoraMerger:
             "required": {
                 "model": ("ACESTEP_MODEL",),
                 "lora_stack": ("LORA_STACK",),
-                "merge_method": (["dare_ties", "ties", "della", "slerp", "linear"], {"default": "dare_ties", "tooltip": "DARE-TIES: обнуляет часть весов для устранения конфликтов. TIES: сглаживает знаки тензоров. SLERP: сферическая интерполяция (строго для 2 лор). Linear: обычное сложение."}),
-                "target_rank": ("INT", {"default": 64, "min": 8, "max": 256, "step": 8, "tooltip": "Ранг (dim) итоговой LoRA."}),
-                "density": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Плотность (для DARE/DELLA). Доля сохраняемых весов. 1.0 = без обнуления."}),
+                "merge_method": (["dare_ties", "ties", "della", "slerp", "linear"], {"default": "dare_ties"}),
+                "target_rank": ("INT", {"default": 128, "min": 8, "max": 512, "step": 8, "tooltip": "Ранг (dim). Если Лоры 'съедают' друг друга, увеличьте до 128 или 256."}),
+                "density": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Плотность (для DARE/DELLA)."}),
                 "svd_method": (["rSVD", "energy_rSVD"], {"default": "rSVD", "tooltip": "Метод факторизации матриц."}),
+                "ignore_bias": ("BOOLEAN", {"default": False, "tooltip": "Игнорировать Bias (смещения). Включите (True), если после мержа слышен гул или шум."}),
             }
         }
 
@@ -217,22 +207,18 @@ class AceStepSmartLoraMerger:
         if os.path.isdir(path):
             st_path = os.path.join(path, "adapter_model.safetensors")
             bin_path = os.path.join(path, "adapter_model.bin")
-            if os.path.exists(st_path): 
-                return load_file(st_path)
-            elif os.path.exists(bin_path): 
-                return torch.load(bin_path, map_location="cpu", weights_only=True)
+            if os.path.exists(st_path): return load_file(st_path)
+            elif os.path.exists(bin_path): return torch.load(bin_path, map_location="cpu", weights_only=True)
         else:
-            if path.endswith('.safetensors'): 
-                return load_file(path)
-            else: 
-                return torch.load(path, map_location="cpu", weights_only=True)
+            if path.endswith('.safetensors'): return load_file(path)
+            else: return torch.load(path, map_location="cpu", weights_only=True)
         return None
 
-    def smart_merge(self, model, lora_stack, merge_method, target_rank, density, svd_method):
+    def smart_merge(self, model, lora_stack, merge_method, target_rank, density, svd_method, ignore_bias):
         if not lora_stack:
             return (model, {})
 
-        print(f"\n[Smart Lora Merger] 🧠 Начинаем ускоренное In-Memory слияние ({len(lora_stack)} LoRA) методом: {merge_method}")
+        print(f"\n[Smart Lora Merger] 🧠 Начинаем In-Memory слияние ({len(lora_stack)} LoRA). Ранг: {target_rank}, Bias Ignored: {ignore_bias}")
         
         loaded_sds =[]
         for lora in lora_stack:
@@ -251,7 +237,6 @@ class AceStepSmartLoraMerger:
 
             loaded_sds.append({"sd": sd, "scale": scale, "strength": lora["strength"]})
 
-        # Поиск уникальных базовых слоев (base_keys)
         base_keys = set()
         for item in loaded_sds:
             for k in item["sd"].keys():
@@ -263,10 +248,9 @@ class AceStepSmartLoraMerger:
         merged_state_dict = {}
         pbar = comfy.utils.ProgressBar(len(base_keys))
         
-        # Многопоточная обработка матриц на GPU
         def process_layer(base_key):
             try:
-                W_list = []
+                W_list =[]
                 valid_strengths =[]
                 orig_dtype = torch.float32
                 
@@ -274,16 +258,13 @@ class AceStepSmartLoraMerger:
                     sd = item["sd"]
                     
                     A = sd.get(f"{base_key}.lora_A.weight")
-                    if A is None:
-                        A = sd.get(f"{base_key}.lora_down.weight")
+                    if A is None: A = sd.get(f"{base_key}.lora_down.weight")
                         
                     B = sd.get(f"{base_key}.lora_B.weight")
-                    if B is None:
-                        B = sd.get(f"{base_key}.lora_up.weight")
+                    if B is None: B = sd.get(f"{base_key}.lora_up.weight")
                     
                     if A is not None and B is not None:
                         orig_dtype = A.dtype
-                        # Вычисления переводим на GPU для сверхбыстрого SVD
                         A_gpu = A.cuda().float()
                         B_gpu = B.cuda().float()
                         
@@ -299,20 +280,15 @@ class AceStepSmartLoraMerger:
                 else:
                     W_merged = execute_mergekit_task(W_list, valid_strengths, merge_method, density)
 
-                # SVD факторизация
-                if svd_method == "energy_rSVD":
-                    A_merged, B_merged = apply_energy_rsvd(W_merged, target_rank)
-                else:
-                    A_merged, B_merged = apply_rsvd(W_merged, target_rank)
+                if svd_method == "energy_rSVD": A_merged, B_merged = apply_energy_rsvd(W_merged, target_rank)
+                else: A_merged, B_merged = apply_rsvd(W_merged, target_rank)
 
-                # Выгружаем результат в RAM
                 return base_key, A_merged.cpu().to(orig_dtype), B_merged.cpu().to(orig_dtype), orig_dtype
                 
             except Exception as e:
                 print(f"[Smart Lora Merger] Ошибка в слое {base_key}: {e}")
                 return base_key, None, None, None
 
-        # Оптимально 4 воркера для баланса между VRAM и CPU/GPU утилизацией
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {executor.submit(process_layer, key): key for key in base_keys}
             for future in as_completed(futures):
@@ -324,33 +300,45 @@ class AceStepSmartLoraMerger:
 
         torch.cuda.empty_cache()
 
-        # Обработка bias'ов и других независимых слоев
-        other_keys = set()
-        for item in loaded_sds:
-            for k in item["sd"].keys():
-                if not any(x in k for x in[".lora_A", ".lora_B", ".lora_up", ".lora_down"]):
-                    other_keys.add(k)
-                    
-        for k in other_keys:
-            merged_val = None
-            orig_dtype = None
+        # =======================================================================
+        # ИСПРАВЛЕНИЕ BIAS: Взвешенное усреднение (чтобы избежать шума и гула)
+        # =======================================================================
+        if not ignore_bias:
+            other_keys = set()
             for item in loaded_sds:
-                val = item["sd"].get(k)
-                if val is not None:
-                    if merged_val is None:
-                        orig_dtype = val.dtype
-                        merged_val = val.float() * item["strength"]
-                    else:
-                        merged_val += val.float() * item["strength"]
+                for k in item["sd"].keys():
+                    if not any(x in k for x in[".lora_A", ".lora_B", ".lora_up", ".lora_down"]):
+                        other_keys.add(k)
                         
-            if merged_val is not None:
+            for k in other_keys:
+                t_list =[]
+                valid_strengths =[]
+                orig_dtype = torch.float32
+                
+                for item in loaded_sds:
+                    val = item["sd"].get(k)
+                    if val is not None:
+                        orig_dtype = val.dtype
+                        t_list.append(val.float())
+                        valid_strengths.append(item["strength"])
+                
+                if not t_list:
+                    continue
+                
+                # Взвешенное усреднение вместо прямого сложения
+                total_weight = sum(valid_strengths)
+                if total_weight == 0: total_weight = 1.0 # Защита от деления на ноль
+                
+                merged_val = torch.zeros_like(t_list[0])
+                for t, s in zip(t_list, valid_strengths):
+                    merged_val += t * s
+                
+                merged_val = merged_val / total_weight
                 merged_state_dict[k] = merged_val.to(orig_dtype)
 
-        print(f"[Smart Lora Merger] ✅ Тензоры успешно слиты! Итоговый размер словаря: {len(merged_state_dict)}")
+        print(f"[Smart Lora Merger] ✅ Тензоры успешно слиты! Размер словаря: {len(merged_state_dict)}")
 
-        # ==============================================================================
-        # МАГИЯ IN-MEMORY ПАТЧИНГА (Унифицировано с AceStepAdvancedLoraLoader)
-        # ==============================================================================
+        # Инъекция
         dit_handler = model["dit_handler"]
         hash_str = hashlib.md5(str(merged_state_dict.keys()).encode()).hexdigest()[:8]
         adapter_name = f"smart_merged_{merge_method}_{hash_str}"
@@ -358,7 +346,6 @@ class AceStepSmartLoraMerger:
         orig_load_st = lora_lifecycle.load_safetensors
         orig_torch_load = torch.load
 
-        # Динамически перехватываем парсинг конфига PEFT, чтобы прокинуть измененный ранг и таргеты!
         try:
             import peft
             orig_from_pretrained = peft.PeftConfig.from_pretrained
@@ -367,19 +354,15 @@ class AceStepSmartLoraMerger:
 
         target_modules = list(set([k.split('.')[-3] for k in merged_state_dict.keys() if "lora_A" in k or "lora_down" in k]))
 
-        # Функция-хук для PEFT Config
         def hooked_from_pretrained(pretrained_model_name_or_path, **kwargs):
             cfg = orig_from_pretrained(pretrained_model_name_or_path, **kwargs)
             cfg.r = target_rank
-            cfg.lora_alpha = target_rank # Scale уже запечен в тензоры
+            cfg.lora_alpha = target_rank
             cfg.target_modules = target_modules
             return cfg
 
-        def hooked_load_st(path, *args, **kwargs_st):
-            return merged_state_dict
-            
-        def hooked_torch_load(path, *args, **kwargs_torch):
-            return merged_state_dict
+        def hooked_load_st(path, *args, **kwargs_st): return merged_state_dict
+        def hooked_torch_load(path, *args, **kwargs_torch): return merged_state_dict
 
         lora_lifecycle.load_safetensors = hooked_load_st
         torch.load = hooked_torch_load
@@ -388,14 +371,11 @@ class AceStepSmartLoraMerger:
             peft.PeftConfig.from_pretrained = hooked_from_pretrained
 
         try:
-            # Берем путь от первой лоры в стеке. Там УЖЕ есть реальный файл .safetensors, 
-            # так что `glob.glob` внутри загрузчика ACE-Step пройдет проверку без фейковых файлов.
-            # А перехваченный PeftConfig подменит данные перед инициализацией матриц.
             dummy_path = lora_stack[0]["path"]
             
-            load_msg = dit_handler.add_lora(dummy_path, adapter_name=adapter_name, ignore_bias=True)
+            # Передаем ignore_bias из UI напрямую в загрузчик ACE-Step!
+            load_msg = dit_handler.add_lora(dummy_path, adapter_name=adapter_name, ignore_bias=ignore_bias)
             
-            # Принудительная активация, чтобы избежать KeyError
             decoder = getattr(dit_handler.model, "decoder", None)
             if decoder is not None and hasattr(decoder, "set_adapter"):
                 try: decoder.set_adapter(adapter_name)
@@ -411,14 +391,12 @@ class AceStepSmartLoraMerger:
                 print(f"[Smart Lora Merger] ✨ In-Memory инъекция '{adapter_name}' выполнена успешно!")
                 
         finally:
-            # Возвращаем все оригинальные функции на родину
             lora_lifecycle.load_safetensors = orig_load_st
             torch.load = orig_torch_load
             if orig_from_pretrained:
                 peft.PeftConfig.from_pretrained = orig_from_pretrained
 
         return (model, merged_state_dict)
-
 
 # ============================================================================
 # 3. Нода: AceStep Save Merged Lora
@@ -429,8 +407,8 @@ class AceStepSaveMergedLora:
         return {
             "required": {
                 "merged_tensors": ("MERGED_LORA_TENSORS",),
-                "output_dir": ("STRING", {"default": folder_paths.get_output_directory(), "multiline": False, "tooltip": "Корневая директория для сохранения"}),
-                "file_name": ("STRING", {"default": "My_Smart_Merge_LoRA", "multiline": False, "tooltip": "Имя ПАПКИ с лорой"}),
+                "output_dir": ("STRING", {"default": folder_paths.get_output_directory(), "multiline": False}),
+                "file_name": ("STRING", {"default": "My_Smart_Merge_LoRA", "multiline": False}),
             }
         }
 
@@ -442,7 +420,6 @@ class AceStepSaveMergedLora:
 
     def save_lora(self, merged_tensors, output_dir, file_name):
         if not merged_tensors:
-            print("[Save Merged Lora] ⚠️ Нет тензоров для сохранения!")
             return ("",)
 
         save_path = os.path.join(output_dir, file_name)
@@ -452,12 +429,15 @@ class AceStepSaveMergedLora:
         rank = sample_tensor.shape[1] if sample_tensor is not None else 64
         target_modules = list(set([k.split('.')[-3] for k in merged_tensors.keys() if "lora_A" in k or "lora_down" in k]))
         
+        # Динамически проверяем, остались ли Bias в словаре
+        has_bias = any("bias" in k for k in merged_tensors.keys())
+        
         config_data = {
             "peft_type": "LORA",
             "r": rank,
             "lora_alpha": rank,
             "target_modules": target_modules,
-            "bias": "none"
+            "bias": "all" if has_bias else "none"
         }
 
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -466,9 +446,8 @@ class AceStepSaveMergedLora:
         weights_path = os.path.join(save_path, "adapter_model.safetensors")
         save_file(merged_tensors, weights_path)
 
-        print(f"[Save Merged Lora] 💾 LoRA успешно сохранена в: {save_path}")
+        print(f"[Save Merged Lora] 💾 LoRA сохранена в: {save_path} (Bias: {'Да' if has_bias else 'Нет'})")
         return (save_path,)
-
 
 # ============================================================================
 # Регистрация нод
