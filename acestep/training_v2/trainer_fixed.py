@@ -396,7 +396,8 @@ class FixedLoRATrainer:
                     shift=shift,
                     use_cache=True,
                     infer_method="ode",
-                    use_progress_bar=False
+                    use_progress_bar=False,
+                    dcw_enabled=False
                 )
                 generated_latents = outputs["target_latents"]
                 

@@ -2124,8 +2124,9 @@ class ACEStepFinetuneTrainer:
                         refer_audio_order_mask=refer_mask, src_latents=src_latents,
                         chunk_masks=chunk_masks, silence_latent=current_silence,
                         attention_mask=attention_mask, is_covers=is_covers,
-                        infer_steps=inf_steps, diffusion_guidance_sale=7.5,
-                        shift=shift, use_cache=True, infer_method="ode", use_progress_bar=False
+                        infer_steps=inf_steps, diffusion_guidance_scale=7.5,
+                        shift=shift, use_cache=True, infer_method="ode", use_progress_bar=False,
+                        dcw_enabled=False
                     )
             generated_latents = outputs["target_latents"]
 
