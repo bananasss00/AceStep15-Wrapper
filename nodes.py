@@ -15,6 +15,14 @@ import re
 import random
 import numpy as np
 
+class AnyType(str):
+    def __eq__(self, __value: object) -> bool:
+        return True
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+ANY = AnyType("*")
+
 # Добавляем путь к библиотеке
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -894,7 +902,7 @@ class AceStepPromptEnhancer:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING", "STRING")
+    RETURN_TYPES = ("STRING", "STRING", "INT", ANY, ANY, ANY)
     RETURN_NAMES = ("enhanced_caption", "enhanced_lyrics", "bpm", "key_scale", "time_signature", "vocal_language")
     FUNCTION = "enhance"
     CATEGORY = "ACE-Step"
